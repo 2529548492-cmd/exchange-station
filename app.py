@@ -561,6 +561,7 @@ def list_folder(service, folder_id):
                 "id": f["id"],
                 "name": f["name"],
                 "size": _fmt_size(f.get("size")),
+                "size_bytes": int(f.get("size") or 0),
                 "ext": (f["name"].rsplit(".", 1)[-1].upper()[:4] if "." in f["name"] else "FILE"),
                 "kind": _file_kind(f["name"], f.get("mimeType") or ""),
                 "is_image": (f.get("mimeType") or "").startswith("image/"),
@@ -840,6 +841,7 @@ PAGE = (
         '<div class="tabpanel" id="tab-private"><div class="card section"><h2>私人区</h2>'
     '<p class="note">只有你自己和站长能看见这里的文件，其他人看不见，也不会出现在已发布区。</p>'
     '{% if fb_user %}<p class="note">当前账号：{{ fb_user }} · <a href="/logout_feedback">退出</a></p>'
+    '<p class="note">私人空间：每人上限 20 GB，你目前已用 {{ private_used_text }}。</p>'
     '<form method="post" action="/private/upload" enctype="multipart/form-data">'
     '<div class="drop"><strong>点这里选文件上传到私人区</strong><span>一次最多 30 个 · 总共 2 GB · 不用站长审核，只有你和站长能看见</span><br><input type="file" name="file" multiple required></div>'
     '<button class="btn primary" style="margin-top:10px">上传到私人区</button></form>'
@@ -1002,6 +1004,7 @@ def index():
             files = _cached_published(drive_service())
     cats = [{"name": c, "count": sum(1 for f in files if f["kind"] == c)} for c in CATS]
     private_files = []
+    private_used = 0
     fb_user = _account_gate()
     if entered and fb_user:
         if _is_relay():
@@ -1021,6 +1024,7 @@ def index():
                 folder = _private_user_folder_id(service, fb_user, create=False)
                 if folder:
                     private_files = list_folder(service, folder)
+    private_used = sum(f.get("size_bytes", 0) for f in private_files)
     return render_template_string(
         PAGE,
         code_configured=bool(code),
@@ -1031,6 +1035,8 @@ def index():
         feedback=_read_feedback(drive_service()) if entered else [],
         fb_user=fb_user,
         private_files=private_files,
+        private_used=private_used,
+        private_used_text=_fmt_size(private_used),
         max_mb=MAX_UPLOAD_MB,
         msg=request.args.get("msg", ""),
     )
@@ -1353,9 +1359,23 @@ def private_upload():
     folder = _private_user_folder_id(service, fb_user)
     if not folder:
         return redirect("/?msg=私人文件夹创建失败，请重试#private")
+    # 每人私人空间上限 20 GB：已有 + 这次要传的，超了就整批拒绝，不传一半。
+    PRIVATE_QUOTA = 20 * 1024 * 1024 * 1024
+    used = sum(f.get("size_bytes", 0) for f in list_folder(service, folder))
+    _uploads = [u for u in request.files.getlist("file") if u and u.filename]
+    _new_total = 0
+    for _u in _uploads:
+        try:
+            _u.stream.seek(0, 2)
+            _new_total += _u.stream.tell()
+            _u.stream.seek(0)
+        except Exception:
+            pass
+    if used + _new_total > PRIVATE_QUOTA:
+        return redirect("/?msg=私人空间已满：每人上限 20 GB，这次传完会超，请先删掉一些私人文件再传#private")
     from googleapiclient.http import MediaIoBaseUpload
     count = 0
-    for up in request.files.getlist("file"):
+    for up in _uploads:
         if not up or not up.filename:
             continue
         name = _safe_filename(up.filename)
@@ -1377,7 +1397,7 @@ def private_upload():
 @app.route("/private/delete", methods=["POST"])
 def private_delete():
     code = _env("EXCHANGE_CODE")
-    if not _has_gate(code, "exchange_access"):
+    if not _has_gate(code, "exchange_access") and not _private_is_admin():
         return redirect("/?msg=请先输入访问口令")
     fb_user = _account_gate()
     if _is_relay():
@@ -1430,13 +1450,15 @@ def admin_private():
                 users = []
     rows = ""
     for u in users:
-        rows += f"<div class=\"card section\"><h2>{u['name']} 的私人文件</h2>"
+        _used = sum(f.get("size_bytes", 0) for f in u["files"])
+        rows += f"<div class=\"card section\"><h2>{u['name']} 的私人文件</h2><p class=\"note\">已用 {_fmt_size(_used)} / 20 GB</p>"
         if u["files"]:
             for f in u["files"]:
                 rows += (f"<div class=\"file\"><div class=\"fic\">{f['ext']}</div>"
                          f"<div class=\"fmain\"><div class=\"fname\">{f['name']}</div><div class=\"fmeta\"><span>{f['size']}</span></div></div>"
                          f"<div class=\"actions\"><a class=\"btn\" href=\"/view/{f['id']}\" target=\"_blank\">打开预览</a>"
-                         f"<a class=\"btn primary\" href=\"/download/{f['id']}\">下载</a></div></div>")
+                         f"<a class=\"btn primary\" href=\"/download/{f['id']}\">下载</a>"
+                         f"<form method=\"post\" action=\"/private/delete\" style=\"display:inline\" onsubmit=\"return confirm('确定删除这个私人文件吗？')\"><input type=\"hidden\" name=\"file_id\" value=\"{f['id']}\"><button class=\"btn danger\">删除</button></form></div></div>")
         else:
             rows += "<p class=\"empty\">这个账号的私人区是空的。</p>"
         rows += "</div>"
