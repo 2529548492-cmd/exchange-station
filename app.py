@@ -488,7 +488,7 @@ BASE_CSS = """
   #toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(20px);background:var(--ink);color:var(--bg);padding:12px 18px;border-radius:999px;font-size:14px;font-weight:700;opacity:0;pointer-events:none;transition:.25s;z-index:50;max-width:calc(100vw - 32px);text-align:center}
   #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
  body{overflow-x:hidden}.file{min-width:0}.fname{word-break:break-all}
-  /* Mobile-first polish: phone is the main way Ryan's friends will use this */
+  /* Mobile-first polish: phone is the main way friends will use this */
   @media(max-width:640px){
     .wrap{padding:18px 12px 40px}
     h1{font-size:32px}
