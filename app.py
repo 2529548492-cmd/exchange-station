@@ -115,7 +115,7 @@ def _relay_files():
         r = _rq.get(_relay_backend() + "/api/files", cookies=cookies, timeout=15)
         return r.json()
     except Exception:
-        return {"published": [], "pending": []}
+        return {"published": [], "pending": [], "folders": []}
 
 
 def _proxy_post_to_backend(path):
@@ -147,21 +147,23 @@ def _drive_configured():
 
 ACCESS_LOG = deque(maxlen=500)
 EXPECTED_SIZES = {}  # file_id -> expected bytes, from direct upload completion; only for files uploaded via this version
-_PUB_CACHE = {'t': 0, 'files': None}
+_PUB_CACHE = {'t': 0, 'files': None, 'folders': None}
 
 
 def _cached_published(service):
     now = time.time()
     if _PUB_CACHE['files'] is not None and now - _PUB_CACHE['t'] < 30:
-        return _PUB_CACHE['files']
-    files = list_folder(service, PUBLISHED_FOLDER_ID)
+        return _PUB_CACHE['files'], _PUB_CACHE['folders'] or []
+    files, folders = _list_published_tree(service)
     _PUB_CACHE['files'] = files
+    _PUB_CACHE['folders'] = folders
     _PUB_CACHE['t'] = now
-    return files
+    return files, folders
 
 
 def _invalidate_pub_cache():
     _PUB_CACHE['files'] = None
+    _PUB_CACHE['folders'] = None
     _PUB_CACHE['t'] = 0
 
 _DRIVE_LOG_BUFFER = []
@@ -566,10 +568,58 @@ def list_folder(service, folder_id):
                 "kind": _file_kind(f["name"], f.get("mimeType") or ""),
                 "is_image": (f.get("mimeType") or "").startswith("image/"),
                 "is_video": (f.get("mimeType") or "").startswith("video/"),
+                "is_audio": (f.get("mimeType") or "").startswith("audio/"),
                 "thumb_link": f.get("thumbnailLink") or "",
             }
         )
     return out
+
+
+def _published_subfolders(service):
+    if service is None:
+        return []
+    try:
+        res = service.files().list(
+            q=f"'{PUBLISHED_FOLDER_ID}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+            fields="files(id,name)", pageSize=100).execute()
+    except Exception:
+        return []
+    return [{"id": f["id"], "name": f["name"]} for f in (res.get("files") or [])]
+
+
+def _published_tree_ids(service):
+    ids = {PUBLISHED_FOLDER_ID}
+    for fo in _published_subfolders(service):
+        ids.add(fo["id"])
+    return ids
+
+
+def _is_published_parent(service, parents):
+    parents = parents or []
+    if PUBLISHED_FOLDER_ID in parents:
+        return True
+    if service is None:
+        return False
+    return bool(set(parents) & _published_tree_ids(service))
+
+
+def _list_published_tree(service):
+    if service is None:
+        return [], []
+    folders = _published_subfolders(service)
+    files = []
+    for f in list_folder(service, PUBLISHED_FOLDER_ID):
+        f["folder_id"] = PUBLISHED_FOLDER_ID
+        f["folder_name"] = ""
+        files.append(f)
+    for fo in folders:
+        for f in list_folder(service, fo["id"]):
+            f["folder_id"] = fo["id"]
+            f["folder_name"] = fo["name"]
+            files.append(f)
+    for fo in folders:
+        fo["count"] = sum(1 for f in files if f.get("folder_id") == fo["id"])
+    return files, folders
 
 
 def get_file(service, file_id):
@@ -758,16 +808,8 @@ PAGE = (
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>交换站</title><style>"
     + BASE_CSS
-    + "</style></head><body><div class=\"wrap\">"
-    "<div class=\"top\"><div><h1>交换站</h1></div>"
-    "<div class=\"badge-live\"><span class=\"dot\"></span> 仅熟人使用 · 需审核</div></div>"
-    "<nav class=\"topnav\" id=\"topnav\">"
-    "<a href=\"#principle\" data-tab=\"principle\">原理区</a>"
-    "<a href=\"#publish\" data-tab=\"publish\">发布区</a>"
-    "<a href=\"#published\" data-tab=\"published\" class=\"active\">已发布区</a>"
-    "<a href=\"#feedback\" data-tab=\"feedback\">意见区</a>"
-    "<a href=\"#private\" data-tab=\"private\">私人区</a>"
-    "<a href=\"#admin\" data-tab=\"admin\">站长区</a></nav>"
+    + "</style><style>" + '\n.shellhead{position:sticky;top:0;z-index:30;background:var(--bg);height:56px;display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--line)}\n.jiabtn{width:44px;height:44px;border-radius:12px;background:var(--green);color:#fff;font-weight:900;font-size:20px;border:0;cursor:pointer;flex-shrink:0}\n.headtitle{flex:1;min-width:0;display:flex;align-items:baseline;gap:8px;white-space:nowrap;overflow:hidden}\n.headtitle h1{font-size:24px}\n#curtab{color:var(--muted);font-size:13px;font-weight:700}\n.drawer-backdrop{position:fixed;top:56px;bottom:0;left:0;right:0;background:rgba(0,0,0,.35);z-index:15}\n.drawer{position:fixed;top:56px;bottom:0;left:0;width:260px;max-width:84vw;background:var(--surface);border-right:1px solid var(--line);z-index:20;display:flex;flex-direction:column;padding:10px 14px 12px;box-sizing:border-box;overflow:hidden}\n.drawer-scroll{flex:1;min-height:0;overflow-y:auto}\n.drawer-label{font-size:11px;font-weight:800;color:var(--muted);letter-spacing:.06em;padding:6px 8px}\n.drawer-navbtn{display:block;width:100%;text-align:left;border:0;border-radius:10px;padding:9px 12px;font-weight:800;font-size:14px;cursor:pointer;margin-bottom:3px;background:transparent;color:var(--ink)}\n.drawer-navbtn.active{background:var(--green);color:#fff}\n.drawer-quota{flex-shrink:0;padding-top:10px;border-top:1px solid var(--line);margin-top:8px}\n.quota-bar{background:var(--surface-2);border-radius:999px;overflow:hidden;height:8px;margin-top:8px}\n.quota-fill{height:100%;background:var(--green)}\n.pub-toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}\n.folderbar{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}\n.album-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}\n.tile{position:relative;aspect-ratio:1/1;border-radius:14px;overflow:hidden;cursor:pointer;background:var(--surface-2);border:1px solid var(--line)}\n.tileimg{width:100%;height:100%;object-fit:cover;display:block}\n.tilefic{width:100%;height:100%;display:grid;place-items:center;font-weight:900;color:var(--green-ink);font-size:20px}\n.tileinfo{position:absolute;left:0;right:0;bottom:0;padding:24px 8px 7px;background:linear-gradient(transparent,rgba(0,0,0,.65));color:#fff}\n.tile-name{font-size:12px;font-weight:800;word-break:break-all;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}\n.tile-meta{font-size:11px;opacity:.85}\n.tile-check{position:absolute;top:6px;right:6px;width:22px;height:22px;border-radius:50%;border:2px solid #fff;background:rgba(0,0,0,.35);display:none;place-items:center;color:#fff;font-size:14px;z-index:2}\n.album-grid.selecting .tile-check{display:grid}\n.tile.selected .tile-check{background:var(--green)}\n.tile.selected .tile-check::after{content:"\\2713"}\n#previewOverlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40;display:none;align-items:center;justify-content:center;padding:16px;box-sizing:border-box}\n#previewCard{background:var(--surface);border-radius:18px;padding:16px;width:100%;max-width:480px;max-height:90vh;overflow:auto}\n' + "</style></head><body><div class=\"wrap\">"
+    '<header class="shellhead"><button id="drawerBtn" class="jiabtn" type="button">交</button><div class="headtitle"><h1>交换站</h1><span id="curtab">/ 已发布区</span></div><div class="badge-live"><span class="dot"></span> 仅熟人使用 · 需审核</div></header><div id="drawerBackdrop" class="drawer-backdrop" style="display:none"></div><aside id="drawer" class="drawer" style="display:none"><div class="drawer-scroll"><div class="drawer-label">导航</div><nav id="drawernav"><button class="drawer-navbtn" data-tab="principle">原理区</button><button class="drawer-navbtn" data-tab="publish">发布区</button><button class="drawer-navbtn active" data-tab="published">已发布区</button><button class="drawer-navbtn" data-tab="feedback">意见区</button><button class="drawer-navbtn" data-tab="private">私人区</button><button class="drawer-navbtn" data-tab="admin">站长区</button></nav><div class="drawer-label">分类</div><div id="drawerCats">{% for c in cats %}{% if c.count %}<button class="drawer-navbtn" data-cat="{{ c.name }}">{{ c.name }}（{{ c.count }}）</button>{% endif %}{% endfor %}</div></div><div class="drawer-quota"><div style="font-weight:800;font-size:13px">私人空间</div>{% if fb_user %}<div class="quota-bar"><div class="quota-fill" style="width:{{ private_used_pct }}%"></div></div><div style="font-size:12px;color:var(--muted);margin-top:6px">{{ private_used_text }} / 20 GB · 还剩 {{ private_remaining_text }}</div>{% else %}<div style="font-size:12px;color:var(--muted);margin-top:6px">登录私人区账号后，这里显示你的用量（每人上限 20 GB）。</div>{% endif %}</div></aside>'
     "<div id=\"progwrap\" style=\"display:none;margin:0 0 14px;padding:12px 14px;border:1px solid var(--line);border-radius:14px;background:var(--surface)\"><div style=\"font-weight:800;margin-bottom:8px\">上传进度</div><div style=\"background:var(--surface-2);border-radius:999px;overflow:hidden;height:14px\"><div id=\"progbar\" style=\"height:100%;width:0%;background:var(--green);transition:width .3s\"></div></div><p class=\"note\" id=\"progtext\" style=\"margin-top:8px\">正在上传… 0%</p></div>"
     "<div class=\"tabpanel\" id=\"tab-principle\">"
     "<p class=\"lead\">熟人之间传文件的地方。<strong>上传不会立刻公开</strong> —— 先进入待审核，站长通过后，其他人才能在已发布里下载。</p>"
@@ -802,7 +844,7 @@ PAGE = (
     "<script>var pf=document.querySelector('#tab-publish form');"
     "var __lastFileMeta=null;var __up={done:0,total:0,start:0,lastT:0,lastDone:0};function __fmtSp(bps){return bps>1048576?(bps/1048576).toFixed(1)+' MB/s':(bps/1024).toFixed(0)+' KB/s';}function __showProg(curFile,idx,totalFiles){var bar=document.getElementById('progbar');var tx=document.getElementById('progtext');if(!bar||!tx)return;var pct=__up.total?Math.round(__up.done/__up.total*100):0;bar.style.width=pct+'%';var el=(Date.now()-__up.start)/1000;var bps=el>0.5?__up.done/el:0;var eta=bps>0?'，还剩约'+Math.round((__up.total-__up.done)/bps)+'秒':'';var stalled=(Date.now()-__up.lastT>30000&&__up.done<__up.total)?'（进度 30 秒没动，网可能卡住了，别刷新，等它自己续传）':'';tx.textContent='上传中 '+idx+'/'+totalFiles+'：'+curFile+' '+pct+'%（'+(__up.done/1048576).toFixed(1)+' / '+(__up.total/1048576).toFixed(1)+' MB，'+__fmtSp(bps)+eta+'）'+stalled;}function putChunk(session,file,start,end,total,base){return new Promise(function(res,rej){var x=new XMLHttpRequest();x.open('PUT',session,true);x.setRequestHeader('Content-Range','bytes '+start+'-'+(end-1)+'/'+total);x.upload.onprogress=function(ev){if(ev.lengthComputable){__up.done=base+ev.loaded;__up.lastT=Date.now();__showProg(file.name,__up.idx,__up.n);}};x.onload=function(){if(x.status===308){var rg=x.getResponseHeader('Range');res(rg?parseInt(rg.split('-')[1])+1:start);}else if(x.status>=200&&x.status<300){try{__lastFileMeta=JSON.parse(x.responseText);}catch(e){}res(total);}else{rej(new Error('直传失败 '+x.status));}};x.onerror=function(){rej(new Error('直传网络失败'));};var __to=setTimeout(function(){try{x.abort();}catch(e){}rej(new Error('直传 45 秒无进度，已改中转'));},45000);var __oldOn=function(){clearTimeout(__to);};x.onload=function(){__oldOn();if(x.status===308){var rg=x.getResponseHeader('Range');res(rg?parseInt(rg.split('-')[1])+1:start);}else if(x.status>=200&&x.status<300){try{__lastFileMeta=JSON.parse(x.responseText);}catch(e){}res(total);}else{rej(new Error('直传失败 '+x.status));}};x.send(file.slice(start,end));});}"
     "async function directOne(file,idx,totalFiles){var tx0=document.getElementById('progtext');if(tx0){tx0.textContent='正在向云盘申请直传通道: '+file.name;}var ac=new AbortController();var to=setTimeout(function(){if(tx0){tx0.textContent='直传通道申请超过15秒没回音，可能是服务器刚睡醒，正在重试…';}},15000);var rs=await fetch('/direct_session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,size:file.size}),signal:ac.signal});clearTimeout(to);var sj=await rs.json();if(!sj.ok){throw new Error(sj.msg||'直传会话失败');}var session=sj.session;var CH=8*1024*1024;var off=0;var fileBase=__up.done;__up.idx=idx;__up.n=totalFiles;__up.lastT=Date.now();while(off<file.size){var nxt=Math.min(off+CH,file.size);off=await putChunk(session,file,off,nxt,file.size,fileBase+off);__up.done=fileBase+off;__up.lastT=Date.now();__showProg(file.name,idx,totalFiles);}await fetch('/direct_done',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,file_id:__lastFileMeta?__lastFileMeta.id:'',size:file.size})});}"
-    "window.__uploading=false;window.addEventListener('beforeunload',function(e){if(window.__uploading){e.preventDefault();e.returnValue='正在上传，离开本页会中断上传';}});document.querySelectorAll('#topnav a').forEach(function(a){a.addEventListener('click',function(e){if(window.__uploading&&a.dataset.tab==='admin'){if(!confirm('正在上传，点站长区进入审核页会中断上传。确定要中断吗？')){e.preventDefault();e.stopImmediatePropagation();}}});});pf.addEventListener('submit',async function(e){e.preventDefault();window.__uploading=true;var us=document.getElementById('uploadstatus');if(us){us.textContent='已点上传，正在向云盘申请直传通道…（如果这行一直不动，说明页面是旧版，请刷新一次再传）';}var b=document.getElementById('uploadbtn');var w=document.getElementById('progwrap');var tx=document.getElementById('progtext');if(!queue.length){if(b){b.disabled=false;}window.__uploading=false;return;}if(b){b.disabled=true;}if(w){w.style.display='block';}__up.done=0;__up.total=queue.reduce(function(a,f){return a+f.size;},0);__up.start=Date.now();__up.lastT=Date.now();try{% if is_relay %}throw new Error('__relay__');{% else %}for(var k=0;k<queue.length;k++){await directOne(queue[k],k+1,queue.length);}{% endif %}window.location.href='/?msg='+encodeURIComponent('已上传 '+queue.length+' 个文件到待审核，站长通过后才会出现在已发布列表')+'#publish';}catch(err){if(tx){tx.textContent=(err.message==='__relay__'?'正在经本站中转上传（手机→上海→海外→云盘），进度跟着国内这一段走…':'直传失败，正在改用本站中转上传: '+err.message);}try{var fd2=new FormData();queue.forEach(function(f){fd2.append('file',f);});var x2=new XMLHttpRequest();x2.open('POST','/upload',true);x2.setRequestHeader('X-Requested-With','XMLHttpRequest');var bar2=document.getElementById('progbar');x2.upload.onprogress=function(ev){if(ev.lengthComputable){var pct=Math.round(ev.loaded/ev.total*100);if(bar2){bar2.style.width=pct+'%';}if(tx){tx.textContent='中转上传: '+pct+'% ('+(ev.loaded/1048576).toFixed(1)+' / '+(ev.total/1048576).toFixed(1)+' MB)';}}};x2.onload=function(){try{var r=JSON.parse(x2.responseText);if(r.ok){window.location.href='/?msg='+encodeURIComponent(r.msg)+'#publish';}else{alert(r.msg);if(b){b.disabled=false;}}}catch(e2){window.location.reload();}};x2.onerror=function(){if(tx){tx.textContent='上传失败，请检查网络后重试';}if(b){b.disabled=false;}window.__uploading=false;};x2.send(fd2);}catch(e3){if(tx){tx.textContent='上传失败：'+err.message+'，请检查网络后重试';}if(b){b.disabled=false;}}}});</script>"
+    "window.__uploading=false;window.addEventListener('beforeunload',function(e){if(window.__uploading){e.preventDefault();e.returnValue='正在上传，离开本页会中断上传';}});document.querySelectorAll('#topnav a').forEach(function(a){a.addEventListener('click',function(e){if(window.__uploading&&a.dataset.tab==='admin'){if(!confirm('正在上传，点站长区进入审核页会中断上传。确定要中断吗？')){e.preventDefault();e.stopImmediatePropagation();}}});});pf.addEventListener('submit',async function(e){e.preventDefault();window.__uploading=true;var us=document.getElementById('uploadstatus');if(us){us.textContent='已点上传，正在向云盘申请直传通道…（如果这行一直不动，说明页面是旧版，请刷新一次再传）';}var b=document.getElementById('uploadbtn');var w=document.getElementById('progwrap');var tx=document.getElementById('progtext');if(!queue.length){if(b){b.disabled=false;}window.__uploading=false;return;}if(b){b.disabled=true;}if(w){w.style.display='block';}__up.done=0;__up.total=queue.reduce(function(a,f){return a+f.size;},0);__up.start=Date.now();__up.lastT=Date.now();try { {% if is_relay %}throw new Error('__relay__');{% else %}for(var k=0;k<queue.length;k++){await directOne(queue[k],k+1,queue.length);}{% endif %}window.location.href='/?msg='+encodeURIComponent('已上传 '+queue.length+' 个文件到待审核，站长通过后才会出现在已发布列表')+'#publish';}catch(err){if(tx){tx.textContent=(err.message==='__relay__'?'正在经本站中转上传（手机→上海→海外→云盘），进度跟着国内这一段走…':'直传失败，正在改用本站中转上传: '+err.message);}try{var fd2=new FormData();queue.forEach(function(f){fd2.append('file',f);});var x2=new XMLHttpRequest();x2.open('POST','/upload',true);x2.setRequestHeader('X-Requested-With','XMLHttpRequest');var bar2=document.getElementById('progbar');x2.upload.onprogress=function(ev){if(ev.lengthComputable){var pct=Math.round(ev.loaded/ev.total*100);if(bar2){bar2.style.width=pct+'%';}if(tx){tx.textContent='中转上传: '+pct+'% ('+(ev.loaded/1048576).toFixed(1)+' / '+(ev.total/1048576).toFixed(1)+' MB)';}}};x2.onload=function(){try{var r=JSON.parse(x2.responseText);if(r.ok){window.location.href='/?msg='+encodeURIComponent(r.msg)+'#publish';}else{alert(r.msg);if(b){b.disabled=false;}}}catch(e2){window.location.reload();}};x2.onerror=function(){if(tx){tx.textContent='上传失败，请检查网络后重试';}if(b){b.disabled=false;}window.__uploading=false;};x2.send(fd2);}catch(e3){if(tx){tx.textContent='上传失败：'+err.message+'，请检查网络后重试';}if(b){b.disabled=false;}}}});</script>"
     ""
     "<script>var d=document.getElementById('drop'),i=document.getElementById('fileinput');"
     "d.addEventListener('click',function(e){if(e.target!==i){i.click();}});"
@@ -820,22 +862,7 @@ PAGE = (
     "var dropped=0;function addQ(fs){var before=queue.length;Array.from(fs).forEach(function(f){if(queue.length<30){queue.push(f);}else{dropped++;}});syncInput();show();}"
     "i.addEventListener('change',function(){addQ(i.files);});</script>"
     "{% if msg %}<p class=\"note\">{{ msg }}</p>{% endif %}</div></div>"
-    "<div class=\"tabpanel active\" id=\"tab-published\"><div class=\"toolbar\"><input class=\"search\" id=\"search\" type=\"search\" placeholder=\"搜索文件名…\" oninput=\"onSearch(this.value)\"></div>"
-    "<section class=\"card section\"><div class=\"section-head\"><h2>已发布</h2><span class=\"count\">{{ files|length }} 个</span></div>"
-    "<div class=\"tabs\" id=\"cattabs\"><button class=\"tab active\" onclick=\"showCat('全部',this)\">全部（{{ files|length }}）</button>"
-    "{% for c in cats %}{% if c.count %}<button class=\"tab\" onclick=\"showCat('{{ c.name }}',this)\">{{ c.name }}（{{ c.count }}）</button>{% endif %}{% endfor %}</div>"
-    "{% if files %}{% for c in cats %}{% if c.count %}"
-    "<div class=\"catgroup\" data-cat=\"{{ c.name }}\"><h3 class=\"cathead\">{{ c.name }} <span class=\"count\">{{ c.count }} 个</span></h3>"
-    "{% for f in files %}{% if f.kind == c.name %}"
-    "<div class=\"file\" data-cat=\"{{ f.kind }}\" data-name=\"{{ f.name|lower }}\">"
-    "{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" alt=\"\" loading=\"lazy\" onerror=\"this.outerHTML='<div class=\\'fic\\'>{{ f.ext }}</div>'\">{% else %}{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}{% endif %}"
-    "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.kind }}</span><span>·</span><span>{{ f.size }}</span></div>"
-"</div>"
-    "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a><button class=\"btn primary\" data-dl=\"/download/{{ f.id }}\" data-name=\"{{ f.name }}\" onclick=\"dlFile(this)\">下载</button></div><div class=\"dlprog\" style=\"display:none;margin-top:8px\"><div style=\"background:var(--surface-2);border-radius:999px;overflow:hidden;height:10px\"><div class=\"dlbar\" style=\"height:100%;width:0%;background:var(--green);transition:width .3s\"></div></div><p class=\"note dltext\" style=\"margin-top:4px\">下载中… 0%</p></div></div>"
-    "{% endif %}{% endfor %}</div>"
-    "{% endif %}{% endfor %}{% else %}<p class=\"empty\">目前还没有已发布的文件。</p>{% endif %}</section>"
-    "<script>var curCat='全部',curQ='';function applyFilter(){document.querySelectorAll('.catgroup').forEach(function(g){var show=curCat==='全部'||g.dataset.cat===curCat;var any=false;g.querySelectorAll('.file').forEach(function(r){var ok=(curCat==='全部'||r.dataset.cat===curCat)&&r.dataset.name.includes(curQ);r.style.display=ok?'':'none';if(ok)any=true;});g.style.display=(show&&any)?'':'none';});}function showCat(c,el){curCat=c;document.querySelectorAll('#cattabs .tab').forEach(function(t){t.classList.remove('active');});el.classList.add('active');applyFilter();}function onSearch(v){curQ=v.toLowerCase();applyFilter();}</script>"
-    "</div>"
+    '<div class="tabpanel active" id="tab-published"><div class="pub-toolbar"><input class="search" id="search" type="search" placeholder="搜索文件名…" oninput="onSearch(this.value)"><button class="btn" id="openDrawerBtn" type="button">导航</button><button class="btn" id="selBtn" type="button">选择</button></div><section class="card section"><div class="section-head"><h2>已发布</h2><span class="count">{{ files|length }} 个</span></div><div class="folderbar" id="folderbar"><button class="tab active" data-folder="all" onclick="showFolder(\'all\',this)">全部（{{ files|length }}）</button>{% for fo in folders %}<button class="tab" data-folder="{{ fo.id }}" onclick="showFolder(\'{{ fo.id }}\',this)">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}<button class="tab" id="newFolderBtn" type="button">+ 新建文件夹</button></div><form id="newFolderForm" method="post" action="/folder/create" style="display:none;gap:8px;margin-top:10px"><input class="textin" name="name" placeholder="新文件夹名字，比如：旅行" required maxlength="50" style="flex:1"><button class="btn primary" type="submit">创建</button><button class="btn" type="button" id="newFolderCancel">取消</button></form><div class="tabs" id="cattabs"><button class="tab active" onclick="showCat(\'全部\',this)">全部（{{ files|length }}）</button>{% for c in cats %}{% if c.count %}<button class="tab" onclick="showCat(\'{{ c.name }}\',this)">{{ c.name }}（{{ c.count }}）</button>{% endif %}{% endfor %}</div><div class="album-grid" id="albumGrid">{% for f in files %}<div class="tile" data-cat="{{ f.kind }}" data-folder="{{ f.folder_id }}" data-name="{{ f.name|lower }}" data-id="{{ f.id }}" data-dl="/download/{{ f.id }}" data-view="/view/{{ f.id }}" data-isimg="{{ \'1\' if f.is_image else \'0\' }}" data-isvid="{{ \'1\' if f.is_video else \'0\' }}" data-isaud="{{ \'1\' if f.is_audio else \'0\' }}"><span class="tile-check"></span>{% if f.is_image or f.is_video %}<img class="tileimg" src="/thumb/{{ f.id }}" alt="" loading="lazy" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'grid\';"><div class="tilefic" style="display:none">{{ f.ext }}</div>{% else %}<div class="tilefic">{{ f.ext }}</div>{% endif %}<div class="tileinfo"><div class="tile-name">{{ f.name }}</div><div class="tile-meta">{{ f.kind }} · {{ f.size }}{% if f.folder_name %} · {{ f.folder_name }}{% endif %}</div></div></div>{% endfor %}</div>{% if not files %}<p class="empty">目前还没有已发布的文件。</p>{% endif %}<form id="moveForm" method="post" action="/folder/move" style="display:none;margin-top:12px;gap:8px;flex-wrap:wrap;align-items:center"><span id="selCount" style="font-weight:800"></span><span>移到</span><select name="dest_folder_id" class="textin" style="width:auto"><option value="{{ published_id }}">已发布根目录</option>{% for fo in folders %}<option value="{{ fo.id }}">{{ fo.name }}</option>{% endfor %}</select><input type="hidden" name="file_ids" id="moveFileIds"><button class="btn primary" type="submit">移动</button><button class="btn" type="button" id="dlSelBtn">选择下载</button></form><p class="note">点图片默认就是预览；点右上角“选择”，再点图片打勾，就可以批量下载或移动到文件夹。</p></section><div id="previewOverlay"><div id="previewCard"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b id="previewTitle" style="word-break:break-all"></b><button class="btn" id="previewClose" type="button">关闭</button></div><div id="previewBody" style="margin-top:12px"></div></div></div><script>var curCat=\'全部\',curFolder=\'all\',curQ=\'\',selectMode=false,selected=new Set();function applyFilter(){document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){var okCat=curCat===\'全部\'||t.dataset.cat===curCat;var okFolder=curFolder===\'all\'||t.dataset.folder===curFolder;var okQ=t.dataset.name.includes(curQ);t.style.display=(okCat&&okFolder&&okQ)?\'\':\'none\';});}function showCat(c,el){curCat=c;document.querySelectorAll(\'#cattabs .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function showFolder(fid,el){curFolder=fid;document.querySelectorAll(\'#folderbar .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function onSearch(v){curQ=v.toLowerCase();applyFilter();}function updateSel(){var mf=document.getElementById(\'moveForm\');var sc=document.getElementById(\'selCount\');var ids=document.getElementById(\'moveFileIds\');if(sc)sc.textContent=\'已选 \'+selected.size+\' 个\';if(ids)ids.value=Array.from(selected).join(\',\');if(mf)mf.style.display=selected.size?\'flex\':\'none\';}function openPreview(t){var ov=document.getElementById(\'previewOverlay\');var ti=document.getElementById(\'previewTitle\');var bd=document.getElementById(\'previewBody\');if(!ov||!ti||!bd)return;ti.textContent=t.querySelector(\'.tile-name\').textContent;var view=t.dataset.view,dl=t.dataset.dl;if(t.dataset.isimg===\'1\'){bd.innerHTML=\'<img src="\'+view+\'" style="width:100%;border-radius:12px">\';}else if(t.dataset.isvid===\'1\'){bd.innerHTML=\'<video controls src="\'+view+\'" style="width:100%;border-radius:12px"></video>\';}else if(t.dataset.isaud===\'1\'){bd.innerHTML=\'<audio controls src="\'+view+\'" style="width:100%"></audio>\';}else if(t.dataset.cat===\'文档\'){bd.innerHTML=\'<iframe src="\'+view+\'" style="width:100%;height:420px;border:0;border-radius:12px"></iframe>\';}else{bd.innerHTML=\'<p class="note">这个类型不能在线预览，请下载后打开。</p><a class="btn primary" href="\'+dl+\'">下载</a>\';}ov.style.display=\'flex\';}function closePreview(){var ov=document.getElementById(\'previewOverlay\');if(ov)ov.style.display=\'none\';}function dlTile(t){var url=t.dataset.dl;var name=t.querySelector(\'.tile-name\').textContent;var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.responseType=\'blob\';x.onload=function(){if(x.status===200){var a=document.createElement(\'a\');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}else{alert(\'下载失败，请重试\');}};x.onerror=function(){alert(\'下载失败，请检查网络后重试\');};x.send();}document.getElementById(\'albumGrid\').addEventListener(\'click\',function(e){var t=e.target.closest(\'.tile\');if(!t)return;if(selectMode){var id=t.dataset.id;if(selected.has(id)){selected.delete(id);t.classList.remove(\'selected\');}else{selected.add(id);t.classList.add(\'selected\');}updateSel();}else{openPreview(t);}});document.getElementById(\'previewClose\').addEventListener(\'click\',closePreview);document.getElementById(\'previewOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'previewOverlay\')closePreview();});document.getElementById(\'selBtn\').addEventListener(\'click\',function(){selectMode=!selectMode;var g=document.getElementById(\'albumGrid\');if(selectMode){g.classList.add(\'selecting\');this.textContent=\'取消\';}else{selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});g.classList.remove(\'selecting\');this.textContent=\'选择\';}updateSel();});document.getElementById(\'dlSelBtn\').addEventListener(\'click\',function(){var tiles=[];document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(selected.has(t.dataset.id))tiles.push(t);});if(!tiles.length)return;var i=0;function next(){if(i>=tiles.length){alert(\'已开始下载 \'+tiles.length+\' 个文件（浏览器可能逐个询问是否允许多个下载）。\');selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});document.getElementById(\'albumGrid\').classList.remove(\'selecting\');selectMode=false;document.getElementById(\'selBtn\').textContent=\'选择\';updateSel();return;}dlTile(tiles[i]);i++;setTimeout(next,600);}next();});document.getElementById(\'newFolderBtn\').addEventListener(\'click\',function(){var f=document.getElementById(\'newFolderForm\');f.style.display=\'flex\';});document.getElementById(\'newFolderCancel\').addEventListener(\'click\',function(){document.getElementById(\'newFolderForm\').style.display=\'none\';});document.getElementById(\'moveForm\').addEventListener(\'submit\',function(e){if(!selected.size){e.preventDefault();alert(\'请先勾选文件\');}});</script></div>'
     "{% endif %}"
     "<script>function dlFile(btn){var row=btn.closest('.file');var wrap=row.querySelector('.dlprog');var bar=row.querySelector('.dlbar');var tx=row.querySelector('.dltext');if(!wrap)return;wrap.style.display='block';btn.disabled=true;var url=btn.getAttribute('data-dl');var name=btn.getAttribute('data-name');var x=new XMLHttpRequest();x.open('GET',url,true);x.responseType='blob';x.onprogress=function(ev){if(ev.lengthComputable){var pct=Math.round(ev.loaded/ev.total*100);bar.style.width=pct+'%';tx.textContent='下载中… '+pct+'%（'+(ev.loaded/1048576).toFixed(1)+' / '+(ev.total/1048576).toFixed(1)+' MB）';}else{tx.textContent='下载中… '+(ev.loaded/1048576).toFixed(1)+' MB';}};x.onload=function(){if(x.status===200){bar.style.width='100%';tx.textContent='下载完成';var a=document.createElement('a');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}else{tx.textContent='下载失败，请重试';}btn.disabled=false;};x.onerror=function(){tx.textContent='下载失败，请检查网络后重试';btn.disabled=false;};x.send();}</script>"
         '<div class="tabpanel" id="tab-private"><div class="card section"><h2>私人区</h2>'
@@ -864,7 +891,7 @@ PAGE = (
     "<form method=\"post\" action=\"/admin/login\">"
     "<input class=\"textin\" type=\"password\" name=\"token\" placeholder=\"站长口令\" required> "
     "<button class=\"btn primary\" type=\"submit\">进入审核</button></form></div>"
-    "</div><script>function showTab(name){document.querySelectorAll('.tabpanel').forEach(function(el){el.classList.toggle('active',el.id==='tab-'+name);});document.querySelectorAll('#topnav a').forEach(function(a){a.classList.toggle('active',a.dataset.tab===name);});}document.querySelectorAll('#topnav a').forEach(function(a){a.addEventListener('click',function(e){e.preventDefault();location.hash=a.dataset.tab;showTab(a.dataset.tab);});});var h=(location.hash||'#published').replace('#','');if(['principle','publish','published','feedback','private','admin'].indexOf(h)<0){h='published';}showTab(h);</script>"
+    "</div><script>var TAB_NAMES={'principle':'原理区','publish':'发布区','published':'已发布区','feedback':'意见区','private':'私人区','admin':'站长区'};function openDrawer(){document.getElementById('drawer').style.display='flex';document.getElementById('drawerBackdrop').style.display='block';}function closeDrawer(){document.getElementById('drawer').style.display='none';document.getElementById('drawerBackdrop').style.display='none';}function showTab(name){if(window.__uploading&&name==='admin'&&!confirm('正在上传，点站长区进入审核页会中断上传。确定要中断吗？')){return;}document.querySelectorAll('.tabpanel').forEach(function(el){el.classList.toggle('active',el.id==='tab-'+name);});document.querySelectorAll('#drawernav .drawer-navbtn').forEach(function(b){b.classList.toggle('active',b.dataset.tab===name);});var ct=document.getElementById('curtab');if(ct)ct.textContent='/ '+(TAB_NAMES[name]||name);closeDrawer();}document.getElementById('drawerBtn').addEventListener('click',function(){var d=document.getElementById('drawer');if(d.style.display==='flex'){closeDrawer();}else{openDrawer();}});document.getElementById('drawerBackdrop').addEventListener('click',closeDrawer);document.querySelectorAll('#drawernav .drawer-navbtn').forEach(function(b){b.addEventListener('click',function(e){e.preventDefault();location.hash=b.dataset.tab;showTab(b.dataset.tab);});});document.querySelectorAll('#drawerCats .drawer-navbtn').forEach(function(b){b.addEventListener('click',function(){location.hash='published';showTab('published');curCat=b.dataset.cat;document.querySelectorAll('#cattabs .tab').forEach(function(t){t.classList.toggle('active',t.textContent.indexOf(b.dataset.cat)===0);});applyFilter();});});var _odb=document.getElementById('openDrawerBtn');if(_odb)_odb.addEventListener('click',openDrawer);var h=(location.hash||'#published').replace('#','');if(['principle','publish','published','feedback','private','admin'].indexOf(h)<0){h='published';}showTab(h);</script>"
     "<footer>交换站 · 熟人文件交换 · 上传需站长审核</footer></div></body></html>"
 )
 
@@ -968,12 +995,15 @@ def api_private_all():
 @app.route("/api/files")
 def api_files():
     code = _env("EXCHANGE_CODE")
-    out = {"published": [], "pending": []}
+    out = {"published": [], "pending": [], "folders": []}
     if code and _has_gate(code, "exchange_access"):
         try:
-            out["published"] = list_folder(drive_service(), PUBLISHED_FOLDER_ID)
+            _pf, _fo = _list_published_tree(drive_service())
+            out["published"] = _pf
+            out["folders"] = _fo
         except Exception:
             out["published"] = []
+            out["folders"] = []
     token = _env("ADMIN_TOKEN")
     if token and _has_gate(token, "admin_access"):
         try:
@@ -988,6 +1018,7 @@ def index():
     code = _env("EXCHANGE_CODE")
     entered = _has_gate(code, "exchange_access")
     files = []
+    folders = []
     if code and entered:
         if _is_relay():
             try:
@@ -996,11 +1027,14 @@ def index():
                 if "exchange_access" in request.cookies:
                     _cookies["exchange_access"] = request.cookies["exchange_access"]
                 _r = _rq.get(_relay_backend() + "/api/files", cookies=_cookies, timeout=15)
-                files = _r.json().get("published", [])
+                _rj = _r.json()
+                files = _rj.get("published", [])
+                folders = _rj.get("folders", [])
             except Exception:
                 files = []
+                folders = []
         else:
-            files = _cached_published(drive_service())
+            files, folders = _cached_published(drive_service())
     cats = [{"name": c, "count": sum(1 for f in files if f["kind"] == c)} for c in CATS]
     private_files = []
     private_used = 0
@@ -1031,6 +1065,10 @@ def index():
         drive_configured=True if _is_relay() else _drive_configured(),
         cats=cats,
         files=files,
+        folders=folders,
+        published_id=PUBLISHED_FOLDER_ID,
+        private_used_pct=int(min(100, private_used / (20 * 1024 * 1024 * 1024) * 100)) if private_used else 0,
+        private_remaining_text=_fmt_size(max(0, 20 * 1024 * 1024 * 1024 - private_used)),
         feedback=_read_feedback(drive_service()) if entered else [],
         fb_user=fb_user,
         private_files=private_files,
@@ -1223,7 +1261,7 @@ def view(file_id):
     except Exception:
         return "文件不存在或无权访问", 404
     parents = meta.get("parents") or []
-    is_published = PUBLISHED_FOLDER_ID in parents
+    is_published = _is_published_parent(service, parents)
     is_pending = PENDING_FOLDER_ID in parents
     if is_published:
         code = _env("EXCHANGE_CODE")
@@ -1289,9 +1327,9 @@ def download(file_id):
         meta = get_file(service, file_id)
     except Exception:
         return "文件不存在或无权访问", 404
-    # 安全底线：只有父文件夹是“已发布”的文件才能下载，待审核文件一律拒绝。
+    # 安全底线：只有在已发布树（根目录或其一级子文件夹）里的文件才能下载，待审核文件一律拒绝。
     # 私人区文件例外：本人或站长可以下载，其他人不行。
-    if PUBLISHED_FOLDER_ID not in (meta.get("parents") or []):
+    if not _is_published_parent(service, meta.get("parents") or []):
         owner = _private_owner(service, meta)
         if owner is None or (owner != _account_gate() and not _private_is_admin()):
             return "该文件尚未发布", 403
@@ -1732,7 +1770,7 @@ def admin_published():
     if _is_relay():
         files = _relay_files().get("published", [])
     else:
-        files = list_folder(drive_service(), PUBLISHED_FOLDER_ID)
+        files, _fo = _list_published_tree(drive_service())
     return render_template_string(
         ADMIN_PUBLISHED_PAGE, files=files, drive_configured=True
     )
@@ -1755,7 +1793,7 @@ def admin_delete():
         meta = get_file(service, file_id)
     except Exception:
         return "文件不存在或无权访问", 404
-    if PUBLISHED_FOLDER_ID not in (meta.get("parents") or []):
+    if not _is_published_parent(service, meta.get("parents") or []):
         return "该文件不在已发布里，无法删除", 403
     _name = (get_file(service, file_id) or {}).get("name", file_id)
     service.files().update(fileId=file_id, body={"trashed": True}).execute()
@@ -1859,7 +1897,7 @@ def thumb(file_id):
     except Exception:
         return "文件不存在或无权访问", 404
     parents = meta.get("parents") or []
-    is_published = PUBLISHED_FOLDER_ID in parents
+    is_published = _is_published_parent(service, parents)
     is_pending = PENDING_FOLDER_ID in parents
     if is_published:
         code = _env("EXCHANGE_CODE")
@@ -1925,7 +1963,7 @@ def rename():
     except Exception:
         return "文件不存在或无权访问", 404
     parents = meta.get("parents") or []
-    is_published = PUBLISHED_FOLDER_ID in parents
+    is_published = _is_published_parent(service, parents)
     is_pending = PENDING_FOLDER_ID in parents
     token = _env("ADMIN_TOKEN")
     is_admin = bool(token) and _has_gate(token, "admin_access")
@@ -1940,6 +1978,74 @@ def rename():
     _invalidate_pub_cache()
     _log("改名", f"{old_name} -> {new_name}")
     return redirect(request.form.get("back", "/") or "/")
+
+
+@app.route("/folder/create", methods=["POST"])
+def folder_create():
+    if _is_relay():
+        return _proxy_post_to_backend("/folder/create")
+    code = _env("EXCHANGE_CODE")
+    if not code or not _has_gate(code, "exchange_access"):
+        return redirect("/?msg=请先输入访问口令")
+    service = drive_service()
+    if service is None:
+        return redirect("/?msg=云盘暂未连接，无法新建文件夹#published")
+    name = _safe_filename(request.form.get("name", ""))
+    if not name or name == "全部" or len(name) > 50:
+        return redirect("/?msg=文件夹名字无效#published")
+    for fo in _published_subfolders(service):
+        if fo["name"].lower() == name.lower():
+            return redirect("/?msg=已有同名文件夹#published")
+    service.files().create(
+        body={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [PUBLISHED_FOLDER_ID]},
+        fields="id").execute()
+    _invalidate_pub_cache()
+    _log("新建文件夹", name)
+    return redirect(f"/?msg=已新建文件夹 {name}#published")
+
+
+@app.route("/folder/move", methods=["POST"])
+def folder_move():
+    if _is_relay():
+        return _proxy_post_to_backend("/folder/move")
+    code = _env("EXCHANGE_CODE")
+    if not code or not _has_gate(code, "exchange_access"):
+        return redirect("/?msg=请先输入访问口令")
+    service = drive_service()
+    if service is None:
+        return redirect("/?msg=云盘暂未连接，无法移动#published")
+    dest_id = (request.form.get("dest_folder_id") or "").strip()
+    raw = request.form.get("file_ids", "") or ""
+    file_ids = [x.strip() for x in raw.split(",") if x.strip()] or request.form.getlist("file_id")
+    if not dest_id or not file_ids:
+        return redirect("/?msg=请选择文件和目标文件夹#published")
+    if dest_id == PUBLISHED_FOLDER_ID:
+        dest_name = "已发布根目录"
+    else:
+        try:
+            dm = get_file(service, dest_id)
+        except Exception:
+            return redirect("/?msg=目标文件夹不存在#published")
+        if dm.get("mimeType") != "application/vnd.google-apps.folder" or PUBLISHED_FOLDER_ID not in (dm.get("parents") or []):
+            return redirect("/?msg=目标文件夹不在已发布里#published")
+        dest_name = dm.get("name", dest_id)
+    moved = 0
+    for fid in file_ids:
+        try:
+            meta = get_file(service, fid)
+        except Exception:
+            continue
+        parents = meta.get("parents") or []
+        if not _is_published_parent(service, parents):
+            continue
+        old = parents[0] if parents else PUBLISHED_FOLDER_ID
+        if old == dest_id:
+            continue
+        service.files().update(fileId=fid, addParents=dest_id, removeParents=old).execute()
+        moved += 1
+    _invalidate_pub_cache()
+    _log("移动到文件夹", f"{moved} 个文件 -> {dest_name}")
+    return redirect(f"/?msg=已移动 {moved} 个文件到 {dest_name}#published")
 
 
 @app.route("/health")
