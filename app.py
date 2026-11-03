@@ -326,7 +326,7 @@ BASE_CSS = """
 
   #toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(20px);background:var(--ink);color:var(--bg);padding:12px 18px;border-radius:999px;font-size:14px;font-weight:700;opacity:0;pointer-events:none;transition:.25s;z-index:50;max-width:calc(100vw - 32px);text-align:center}
   #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-"""
+ @media(max-width:560px){.wrap{padding:20px 12px 40px}.fname{white-space:normal;word-break:break-all}.fmeta{word-break:break-all}.upload,.card{max-width:100%}} body{overflow-x:hidden}.file{min-width:0}.fname{word-break:break-all} """
 
 PAGE = (
     "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
@@ -362,7 +362,8 @@ PAGE = (
     "<button class=\"btn primary\" type=\"submit\" {% if not drive_configured %}disabled{% endif %}>上传，等待审核</button></form>"
     "<p class=\"note\">支持图片、文档、视频、音频、压缩包等常见类型，点打开预览可以在浏览器里直接看图片、PDF 和文本，不用先下载。</p>"
     "<script>var d=document.getElementById('drop'),i=document.getElementById('fileinput');"
-    "d.addEventListener('click',function(){i.click();});"
+    "d.addEventListener('click',function(e){if(e.target!==i){i.click();}});"
+    "i.addEventListener('click',function(e){e.stopPropagation();});"
     "d.addEventListener('dragover',function(e){e.preventDefault();d.classList.add('over');});"
     "d.addEventListener('dragleave',function(){d.classList.remove('over');});"
     "d.addEventListener('drop',function(e){e.preventDefault();d.classList.remove('over');i.files=e.dataTransfer.files;show();});"
@@ -403,7 +404,42 @@ ADMIN_PAGE = (
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<button class=\"btn danger\">不通过（移到回收站）</button></form></div></div>{% endfor %}</div>"
     "{% else %}<p class=\"empty\">目前没有待审核的文件。</p>{% endif %}"
-    "<p><a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    "<p><a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+)
+ADMIN_PAGE = (
+    "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<title>审核 - 交换站</title><style>"
+    + BASE_CSS
+    + "</style></head><body><div class=\"wrap\"><h1>待审核文件</h1>"
+    "{% if not drive_configured %}"
+    "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
+    "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\"><div class=\"fic\">{{ f.ext }}</div>"
+    "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.size }}</span><span class=\"chip wait\">待审核</span></div></div>"
+    "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a><form method=\"post\" action=\"/admin/approve\" style=\"display:inline\">"
+    "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn primary\">通过</button></form> "
+    "<form method=\"post\" action=\"/admin/reject\" style=\"display:inline\">"
+    "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
+    "<button class=\"btn danger\">不通过（移到回收站）</button></form></div></div>{% endfor %}</div>"
+    "{% else %}<p class=\"empty\">目前没有待审核的文件。</p>{% endif %}"
+    "<p><a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+)
+
+ADMIN_PUBLISHED_PAGE = (
+    "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<title>已发布管理 - 交换站</title><style>"
+    + BASE_CSS
+    + "</style></head><body><div class=\"wrap\"><h1>已发布管理</h1>"
+    "<p class=\"note\">这里可以把已发布的文件移到回收站，熟人就再也下载不到了。回收站里的文件不在列表里，需要去云盘回收站看。</p>"
+    "{% if files %}<div class=\"card section\">{% for f in files %}<div class=\"file\"><div class=\"fic\">{{ f.ext }}</div>"
+    "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.kind }}</span><span>·</span><span>{{ f.size }}</span></div></div>"
+    "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a>"
+    "<form method=\"post\" action=\"/admin/delete\" style=\"display:inline\" onsubmit=\"return confirm('确定把这个文件移到回收站吗？');\">"
+    "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
+    "<button class=\"btn danger\">删除（移到回收站）</button></form></div></div>{% endfor %}</div>"
+    "{% else %}<p class=\"empty\">目前没有已发布的文件。</p>{% endif %}"
+    "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
 )
 
 
@@ -516,17 +552,29 @@ def view(file_id):
         return "文件不存在或无权访问", 404
     from googleapiclient.http import MediaIoBaseDownload
 
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, service.files().get_media(fileId=file_id))
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    data = buf.getvalue()
+    ctype = meta.get("mimeType") or "application/octet-stream"
+    # 文本预览必须带 charset=utf-8，否则浏览器默认按 Latin-1 解码，中文会乱码。
+    if ctype.startswith("text/") and "charset" not in ctype:
+        ctype = ctype + "; charset=utf-8"
+
+    def generate_view():
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, service.files().get_media(fileId=file_id))
+        downloader._chunksize = 256 * 1024
+        done = False
+        while not done:
+            buf.seek(0)
+            buf.truncate(0)
+            _, done = downloader.next_chunk()
+            chunk = buf.getvalue()
+            if chunk:
+                yield chunk
+
     return Response(
-        data,
+        generate_view(),
         headers={
             "Content-Disposition": _disposition("inline", meta["name"]),
-            "Content-Type": meta.get("mimeType") or "application/octet-stream",
+            "Content-Type": ctype,
         },
     )
 
@@ -550,16 +598,21 @@ def download(file_id):
     # 不再手动拼 Bearer 令牌，避免过期令牌导致下载到空内容。
     from googleapiclient.http import MediaIoBaseDownload
 
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, service.files().get_media(fileId=file_id))
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    data = buf.getvalue()
-    if not data and meta.get("size"):
-        return "下载失败，请稍后再试", 502
+    def generate_dl():
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, service.files().get_media(fileId=file_id))
+        downloader._chunksize = 256 * 1024
+        done = False
+        while not done:
+            buf.seek(0)
+            buf.truncate(0)
+            _, done = downloader.next_chunk()
+            chunk = buf.getvalue()
+            if chunk:
+                yield chunk
+
     return Response(
-        data,
+        generate_dl(),
         headers={
             "Content-Disposition": _disposition("attachment", meta["name"]),
             "Content-Type": meta.get("mimeType") or "application/octet-stream",
@@ -631,6 +684,38 @@ def reject():
         return "该文件不在待审核里，无法处理", 403
     service.files().update(fileId=file_id, body={"trashed": True}).execute()
     return redirect("/admin")
+
+
+@app.route("/admin/published")
+def admin_published():
+    token = _env("ADMIN_TOKEN")
+    if not token or not _has_gate(token, "admin_access"):
+        return "请先在首页输入站长口令", 403
+    files = list_folder(drive_service(), PUBLISHED_FOLDER_ID)
+    return render_template_string(
+        ADMIN_PUBLISHED_PAGE, files=files, drive_configured=_drive_configured()
+    )
+
+
+@app.route("/admin/delete", methods=["POST"])
+def admin_delete():
+    token = _env("ADMIN_TOKEN")
+    if not token or not _has_gate(token, "admin_access"):
+        return "请先在首页输入站长口令", 403
+    service = drive_service()
+    if service is None:
+        return "云盘暂未连接", 503
+    file_id = request.form.get("file_id", "")
+    if not file_id:
+        return "没有文件", 403
+    try:
+        meta = get_file(service, file_id)
+    except Exception:
+        return "文件不存在或无权访问", 404
+    if PUBLISHED_FOLDER_ID not in (meta.get("parents") or []):
+        return "该文件不在已发布里，无法删除", 403
+    service.files().update(fileId=file_id, body={"trashed": True}).execute()
+    return redirect("/admin/published")
 
 
 @app.route("/health")
