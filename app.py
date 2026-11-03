@@ -452,9 +452,7 @@ PAGE = (
     "<div class=\"file\" data-cat=\"{{ f.kind }}\" data-name=\"{{ f.name|lower }}\">"
     "{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" alt=\"\" loading=\"lazy\" onerror=\"this.outerHTML='<div class=\\'fic\\'>{{ f.ext }}</div>'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
     "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.kind }}</span><span>·</span><span>{{ f.size }}</span></div>"
-    "<form class=\"renameform\" method=\"post\" action=\"/rename\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
-    "<input type=\"hidden\" name=\"back\" value=\"/\"><input class=\"renametext\" type=\"text\" name=\"new_name\" placeholder=\"改个名字…\" required>"
-    "<button class=\"btn\">改名</button></form></div>"
+"</div>"
     "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a><a class=\"btn primary\" href=\"/download/{{ f.id }}\">下载</a></div></div>"
     "{% endif %}{% endfor %}</div>"
     "{% endif %}{% endfor %}{% else %}<p class=\"empty\">目前还没有已发布的文件。</p>{% endif %}</section>"
@@ -480,7 +478,10 @@ ADMIN_PAGE = (
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
     "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\"><div class=\"fic\">{{ f.ext }}</div>"
     "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.size }}</span><span class=\"chip wait\">待审核</span></div></div>"
-    "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a><form method=\"post\" action=\"/admin/approve\" style=\"display:inline\">"
+    "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a>"
+    "<form class=\"renameform\" method=\"post\" action=\"/rename\" style=\"display:inline-flex\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
+    "<input type=\"hidden\" name=\"back\" value=\"/admin\"><input class=\"renametext\" type=\"text\" name=\"new_name\" placeholder=\"改个名字…\" required>"
+    "<button class=\"btn\">改名</button></form><form method=\"post\" action=\"/admin/approve\" style=\"display:inline\">"
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn primary\">通过</button></form> "
     "<form method=\"post\" action=\"/admin/reject\" style=\"display:inline\">"
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
@@ -498,7 +499,10 @@ ADMIN_PAGE = (
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
     "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\"><div class=\"fic\">{{ f.ext }}</div>"
     "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.size }}</span><span class=\"chip wait\">待审核</span></div></div>"
-    "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a><form method=\"post\" action=\"/admin/approve\" style=\"display:inline\">"
+    "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a>"
+    "<form class=\"renameform\" method=\"post\" action=\"/rename\" style=\"display:inline-flex\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
+    "<input type=\"hidden\" name=\"back\" value=\"/admin\"><input class=\"renametext\" type=\"text\" name=\"new_name\" placeholder=\"改个名字…\" required>"
+    "<button class=\"btn\">改名</button></form><form method=\"post\" action=\"/admin/approve\" style=\"display:inline\">"
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn primary\">通过</button></form> "
     "<form method=\"post\" action=\"/admin/reject\" style=\"display:inline\">"
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
@@ -517,6 +521,9 @@ ADMIN_PUBLISHED_PAGE = (
     "{% if files %}<div class=\"card section\">{% for f in files %}<div class=\"file\"><div class=\"fic\">{{ f.ext }}</div>"
     "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.kind }}</span><span>·</span><span>{{ f.size }}</span></div></div>"
     "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a>"
+    "<form class=\"renameform\" method=\"post\" action=\"/rename\" style=\"display:inline-flex\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
+    "<input type=\"hidden\" name=\"back\" value=\"/admin/published\"><input class=\"renametext\" type=\"text\" name=\"new_name\" placeholder=\"改个名字…\" required>"
+    "<button class=\"btn\">改名</button></form>"
     "<form method=\"post\" action=\"/admin/delete\" style=\"display:inline\" onsubmit=\"return confirm('确定把这个文件移到回收站吗？');\">"
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<button class=\"btn danger\">删除（移到回收站）</button></form></div></div>{% endfor %}</div>"
@@ -897,7 +904,8 @@ def thumb(file_id):
 
 @app.route("/rename", methods=["POST"])
 def rename():
-    """改名：熟人可改已发布文件的名字，站长可改待审核/已发布文件的名字。
+    """改名：只有站长能改名（已发布和待审核都行），熟人不能改已发布区的文件。
+    原因：本站没有每人账号，分不出谁是原上传者，放开给熟人等于谁都能改别人的名字。
     只改名字不改内容，后缀不写时自动保留原后缀；改名会记进访问日志。"""
     service = drive_service()
     if service is None:
@@ -916,14 +924,10 @@ def rename():
     parents = meta.get("parents") or []
     is_published = PUBLISHED_FOLDER_ID in parents
     is_pending = PENDING_FOLDER_ID in parents
-    code = _env("EXCHANGE_CODE")
     token = _env("ADMIN_TOKEN")
-    is_friend = bool(code) and _has_gate(code, "exchange_access")
     is_admin = bool(token) and _has_gate(token, "admin_access")
-    if is_published and not (is_friend or is_admin):
-        return "请先输入访问口令", 403
-    if is_pending and not is_admin:
-        return "待审核文件只有站长能改名", 403
+    if not is_admin:
+        return "只有站长能改名，请先在站长区输入站长口令", 403
     if not is_published and not is_pending:
         return "文件不存在或无权访问", 404
     old_name = meta.get("name", "")
