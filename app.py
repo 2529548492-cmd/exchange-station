@@ -285,31 +285,14 @@ BASE_CSS = """
     --shadow:0 8px 28px rgba(23,33,26,.07);
     --radius:18px;
   }
-  @media (prefers-color-scheme: dark){
-    :root{
-      --bg:#111511;
-      --surface:#1a1f1a;
-      --surface-2:#222822;
-      --ink:#e8ede8;
-      --muted:#9aa89d;
-      --line:#2e362e;
-      --green:#3cb179;
-      --green-ink:#7ed3a6;
-      --green-soft:#1e3327;
-      --amber:#e5b64a;
-      --amber-soft:#332a12;
-      --amber-line:#5a4a1a;
-      --red:#ff8a7a;
-      --red-soft:#3a1d19;
-      --shadow:0 8px 28px rgba(0,0,0,.35);
-    }
-  }
+  /* 固定浅色主题：手机和电脑显示一致，不跟随系统深色，避免对比度变差 */
   *{box-sizing:border-box}
   html{scroll-behavior:smooth}
   body{margin:0;background:var(--bg);color:var(--ink);font-family:"Noto Sans SC",system-ui,-apple-system,sans-serif;line-height:1.6}
   a{color:var(--green)}
   button,input{font:inherit}
-  .wrap{max-width:1120px;margin:0 auto;padding:28px 20px 56px}
+  .wrap{max-width:900px;margin:0 auto;padding:28px 20px 56px}
+  @media(min-width:861px){.wrap{padding:28px 24px 56px}h1{font-size:38px}.topnav a{padding:13px 8px;font-size:16px}}
 
   /* Header */
   .top{display:flex;gap:24px;justify-content:space-between;align-items:flex-start;flex-wrap:wrap}
@@ -334,7 +317,6 @@ BASE_CSS = """
   .rolebar{margin-top:22px;background:var(--ink);color:var(--bg);border-radius:14px;padding:14px 16px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;justify-content:space-between}
   .rolebar p{margin:0;font-size:14px;opacity:.92}
   .seg{display:flex;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.18);padding:4px;border-radius:999px;gap:4px}
-  @media (prefers-color-scheme: dark){.seg{background:rgba(0,0,0,.3)}}
   .seg button{border:0;background:transparent;color:inherit;padding:8px 16px;border-radius:999px;cursor:pointer;font-weight:700;font-size:14px}
   .seg button.active{background:var(--bg);color:var(--ink)}
 
@@ -372,6 +354,7 @@ BASE_CSS = """
 
   .file{display:flex;gap:14px;padding:15px 0;border-top:1px solid var(--line);align-items:center}
   .file:first-of-type{border-top:0}
+  .filelist{margin-top:12px}.filelist .btn{padding:6px 10px;font-size:13px}
   .renameform{display:flex;gap:6px;margin-top:8px}.renametext{flex:1;min-width:0;padding:8px 10px;border-radius:10px;border:1px solid var(--line);background:var(--surface);color:var(--ink);font-size:14px}
   .topnav{position:sticky;top:0;z-index:20;background:var(--bg);padding:10px 0;display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--line);margin-bottom:16px}.topnav a{flex:1;text-align:center;text-decoration:none;border:1px solid var(--line);background:var(--surface);color:var(--ink);padding:11px 6px;border-radius:12px;font-weight:800;font-size:15px}.topnav a.active{background:var(--green);border-color:var(--green);color:#fff}.tabpanel{display:none}.tabpanel.active{display:block}
   .thumb{width:46px;height:46px;object-fit:cover;border-radius:12px;border:1px solid var(--line);flex-shrink:0;background:var(--surface-2)}
@@ -477,7 +460,7 @@ PAGE = (
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>网站可以打开，但上传和下载暂不可用。</div>"
     "{% endif %}"
     "<div class=\"tabpanel\" id=\"tab-publish\"><div class=\"card upload\"><h2>上传文件</h2>"
-    "<p class=\"note\">上传后别人看不到，等站长通过后才会出现在已发布列表。一次上传总量不超过 {{ max_mb }} MB，例如一次拖 3 个视频，总共别超 {{ max_mb }} MB 就行。</p>"
+    "<p class=\"note\">上传后别人看不到，等站长通过后才会出现在已发布列表。一次最多传 3 个文件，按 1、2、3 的顺序排好再传，总量不超过 {{ max_mb }} MB。</p>"
     "<form method=\"post\" action=\"/upload\" enctype=\"multipart/form-data\">"
     "<div class=\"drop\" id=\"drop\"><strong>点这里选文件，或把文件拖进来</strong><span>支持多选 · 提交后进入待审核</span>"
     "<br><input type=\"file\" id=\"fileinput\" name=\"file\" multiple required></div>"
@@ -492,9 +475,16 @@ PAGE = (
     "i.addEventListener('click',function(e){e.stopPropagation();});"
     "d.addEventListener('dragover',function(e){e.preventDefault();d.classList.add('over');});"
     "d.addEventListener('dragleave',function(){d.classList.remove('over');});"
-    "d.addEventListener('drop',function(e){e.preventDefault();d.classList.remove('over');i.files=e.dataTransfer.files;show();});"
-    "function show(){var l=document.getElementById('filelist');var fs=Array.from(i.files);var tot=fs.reduce(function(a,f){return a+f.size;},0);var mb=(tot/1048576).toFixed(1);l.textContent=fs.map(function(f){return f.name+'（'+(f.size<1048576?(f.size/1024).toFixed(1)+' KB':(f.size/1048576).toFixed(1)+' MB')+'）';}).join('\n')+'\n共 '+fs.length+' 个文件，总计 '+mb+' MB'+(tot>{{ max_mb }}*1048576?'，已超过 {{ max_mb }} MB 上限，请减少文件或分批上传':'');var b=document.getElementById('uploadbtn');if(b){b.disabled=tot>{{ max_mb }}*1048576;}}"
-    "i.addEventListener('change',show);</script>"
+    "d.addEventListener('drop',function(e){e.preventDefault();d.classList.remove('over');addQ(e.dataTransfer.files);});"
+    "var queue=[];function fmtSize(z){return z<1048576?(z/1024).toFixed(1)+' KB':(z/1048576).toFixed(1)+' MB';}"
+    "function syncInput(){var dt=new DataTransfer();queue.forEach(function(f){dt.items.add(f);});i.files=dt.files;}"
+    "function show(){var l=document.getElementById('filelist');var tot=queue.reduce(function(a,f){return a+f.size;},0);var mb=(tot/1048576).toFixed(1);var over=queue.length>3||tot>{{ max_mb }}*1048576;"
+    "l.innerHTML=queue.map(function(f,idx){return '<div style=\"display:flex;gap:8px;align-items:center;padding:8px 0;border-top:1px solid var(--line)\"><b>'+(idx+1)+'</b><span style=\"flex:1;min-width:0;word-break:break-all\">'+f.name+'（'+fmtSize(f.size)+'）</span><button type=\"button\" class=\"btn\" onclick=\"moveQ('+idx+',-1)\">↑</button><button type=\"button\" class=\"btn\" onclick=\"moveQ('+idx+',1)\">↓</button><button type=\"button\" class=\"btn\" onclick=\"delQ('+idx+')\">×</button></div>';}).join('')+(queue.length?'<div style=\"padding:8px 0;font-weight:700\">'+(dropped?'（已忽略多余的 '+dropped+' 个，一次最多 3 个）':'')+'共 '+queue.length+' 个文件，总计 '+mb+' MB'+(queue.length>3?'，一次最多 3 个，请删到 3 个以内':'')+(tot>{{ max_mb }}*1048576?'，已超过 {{ max_mb }} MB 上限，请减少文件或分批上传':'')+'</div>':'');"
+    "var b=document.getElementById('uploadbtn');if(b){b.disabled=over||!queue.length;}}"
+    "function moveQ(idx,d){var j=idx+d;if(j<0||j>=queue.length){return;}var t=queue[idx];queue[idx]=queue[j];queue[j]=t;syncInput();show();}"
+    "function delQ(idx){queue.splice(idx,1);syncInput();show();}"
+    "var dropped=0;function addQ(fs){var before=queue.length;Array.from(fs).forEach(function(f){if(queue.length<3){queue.push(f);}else{dropped++;}});syncInput();show();}"
+    "i.addEventListener('change',function(){addQ(i.files);});</script>"
     "{% if msg %}<p class=\"note\">{{ msg }}</p>{% endif %}</div></div>"
     "<div class=\"tabpanel active\" id=\"tab-published\"><div class=\"toolbar\"><input class=\"search\" id=\"search\" type=\"search\" placeholder=\"搜索文件名…\" oninput=\"onSearch(this.value)\"></div>"
     "<section class=\"card section\"><div class=\"section-head\"><h2>已发布</h2><span class=\"count\">{{ files|length }} 个</span></div>"
