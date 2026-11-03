@@ -310,7 +310,7 @@ BASE_CSS = """
   .btn.danger{color:var(--red);border-color:var(--line)}
   .btn.danger:hover{background:var(--red-soft)}
   .btn:active{transform:scale(.98)}
-  @media(max-width:560px){.file{flex-wrap:wrap}.actions{width:100%;padding-left:60px}.search{max-width:none}}
+  @media(max-width:560px){.search{max-width:none}}
   .empty{padding:28px 10px;text-align:center;color:var(--muted);font-size:14px;border:1.5px dashed var(--line);border-radius:12px;margin-top:12px}
   .locked{padding:18px;border-radius:12px;background:var(--surface-2);border:1px solid var(--line);font-size:14px;color:var(--muted);margin-top:10px}
 
@@ -326,7 +326,41 @@ BASE_CSS = """
 
   #toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(20px);background:var(--ink);color:var(--bg);padding:12px 18px;border-radius:999px;font-size:14px;font-weight:700;opacity:0;pointer-events:none;transition:.25s;z-index:50;max-width:calc(100vw - 32px);text-align:center}
   #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
- @media(max-width:560px){.wrap{padding:20px 12px 40px}.fname{white-space:normal;word-break:break-all}.fmeta{word-break:break-all}.upload,.card{max-width:100%}} body{overflow-x:hidden}.file{min-width:0}.fname{word-break:break-all} """
+ body{overflow-x:hidden}.file{min-width:0}.fname{word-break:break-all}
+  /* Mobile-first polish: phone is the main way Ryan's friends will use this */
+  @media(max-width:640px){
+    .wrap{padding:18px 12px 40px}
+    h1{font-size:32px}
+    .lead{font-size:15px}
+    .badge-live{white-space:normal}
+    .flow{gap:8px;margin-top:18px}
+    .step{padding:14px 16px}
+    .layout{gap:14px;margin-top:14px}
+    .upload{padding:18px 16px}
+    .section{padding:16px}
+    .bottom{margin-top:14px}
+    .bottom .card{padding:18px 16px}
+    .search{max-width:none;width:100%}
+    .toolbar{flex-direction:column;align-items:stretch}
+    .textin{font-size:16px;padding:13px}
+    .drop{padding:28px 14px}
+    .file{display:grid;grid-template-columns:46px 1fr;gap:10px 12px;align-items:start}
+    .file .fic{grid-row:1}
+    .file .fmain{min-width:0}
+    .fname{white-space:normal;overflow:visible;text-overflow:clip;font-size:15.5px}
+    .fmeta{word-break:break-all}
+    .actions{grid-column:1 / -1;width:100%;padding-left:0;display:flex}
+    .actions .btn,.actions form{flex:1}
+    .actions .btn{width:100%;text-align:center;justify-content:center;min-height:44px;display:inline-flex;align-items:center}
+    .actions form .btn{width:100%}
+    form{display:flex;flex-wrap:wrap;gap:10px}
+    form .textin{flex:1 1 100%}
+    form .btn{flex:1 1 auto;min-height:44px}
+    .upload form{flex-direction:column}
+    .upload form .btn{width:100%}
+    .upload .drop{width:100%}
+  }
+ """
 
 PAGE = (
     "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
