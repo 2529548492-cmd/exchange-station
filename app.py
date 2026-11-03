@@ -1974,7 +1974,9 @@ def admin_logs():
 @app.route("/thumb/<file_id>")
 def thumb(file_id):
     """图片缩略图：只给已发布（熟人）或待审核（站长）看，权限和预览一致。
-    用 Pillow 缩到 160 像素宽再返回，没有 Pillow 时原图返回，浏览器按 CSS 缩放。"""
+    狠压版（2026-11-03）：手机相册格子约 120 像素宽，缩略图只留 192 像素长边、
+    JPEG 质量 45，目标是手机上能认出图片是什么就行，不追求清晰；点开预览时
+    仍走 /view 看原图。没有 Pillow 时原图返回，浏览器按 CSS 缩放。"""
     if _is_relay():
         return _proxy_to_backend(f"/thumb/{file_id}")
     service = drive_service()
@@ -2017,12 +2019,20 @@ def thumb(file_id):
         _, done = downloader.next_chunk()
     data = buf.getvalue()
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
 
         im = Image.open(io.BytesIO(data))
-        im.thumbnail((320, 320))
+        im = ImageOps.exif_transpose(im)
+        im.thumbnail((192, 192))
+        if im.mode in ("RGBA", "LA", "P"):
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            alpha = im.convert("RGBA").split()[3]
+            bg.paste(im.convert("RGBA"), mask=alpha)
+            im = bg
+        else:
+            im = im.convert("RGB")
         out = io.BytesIO()
-        im.convert("RGB").save(out, format="JPEG", quality=80)
+        im.save(out, format="JPEG", quality=45, optimize=True)
         return Response(out.getvalue(), headers={"Content-Type": "image/jpeg", "Cache-Control": "public, max-age=86400"})
     except Exception:
         return Response(data, headers={"Content-Type": meta.get("mimeType") or "image/jpeg", "Cache-Control": "public, max-age=86400"})
