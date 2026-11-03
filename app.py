@@ -179,6 +179,57 @@ def _flush_drive_log():
         _DRIVE_LOG_BUFFER = lines + _DRIVE_LOG_BUFFER
 
 
+
+ACCOUNTS_FILE_NAME = "交换站账号.txt"
+
+
+def _read_accounts(service):
+    if service is None:
+        return []
+    try:
+        res = service.files().list(q=f"name = '{ACCOUNTS_FILE_NAME}' and trashed = false", fields="files(id)", pageSize=5).execute()
+        fl = res.get("files") or []
+        if not fl:
+            return []
+        from googleapiclient.http import MediaIoBaseDownload
+        buf = io.BytesIO()
+        dl = MediaIoBaseDownload(buf, service.files().get_media(fileId=fl[0]["id"]))
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        out = []
+        for line in buf.getvalue().decode("utf-8", errors="ignore").strip().split("\n"):
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                out.append({"name": parts[0], "password": parts[1], "created": parts[2], "last": parts[3] if len(parts) > 3 else "", "disabled": parts[4] if len(parts) > 4 else "0"})
+        return out
+    except Exception:
+        return []
+
+
+def _write_accounts(service, accounts):
+    from googleapiclient.http import MediaIoBaseUpload
+    body = "\n".join(f"{a['name']}\t{a['password']}\t{a['created']}\t{a.get('last','')}\t{a.get('disabled','0')}" for a in accounts)
+    media = MediaIoBaseUpload(io.BytesIO(body.encode("utf-8")), mimetype="text/plain", resumable=False)
+    try:
+        res = service.files().list(q=f"name = '{ACCOUNTS_FILE_NAME}' and trashed = false", fields="files(id)", pageSize=5).execute()
+        fl = res.get("files") or []
+        if fl:
+            service.files().update(fileId=fl[0]["id"], media_body=media).execute()
+        else:
+            service.files().create(body={"name": ACCOUNTS_FILE_NAME, "mimeType": "text/plain"}, media_body=media, fields="id").execute()
+        return True
+    except Exception as e:
+        print(f"[accounts] write failed: {e}", flush=True)
+        return False
+
+
+def _account_gate():
+    return request.cookies.get("feedback_user", "")
+
+
 FEEDBACK_FILE_NAME = "交换站意见.txt"
 _FEEDBACK_CACHE = {"t": 0, "items": []}
 
@@ -213,8 +264,8 @@ def _read_feedback(service):
             if not line.strip():
                 continue
             parts = line.split("\\t", 3)
-            if len(parts) == 4:
-                items.append({"id": parts[0], "time": parts[1], "status": parts[2], "text": parts[3]})
+            if len(parts) >= 4:
+                items.append({"id": parts[0], "time": parts[1], "status": parts[2], "text": parts[3], "author": parts[4] if len(parts) > 4 else ""})
         items.reverse()
         return items
     except Exception:
@@ -670,8 +721,11 @@ PAGE = (
     "{% endif %}"
     "<div class=\"tabpanel\" id=\"tab-feedback\"><div class=\"card section\"><h2>意见区</h2>"
     "<p class=\"note\">有意见就写在这里，大家都能看见。站长处理完会把状态改成已解决。</p>"
-    "<form method=\"post\" action=\"/feedback\"><textarea class=\"textin\" name=\"text\" rows=\"3\" placeholder=\"写下你的意见…\" required style=\"width:100%\"></textarea><br><button class=\"btn primary\" style=\"margin-top:8px\">提交意见</button></form>"
-    "{% if feedback %}{% for fb in feedback %}<div class=\"logrow\"><div class=\"fname\">{{ fb.text }}</div><div class=\"fmeta\"><span>{{ fb.time }}</span><span>·</span>{% if fb.status == 'done' %}<span class=\"chip\">已解决</span>{% else %}<span class=\"chip wait\">未解决</span>{% endif %}</div></div>{% endfor %}{% else %}<p class=\"empty\">目前还没有意见。</p>{% endif %}</div></div>"
+    "{% if fb_user %}<p class=\"note\">当前账号：{{ fb_user }} · <a href=\"/logout_feedback\">退出</a></p><form method=\"post\" action=\"/feedback\"><textarea class=\"textin\" name=\"text\" rows=\"3\" placeholder=\"写下你的意见…\" required style=\"width:100%\"></textarea><br><button class=\"btn primary\" style=\"margin-top:8px\">提交意见</button></form>"
+    "{% else %}<div class=\"card section\"><h3>提意见要先注册 / 登录</h3><p class=\"note\">意见大家都能看见，但提意见要先有账号，这样才知道是谁提的。注册的账号密码存在云端，站长能看见和管理，请不要用重要密码注册。</p>"
+    "<form method=\"post\" action=\"/register\"><input class=\"textin\" name=\"name\" placeholder=\"账号名\" required> <input class=\"textin\" type=\"password\" name=\"password\" placeholder=\"密码\" required> <button class=\"btn primary\">注册</button></form>"
+    "<form method=\"post\" action=\"/login_feedback\" style=\"margin-top:8px\"><input class=\"textin\" name=\"name\" placeholder=\"账号名\" required> <input class=\"textin\" type=\"password\" name=\"password\" placeholder=\"密码\" required> <button class=\"btn\">登录</button></form></div>{% endif %}"
+    "{% if feedback %}{% for fb in feedback %}<div class=\"logrow\"><div class=\"fname\">{{ fb.text }}</div><div class=\"fmeta\"><span>{{ fb.author }}</span><span>·</span><span>{{ fb.time }}</span><span>·</span>{% if fb.status == 'done' %}<span class=\"chip\">已解决</span>{% else %}<span class=\"chip wait\">未解决</span>{% endif %}</div></div>{% endfor %}{% else %}<p class=\"empty\">目前还没有意见。</p>{% endif %}</div></div>"
     "<div class=\"tabpanel\" id=\"tab-admin\"><div class=\"card section\"><h2>站长审核</h2>"
     "<p class=\"note\">站长入口与熟人入口分开，站长口令只在审核页使用。</p>"
     "<form method=\"post\" action=\"/admin/login\">"
@@ -700,7 +754,7 @@ ADMIN_PAGE = (
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<button class=\"btn danger\">不通过（移到回收站）</button></form></div></div>{% endfor %}</div>"
     "{% else %}<p class=\"empty\">目前没有待审核的文件。</p>{% endif %}"
-    "<p><a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    "<p><a href=\"/admin/accounts\">账号管理</a> · <a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
 )
 ADMIN_PAGE = (
     "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
@@ -721,7 +775,7 @@ ADMIN_PAGE = (
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<button class=\"btn danger\">不通过（移到回收站）</button></form></div></div>{% endfor %}</div>"
     "{% else %}<p class=\"empty\">目前没有待审核的文件。</p>{% endif %}"
-    "<p><a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    "<p><a href=\"/admin/accounts\">账号管理</a> · <a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
 )
 
 ADMIN_PUBLISHED_PAGE = (
@@ -790,6 +844,7 @@ def index():
         cats=cats,
         files=files,
         feedback=_read_feedback(drive_service()) if entered else [],
+        fb_user=_account_gate(),
         max_mb=MAX_UPLOAD_MB,
         msg=request.args.get("msg", ""),
     )
@@ -1081,6 +1136,9 @@ def feedback_submit():
     code = _env("EXCHANGE_CODE")
     if not _has_gate(code, "exchange_access"):
         return redirect("/?msg=请先输入访问口令")
+    fb_user = _account_gate()
+    if not fb_user:
+        return redirect("/?msg=提意见要先注册登录#feedback")
     text = (request.form.get("text") or "").strip().replace("\n", " ").replace("\t", " ")
     if not text:
         return redirect("/#feedback")
@@ -1093,7 +1151,7 @@ def feedback_submit():
     import time as _t, random as _r
     now = datetime.now(timezone.utc) + timedelta(hours=8)
     fid = now.strftime("%Y%m%d%H%M%S") + str(_r.randint(100, 999))
-    items.insert(0, {"id": fid, "time": now.strftime("%Y-%m-%d %H:%M"), "status": "open", "text": text})
+    items.insert(0, {"id": fid, "time": now.strftime("%Y-%m-%d %H:%M"), "status": "open", "text": text, "author": fb_user})
     # _write_feedback expects oldest first
     if _write_feedback(service, list(reversed(items))):
         _log("提意见", text[:20])
@@ -1117,6 +1175,114 @@ def feedback_resolve():
     _write_feedback(service, list(reversed(items)))
     _log("改意见状态", fid)
     return redirect("/admin")
+
+
+
+@app.route("/register", methods=["POST"])
+def register():
+    code = _env("EXCHANGE_CODE")
+    if not _has_gate(code, "exchange_access"):
+        return redirect("/?msg=请先输入访问口令")
+    name = (request.form.get("name") or "").strip()
+    pw = request.form.get("password") or ""
+    if not name or not pw or len(name) > 20 or len(pw) > 50:
+        return redirect("/?msg=账号名和密码不能为空#feedback")
+    service = drive_service()
+    if service is None:
+        return redirect("/?msg=云盘暂未连接，注册暂不可用#feedback")
+    accounts = _read_accounts(service)
+    if any(a["name"] == name for a in accounts):
+        return redirect("/?msg=这个账号名已经被注册了，换一个#feedback")
+    now = datetime.now(timezone.utc) + timedelta(hours=8)
+    accounts.append({"name": name, "password": pw, "created": now.strftime("%Y-%m-%d %H:%M"), "last": "", "disabled": "0"})
+    if _write_accounts(service, accounts):
+        resp = redirect("/?msg=注册成功，已自动登录，可以提意见了#feedback")
+        resp.set_cookie("feedback_user", name, httponly=True, samesite="Lax")
+        return resp
+    return redirect("/?msg=注册失败，请重试#feedback")
+
+
+@app.route("/login_feedback", methods=["POST"])
+def login_feedback():
+    code = _env("EXCHANGE_CODE")
+    if not _has_gate(code, "exchange_access"):
+        return redirect("/?msg=请先输入访问口令")
+    name = (request.form.get("name") or "").strip()
+    pw = request.form.get("password") or ""
+    service = drive_service()
+    accounts = _read_accounts(service) if service else []
+    for a in accounts:
+        if a["name"] == name and a["password"] == pw:
+            if a.get("disabled") == "1":
+                return redirect("/?msg=这个账号已被站长禁用#feedback")
+            a["last"] = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
+            _write_accounts(service, accounts)
+            resp = redirect("/?msg=登录成功#feedback")
+            resp.set_cookie("feedback_user", name, httponly=True, samesite="Lax")
+            return resp
+    return redirect("/?msg=账号或密码不对#feedback")
+
+
+@app.route("/logout_feedback")
+def logout_feedback():
+    resp = redirect("/#feedback")
+    resp.delete_cookie("feedback_user")
+    return resp
+
+
+@app.route("/admin/accounts")
+def admin_accounts():
+    token = _env("ADMIN_TOKEN")
+    if not token or not _has_gate(token, "admin_access"):
+        return "请先在首页输入站长口令", 403
+    service = drive_service()
+    accounts = _read_accounts(service) if service else []
+    rows = "".join(
+        f"<div class=\"logrow\"><div class=\"fname\">{a['name']}</div><div class=\"fmeta\"><span>密码：{a['password']}</span><span>·</span><span>注册：{a['created']}</span><span>·</span><span>最后登录：{a.get('last','')}</span><span>·</span><span>{'已禁用' if a.get('disabled')=='1' else '正常'}</span></div>"
+        f"<form method=\"post\" action=\"/admin/accounts/change\" style=\"margin-top:6px\"><input type=\"hidden\" name=\"name\" value=\"{a['name']}\">"
+        f"<input class=\"textin\" type=\"text\" name=\"new_password\" placeholder=\"新密码\" required> <button class=\"btn\">改密码</button> "
+        f"<button class=\"btn\" formaction=\"/admin/accounts/toggle\">{'解封' if a.get('disabled')=='1' else '禁用'}</button></form></div>"
+        for a in accounts
+    ) or "<p class=\"empty\">目前还没有注册账号。</p>"
+    return render_template_string(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>账号管理 - 交换站</title><style>" + BASE_CSS + "</style></head><body><div class=\"wrap\">"
+        "<h1>账号管理</h1><p class=\"note\">站长能看见账号和密码，也能改密码、禁用 / 解封。请提醒用户不要用重要密码注册。</p>"
+        "<div class=\"card section\">" + rows + "</div>"
+        "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    )
+
+
+@app.route("/admin/accounts/change", methods=["POST"])
+def admin_accounts_change():
+    token = _env("ADMIN_TOKEN")
+    if not token or not _has_gate(token, "admin_access"):
+        return "只有站长能改", 403
+    name = request.form.get("name") or ""
+    new_pw = request.form.get("new_password") or ""
+    service = drive_service()
+    accounts = _read_accounts(service) if service else []
+    for a in accounts:
+        if a["name"] == name and new_pw:
+            a["password"] = new_pw
+    _write_accounts(service, accounts)
+    return redirect("/admin/accounts")
+
+
+@app.route("/admin/accounts/toggle", methods=["POST"])
+def admin_accounts_toggle():
+    token = _env("ADMIN_TOKEN")
+    if not token or not _has_gate(token, "admin_access"):
+        return "只有站长能改", 403
+    name = request.form.get("name") or ""
+    service = drive_service()
+    accounts = _read_accounts(service) if service else []
+    for a in accounts:
+        if a["name"] == name:
+            a["disabled"] = "0" if a.get("disabled") == "1" else "1"
+    _write_accounts(service, accounts)
+    return redirect("/admin/accounts")
 
 
 @app.route("/admin/login", methods=["POST"])
