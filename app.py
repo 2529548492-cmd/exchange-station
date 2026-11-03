@@ -411,12 +411,12 @@ PAGE = (
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>网站可以打开，但上传和下载暂不可用。</div>"
     "{% endif %}"
     "<div class=\"layout\"><aside class=\"card upload\"><h2>上传文件</h2>"
-    "<p class=\"note\">上传后别人看不到，等站长通过后才会出现在已发布列表。单文件上限 {{ max_mb }} MB。</p>"
+    "<p class=\"note\">上传后别人看不到，等站长通过后才会出现在已发布列表。一次上传总量不超过 {{ max_mb }} MB，例如一次拖 3 个视频，总共别超 {{ max_mb }} MB 就行。</p>"
     "<form method=\"post\" action=\"/upload\" enctype=\"multipart/form-data\">"
     "<div class=\"drop\" id=\"drop\"><strong>点这里选文件，或把文件拖进来</strong><span>支持多选 · 提交后进入待审核</span>"
     "<br><input type=\"file\" id=\"fileinput\" name=\"file\" multiple required></div>"
     "<div class=\"filelist\" id=\"filelist\"></div>"
-    "<button class=\"btn primary\" type=\"submit\" {% if not drive_configured %}disabled{% endif %}>上传，等待审核</button></form>"
+    "<button class=\"btn primary\" id=\"uploadbtn\" type=\"submit\" {% if not drive_configured %}disabled{% endif %}>上传，等待审核</button></form>"
     "<p class=\"note\">支持图片、文档、视频、音频、压缩包等常见类型，点打开预览可以在浏览器里直接看图片、PDF 和文本，不用先下载。</p>"
     "<script>var d=document.getElementById('drop'),i=document.getElementById('fileinput');"
     "d.addEventListener('click',function(e){if(e.target!==i){i.click();}});"
@@ -424,7 +424,7 @@ PAGE = (
     "d.addEventListener('dragover',function(e){e.preventDefault();d.classList.add('over');});"
     "d.addEventListener('dragleave',function(){d.classList.remove('over');});"
     "d.addEventListener('drop',function(e){e.preventDefault();d.classList.remove('over');i.files=e.dataTransfer.files;show();});"
-    "function show(){var l=document.getElementById('filelist');l.textContent=Array.from(i.files).map(function(f){return f.name+'（'+(f.size<1024?f.size+' B':(f.size/1024).toFixed(1)+' KB')+'）';}).join('\n');}"
+    "function show(){var l=document.getElementById('filelist');var fs=Array.from(i.files);var tot=fs.reduce(function(a,f){return a+f.size;},0);var mb=(tot/1048576).toFixed(1);l.textContent=fs.map(function(f){return f.name+'（'+(f.size<1048576?(f.size/1024).toFixed(1)+' KB':(f.size/1048576).toFixed(1)+' MB')+'）';}).join('\n')+'\n共 '+fs.length+' 个文件，总计 '+mb+' MB'+(tot>{{ max_mb }}*1048576?'，已超过 {{ max_mb }} MB 上限，请减少文件或分批上传':'');var b=document.getElementById('uploadbtn');if(b){b.disabled=tot>{{ max_mb }}*1048576;}}"
     "i.addEventListener('change',show);</script>"
     "{% if msg %}<p class=\"note\">{{ msg }}</p>{% endif %}</aside>"
     "<div class=\"maincol\"><div class=\"toolbar\"><input class=\"search\" id=\"search\" type=\"search\" placeholder=\"搜索文件名…\" oninput=\"onSearch(this.value)\"></div>"
@@ -830,7 +830,7 @@ def health():
 
 @app.errorhandler(413)
 def too_large(_error):
-    return redirect(f"/?msg=文件太大了，单文件上限是 {MAX_UPLOAD_MB} MB，请分批或压缩后再传")
+    return redirect(f"/?msg=一次上传总量超过了 {MAX_UPLOAD_MB} MB，请减少文件或分批上传")
 
 
 if __name__ == "__main__":
