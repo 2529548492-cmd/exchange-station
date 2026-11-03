@@ -183,7 +183,7 @@ def list_folder(service, folder_id):
         return []
     res = service.files().list(
         q=f"'{folder_id}' in parents and trashed=false",
-        fields="files(id,name,size,mimeType)",
+        fields="files(id,name,size,mimeType,thumbnailLink)",
         pageSize=100,
     ).execute()
     out = []
@@ -196,6 +196,8 @@ def list_folder(service, folder_id):
                 "ext": (f["name"].rsplit(".", 1)[-1].upper()[:4] if "." in f["name"] else "FILE"),
                 "kind": _file_kind(f["name"], f.get("mimeType") or ""),
                 "is_image": (f.get("mimeType") or "").startswith("image/"),
+                "is_video": (f.get("mimeType") or "").startswith("video/"),
+                "thumb_link": f.get("thumbnailLink") or "",
             }
         )
     return out
@@ -203,7 +205,7 @@ def list_folder(service, folder_id):
 
 def get_file(service, file_id):
     return service.files().get(
-        fileId=file_id, fields="id,name,size,mimeType,parents"
+        fileId=file_id, fields="id,name,size,mimeType,parents,thumbnailLink"
     ).execute()
 
 
@@ -319,6 +321,7 @@ BASE_CSS = """
 
   .file{display:flex;gap:14px;padding:15px 0;border-top:1px solid var(--line);align-items:center}
   .file:first-of-type{border-top:0}
+  .renameform{display:flex;gap:6px;margin-top:8px}.renametext{flex:1;min-width:0;padding:8px 10px;border-radius:10px;border:1px solid var(--line);background:var(--surface);color:var(--ink);font-size:14px}
   .thumb{width:46px;height:46px;object-fit:cover;border-radius:12px;border:1px solid var(--line);flex-shrink:0;background:var(--surface-2)}
   .fic{width:46px;height:46px;border-radius:12px;background:var(--surface-2);border:1px solid var(--line);display:grid;place-items:center;flex-shrink:0;font-size:11px;font-weight:900;letter-spacing:.04em;color:var(--green-ink)}
   .fic.pdf{color:#b42318}.fic.zip{color:#7a4a00}.fic.img{color:#175c8a}.fic.audio{color:#6d3bbf}
@@ -437,8 +440,11 @@ PAGE = (
     "<div class=\"catgroup\" data-cat=\"{{ c.name }}\"><h3 class=\"cathead\">{{ c.name }} <span class=\"count\">{{ c.count }} 个</span></h3>"
     "{% for f in files %}{% if f.kind == c.name %}"
     "<div class=\"file\" data-cat=\"{{ f.kind }}\" data-name=\"{{ f.name|lower }}\">"
-    "{% if f.is_image %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" alt=\"\" loading=\"lazy\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
-    "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.kind }}</span><span>·</span><span>{{ f.size }}</span></div></div>"
+    "{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" alt=\"\" loading=\"lazy\" onerror=\"this.outerHTML='<div class=\\'fic\\'>{{ f.ext }}</div>'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
+    "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.kind }}</span><span>·</span><span>{{ f.size }}</span></div>"
+    "<form class=\"renameform\" method=\"post\" action=\"/rename\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
+    "<input type=\"hidden\" name=\"back\" value=\"/\"><input class=\"renametext\" type=\"text\" name=\"new_name\" placeholder=\"改个名字…\" required>"
+    "<button class=\"btn\">改名</button></form></div>"
     "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a><a class=\"btn primary\" href=\"/download/{{ f.id }}\">下载</a></div></div>"
     "{% endif %}{% endfor %}</div>"
     "{% endif %}{% endfor %}{% else %}<p class=\"empty\">目前还没有已发布的文件。</p>{% endif %}</section>"
@@ -849,6 +855,13 @@ def thumb(file_id):
             return "该文件尚未发布", 403
     else:
         return "文件不存在或无权访问", 404
+    if (meta.get("mimeType") or "").startswith("video/"):
+        # MP4 缩略图不用 ffmpeg：云盘本身会给视频生成缩略图，直接跳到云盘缩略图链接。
+        # 该链接是云盘生成的临时链接，没有它时回退到类型图标。
+        tl = meta.get("thumbnailLink")
+        if tl:
+            return redirect(tl)
+        return "暂无视频缩略图", 404
     if not (meta.get("mimeType") or "").startswith("image/"):
         return "不是图片", 404
     from googleapiclient.http import MediaIoBaseDownload
@@ -869,6 +882,45 @@ def thumb(file_id):
         return Response(out.getvalue(), headers={"Content-Type": "image/jpeg", "Cache-Control": "public, max-age=86400"})
     except Exception:
         return Response(data, headers={"Content-Type": meta.get("mimeType") or "image/jpeg", "Cache-Control": "public, max-age=86400"})
+
+
+@app.route("/rename", methods=["POST"])
+def rename():
+    """改名：熟人可改已发布文件的名字，站长可改待审核/已发布文件的名字。
+    只改名字不改内容，后缀不写时自动保留原后缀；改名会记进访问日志。"""
+    service = drive_service()
+    if service is None:
+        return "云盘暂未连接", 503
+    file_id = request.form.get("file_id", "")
+    new_name = (request.form.get("new_name", "") or "").strip()
+    if not file_id or not new_name:
+        return "请填写新名字", 400
+    new_name = _safe_filename(new_name)
+    if not new_name:
+        return "名字无效", 400
+    try:
+        meta = get_file(service, file_id)
+    except Exception:
+        return "文件不存在或无权访问", 404
+    parents = meta.get("parents") or []
+    is_published = PUBLISHED_FOLDER_ID in parents
+    is_pending = PENDING_FOLDER_ID in parents
+    code = _env("EXCHANGE_CODE")
+    token = _env("ADMIN_TOKEN")
+    is_friend = bool(code) and _has_gate(code, "exchange_access")
+    is_admin = bool(token) and _has_gate(token, "admin_access")
+    if is_published and not (is_friend or is_admin):
+        return "请先输入访问口令", 403
+    if is_pending and not is_admin:
+        return "待审核文件只有站长能改名", 403
+    if not is_published and not is_pending:
+        return "文件不存在或无权访问", 404
+    old_name = meta.get("name", "")
+    if "." not in new_name and "." in old_name:
+        new_name = new_name + "." + old_name.rsplit(".", 1)[-1]
+    service.files().update(fileId=file_id, body={"name": new_name}).execute()
+    _log("改名", f"{old_name} -> {new_name}")
+    return redirect(request.form.get("back", "/") or "/")
 
 
 @app.route("/health")
