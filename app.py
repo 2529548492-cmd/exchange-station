@@ -120,6 +120,21 @@ def drive_service():
     return build("drive", "v3", credentials=creds)
 
 
+def _file_kind(name, mime):
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext in ("jpg", "jpeg", "png", "gif", "webp", "bmp", "svg") or mime.startswith("image/"):
+        return "图片"
+    if ext in ("mp4", "mov", "mkv", "avi", "webm") or mime.startswith("video/"):
+        return "视频"
+    if ext in ("mp3", "wav", "m4a", "flac", "ogg") or mime.startswith("audio/"):
+        return "音频"
+    if ext in ("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md"):
+        return "文档"
+    if ext in ("zip", "rar", "7z", "tar", "gz"):
+        return "压缩包"
+    return "文件"
+
+
 def _fmt_size(size):
     try:
         b = int(size)
@@ -150,6 +165,7 @@ def list_folder(service, folder_id):
                 "name": f["name"],
                 "size": _fmt_size(f.get("size")),
                 "ext": (f["name"].rsplit(".", 1)[-1].upper()[:4] if "." in f["name"] else "FILE"),
+                "kind": _file_kind(f["name"], f.get("mimeType") or ""),
             }
         )
     return out
@@ -335,19 +351,23 @@ PAGE = (
     "<form method=\"post\" action=\"/upload\" enctype=\"multipart/form-data\">"
     "<div class=\"drop\" id=\"drop\"><strong>点这里选文件，或把文件拖进来</strong><span>支持多选 · 提交后进入待审核</span>"
     "<br><input type=\"file\" id=\"fileinput\" name=\"file\" multiple required></div>"
+    "<div class=\"filelist\" id=\"filelist\"></div>"
     "<button class=\"btn primary\" type=\"submit\" {% if not drive_configured %}disabled{% endif %}>上传，等待审核</button></form>"
+    "<p class=\"note\">支持图片、文档、视频、音频、压缩包等常见类型，点打开预览可以在浏览器里直接看图片、PDF 和文本，不用先下载。</p>"
     "<script>var d=document.getElementById('drop'),i=document.getElementById('fileinput');"
     "d.addEventListener('click',function(){i.click();});"
     "d.addEventListener('dragover',function(e){e.preventDefault();d.classList.add('over');});"
     "d.addEventListener('dragleave',function(){d.classList.remove('over');});"
-    "d.addEventListener('drop',function(e){e.preventDefault();d.classList.remove('over');i.files=e.dataTransfer.files;});</script>"
+    "d.addEventListener('drop',function(e){e.preventDefault();d.classList.remove('over');i.files=e.dataTransfer.files;show();});"
+    "function show(){var l=document.getElementById('filelist');l.textContent=Array.from(i.files).map(function(f){return f.name+'（'+(f.size<1024?f.size+' B':(f.size/1024).toFixed(1)+' KB')+'）';}).join('\n');}"
+    "i.addEventListener('change',show);</script>"
     "{% if msg %}<p class=\"note\">{{ msg }}</p>{% endif %}</aside>"
     "<div class=\"maincol\"><div class=\"toolbar\"><input class=\"search\" id=\"search\" type=\"search\" placeholder=\"搜索文件名…\" oninput=\"onSearch(this.value)\"></div>"
     "<section class=\"card section\"><div class=\"section-head\"><h2>已发布</h2><span class=\"count\">{{ files|length }} 个</span></div>"
     "{% if files %}{% for f in files %}"
     "<div class=\"file\"><div class=\"fic\">{{ f.ext }}</div>"
-    "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.size }}</span></div></div>"
-    "<div class=\"actions\"><a class=\"btn primary\" href=\"/download/{{ f.id }}\">下载</a></div></div>"
+    "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.kind }}</span><span>·</span><span>{{ f.size }}</span></div></div>"
+    "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a><a class=\"btn primary\" href=\"/download/{{ f.id }}\">下载</a></div></div>"
     "{% endfor %}{% else %}<p class=\"empty\">目前还没有已发布的文件。</p>{% endif %}</section>"
     "<script>function onSearch(v){v=v.toLowerCase();document.querySelectorAll('.file').forEach(function(r){r.style.display=r.textContent.toLowerCase().includes(v)?'':'none';});}</script>"
     "</div></div>"
@@ -370,7 +390,7 @@ ADMIN_PAGE = (
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
     "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\"><div class=\"fic\">{{ f.ext }}</div>"
     "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.size }}</span><span class=\"chip wait\">待审核</span></div></div>"
-    "<div class=\"actions\"><form method=\"post\" action=\"/admin/approve\" style=\"display:inline\">"
+    "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a><form method=\"post\" action=\"/admin/approve\" style=\"display:inline\">"
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn primary\">通过</button></form> "
     "<form method=\"post\" action=\"/admin/reject\" style=\"display:inline\">"
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
@@ -461,6 +481,47 @@ def upload():
     if count == 0:
         return redirect("/?msg=没有可上传的文件")
     return redirect(f"/?msg=已上传 {count} 个文件到待审核，站长通过后才会出现在已发布列表")
+
+
+@app.route("/view/<file_id>")
+def view(file_id):
+    """在线预览：已发布文件熟人可看，待审核文件只有站长可看。
+    图片、PDF、文本、视频、音频会在浏览器里直接打开，其他类型浏览器会提示下载。"""
+    service = drive_service()
+    if service is None:
+        return "云盘暂未连接", 503
+    try:
+        meta = get_file(service, file_id)
+    except Exception:
+        return "文件不存在或无权访问", 404
+    parents = meta.get("parents") or []
+    is_published = PUBLISHED_FOLDER_ID in parents
+    is_pending = PENDING_FOLDER_ID in parents
+    if is_published:
+        code = _env("EXCHANGE_CODE")
+        if not _has_gate(code, "exchange_access"):
+            return redirect("/?msg=请先输入访问口令")
+    elif is_pending:
+        token = _env("ADMIN_TOKEN")
+        if not token or not _has_gate(token, "admin_access"):
+            return "该文件尚未发布", 403
+    else:
+        return "文件不存在或无权访问", 404
+    from googleapiclient.http import MediaIoBaseDownload
+
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, service.files().get_media(fileId=file_id))
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    data = buf.getvalue()
+    return Response(
+        data,
+        headers={
+            "Content-Disposition": f"inline; filename*=UTF-8''{meta['name']}",
+            "Content-Type": meta.get("mimeType") or "application/octet-stream",
+        },
+    )
 
 
 @app.route("/download/<file_id>")
