@@ -90,7 +90,7 @@ def _proxy_to_backend(path):
     url = _relay_backend() + path
     # Forward only the gate cookies, never any other header
     cookies = {}
-    for _k in ("exchange_access", "admin_access"):
+    for _k in ("exchange_access", "admin_access", "feedback_user"):
         if _k in request.cookies:
             cookies[_k] = request.cookies[_k]
     try:
@@ -108,7 +108,7 @@ def _relay_files():
     """In relay mode, fetch published+pending lists from the backend (Render)."""
     import requests as _rq
     cookies = {}
-    for _k in ("exchange_access", "admin_access"):
+    for _k in ("exchange_access", "admin_access", "feedback_user"):
         if _k in request.cookies:
             cookies[_k] = request.cookies[_k]
     try:
@@ -122,7 +122,7 @@ def _proxy_post_to_backend(path):
     """Forward an admin POST form to the backend and return its result."""
     import requests as _rq
     cookies = {}
-    for _k in ("exchange_access", "admin_access"):
+    for _k in ("exchange_access", "admin_access", "feedback_user"):
         if _k in request.cookies:
             cookies[_k] = request.cookies[_k]
     try:
@@ -262,6 +262,88 @@ def _write_accounts(service, accounts):
 
 def _account_gate():
     return request.cookies.get("feedback_user", "")
+
+
+# ---- 私人区：每个注册账号在云盘里有一个以账号名命名的专属文件夹，
+# 放在“交换站私人区”根文件夹下；只有本人和站长能看里面的文件，
+# 其他人即使拿到文件链接，没有本人登录状态也打不开。
+PRIVATE_ROOT_NAME = "交换站私人区"
+_PRIVATE_ROOT_ID = [None]
+
+
+def _drive_q(v):
+    return (v or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _private_root_id(service):
+    if _env("PRIVATE_FOLDER_ID"):
+        return _env("PRIVATE_FOLDER_ID")
+    if _PRIVATE_ROOT_ID[0]:
+        return _PRIVATE_ROOT_ID[0]
+    if service is None:
+        return None
+    res = service.files().list(
+        q=f"name = '{PRIVATE_ROOT_NAME}' and 'root' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+        fields="files(id)", pageSize=5).execute()
+    fl = res.get("files") or []
+    if fl:
+        _PRIVATE_ROOT_ID[0] = fl[0]["id"]
+        return fl[0]["id"]
+    created = service.files().create(
+        body={"name": PRIVATE_ROOT_NAME, "mimeType": "application/vnd.google-apps.folder"},
+        fields="id").execute()
+    _PRIVATE_ROOT_ID[0] = created["id"]
+    return created["id"]
+
+
+def _private_user_folder_id(service, username, create=True):
+    root = _private_root_id(service)
+    if not root or service is None:
+        return None
+    res = service.files().list(
+        q=f"name = '{_drive_q(username)}' and '{root}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+        fields="files(id)", pageSize=5).execute()
+    fl = res.get("files") or []
+    if fl:
+        return fl[0]["id"]
+    if not create:
+        return None
+    created = service.files().create(
+        body={"name": username, "mimeType": "application/vnd.google-apps.folder", "parents": [root]},
+        fields="id").execute()
+    return created["id"]
+
+
+def _private_owner(service, meta):
+    """返回文件所属的私人区账号名；不是私人区文件时返回 None。"""
+    try:
+        root = _private_root_id(service)
+        for pid in (meta.get("parents") or []):
+            parent = service.files().get(fileId=pid, fields="id,name,parents").execute()
+            if root in (parent.get("parents") or []):
+                return parent.get("name")
+    except Exception:
+        return None
+    return None
+
+
+def _private_account_ok(service, username):
+    """账号存在且未被站长禁用时才能用私人区。"""
+    if not username:
+        return False
+    try:
+        accounts = _read_accounts(service) if service else []
+    except Exception:
+        return False
+    for a in accounts:
+        if a["name"] == username:
+            return a.get("disabled") != "1"
+    return False
+
+
+def _private_is_admin():
+    token = _env("ADMIN_TOKEN")
+    return bool(token) and _has_gate(token, "admin_access")
 
 
 FEEDBACK_FILE_NAME = "交换站意见.txt"
@@ -683,6 +765,7 @@ PAGE = (
     "<a href=\"#publish\" data-tab=\"publish\">发布区</a>"
     "<a href=\"#published\" data-tab=\"published\" class=\"active\">已发布区</a>"
     "<a href=\"#feedback\" data-tab=\"feedback\">意见区</a>"
+    "<a href=\"#private\" data-tab=\"private\">私人区</a>"
     "<a href=\"#admin\" data-tab=\"admin\">站长区</a></nav>"
     "<div id=\"progwrap\" style=\"display:none;margin:0 0 14px;padding:12px 14px;border:1px solid var(--line);border-radius:14px;background:var(--surface)\"><div style=\"font-weight:800;margin-bottom:8px\">上传进度</div><div style=\"background:var(--surface-2);border-radius:999px;overflow:hidden;height:14px\"><div id=\"progbar\" style=\"height:100%;width:0%;background:var(--green);transition:width .3s\"></div></div><p class=\"note\" id=\"progtext\" style=\"margin-top:8px\">正在上传… 0%</p></div>"
     "<div class=\"tabpanel\" id=\"tab-principle\">"
@@ -754,7 +837,21 @@ PAGE = (
     "</div>"
     "{% endif %}"
     "<script>function dlFile(btn){var row=btn.closest('.file');var wrap=row.querySelector('.dlprog');var bar=row.querySelector('.dlbar');var tx=row.querySelector('.dltext');if(!wrap)return;wrap.style.display='block';btn.disabled=true;var url=btn.getAttribute('data-dl');var name=btn.getAttribute('data-name');var x=new XMLHttpRequest();x.open('GET',url,true);x.responseType='blob';x.onprogress=function(ev){if(ev.lengthComputable){var pct=Math.round(ev.loaded/ev.total*100);bar.style.width=pct+'%';tx.textContent='下载中… '+pct+'%（'+(ev.loaded/1048576).toFixed(1)+' / '+(ev.total/1048576).toFixed(1)+' MB）';}else{tx.textContent='下载中… '+(ev.loaded/1048576).toFixed(1)+' MB';}};x.onload=function(){if(x.status===200){bar.style.width='100%';tx.textContent='下载完成';var a=document.createElement('a');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}else{tx.textContent='下载失败，请重试';}btn.disabled=false;};x.onerror=function(){tx.textContent='下载失败，请检查网络后重试';btn.disabled=false;};x.send();}</script>"
-    "<div class=\"tabpanel\" id=\"tab-feedback\"><div class=\"card section\"><h2>意见区</h2>"
+        '<div class="tabpanel" id="tab-private"><div class="card section"><h2>私人区</h2>'
+    '<p class="note">只有你自己和站长能看见这里的文件，其他人看不见，也不会出现在已发布区。</p>'
+    '{% if fb_user %}<p class="note">当前账号：{{ fb_user }} · <a href="/logout_feedback">退出</a></p>'
+    '<form method="post" action="/private/upload" enctype="multipart/form-data">'
+    '<div class="drop"><strong>点这里选文件上传到私人区</strong><span>一次最多 30 个 · 总共 2 GB · 不用站长审核，只有你和站长能看见</span><br><input type="file" name="file" multiple required></div>'
+    '<button class="btn primary" style="margin-top:10px">上传到私人区</button></form>'
+    '{% if private_files %}{% for f in private_files %}<div class="file"><div class="fic">{{ f.ext }}</div><div class="fmain"><div class="fname">{{ f.name }}</div><div class="fmeta"><span>{{ f.kind }}</span><span>·</span><span>{{ f.size }}</span></div></div>'
+    '<div class="actions"><a class="btn" href="/view/{{ f.id }}" target="_blank">打开预览</a><a class="btn primary" href="/download/{{ f.id }}">下载</a>'
+    '<form method="post" action="/private/delete" style="display:inline" onsubmit="return confirm(&quot;确定删除这个私人文件吗？&quot;)"><input type="hidden" name="file_id" value="{{ f.id }}"><button class="btn danger">删除</button></form></div></div>'
+    '{% endfor %}{% else %}<p class="empty">你的私人区目前还没有文件。</p>{% endif %}'
+    '{% else %}<div class="card section"><h3>私人区要先注册 / 登录</h3><p class="note">用意见区同一个账号就行：先注册一个账号名和密码，登录后这个区就只显示你自己的文件。账号密码存在云端，站长能看见和管理，请不要用重要密码注册。</p>'
+    '<form method="post" action="/register"><input class="textin" name="name" placeholder="账号名" required> <input class="textin" type="password" name="password" placeholder="密码" required> <button class="btn primary">注册</button></form>'
+    '<form method="post" action="/login_feedback" style="margin-top:8px"><input class="textin" name="name" placeholder="账号名" required> <input class="textin" type="password" name="password" placeholder="密码" required> <button class="btn">登录</button></form></div>{% endif %}'
+    '</div></div>'
+"<div class=\"tabpanel\" id=\"tab-feedback\"><div class=\"card section\"><h2>意见区</h2>"
     "<p class=\"note\">大家都能看见，站长处理后改成已解决。</p>"
     "{% if fb_user %}<p class=\"note\">当前账号：{{ fb_user }} · <a href=\"/logout_feedback\">退出</a></p><form method=\"post\" action=\"/feedback\"><textarea class=\"textin\" name=\"text\" rows=\"3\" placeholder=\"写下你的意见…\" required style=\"width:100%\"></textarea><br><button class=\"btn primary\" style=\"margin-top:8px\">提交意见</button></form>"
     "{% else %}<div class=\"card section\"><h3>提意见要先注册 / 登录</h3><p class=\"note\">意见大家都能看见，但提意见要先有账号，这样才知道是谁提的。注册的账号密码存在云端，站长能看见和管理，请不要用重要密码注册。</p>"
@@ -766,7 +863,7 @@ PAGE = (
     "<form method=\"post\" action=\"/admin/login\">"
     "<input class=\"textin\" type=\"password\" name=\"token\" placeholder=\"站长口令\" required> "
     "<button class=\"btn primary\" type=\"submit\">进入审核</button></form></div>"
-    "</div><script>function showTab(name){document.querySelectorAll('.tabpanel').forEach(function(el){el.classList.toggle('active',el.id==='tab-'+name);});document.querySelectorAll('#topnav a').forEach(function(a){a.classList.toggle('active',a.dataset.tab===name);});}document.querySelectorAll('#topnav a').forEach(function(a){a.addEventListener('click',function(e){e.preventDefault();location.hash=a.dataset.tab;showTab(a.dataset.tab);});});var h=(location.hash||'#published').replace('#','');if(['principle','publish','published','feedback','admin'].indexOf(h)<0){h='published';}showTab(h);</script>"
+    "</div><script>function showTab(name){document.querySelectorAll('.tabpanel').forEach(function(el){el.classList.toggle('active',el.id==='tab-'+name);});document.querySelectorAll('#topnav a').forEach(function(a){a.classList.toggle('active',a.dataset.tab===name);});}document.querySelectorAll('#topnav a').forEach(function(a){a.addEventListener('click',function(e){e.preventDefault();location.hash=a.dataset.tab;showTab(a.dataset.tab);});});var h=(location.hash||'#published').replace('#','');if(['principle','publish','published','feedback','private','admin'].indexOf(h)<0){h='published';}showTab(h);</script>"
     "<footer>交换站 · 熟人文件交换 · 上传需站长审核</footer></div></body></html>"
 )
 
@@ -789,7 +886,7 @@ ADMIN_PAGE = (
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<button class=\"btn danger\">不通过（移到回收站）</button></form></div></div>{% endfor %}</div>"
     "{% else %}<p class=\"empty\">目前没有待审核的文件。</p>{% endif %}"
-    "<p><a href=\"/admin/accounts\">账号管理</a> · <a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    "<p><a href=\"/admin/accounts\">账号管理</a> · <a href=\"/admin/private\">私人区管理</a> · <a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
 )
 ADMIN_PAGE = (
     "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
@@ -810,7 +907,7 @@ ADMIN_PAGE = (
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<button class=\"btn danger\">不通过（移到回收站）</button></form></div></div>{% endfor %}</div>"
     "{% else %}<p class=\"empty\">目前没有待审核的文件。</p>{% endif %}"
-    "<p><a href=\"/admin/accounts\">账号管理</a> · <a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    "<p><a href=\"/admin/accounts\">账号管理</a> · <a href=\"/admin/private\">私人区管理</a> · <a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
 )
 
 ADMIN_PUBLISHED_PAGE = (
@@ -832,6 +929,39 @@ ADMIN_PUBLISHED_PAGE = (
     "{% else %}<p class=\"empty\">目前没有已发布的文件。</p>{% endif %}"
     "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
 )
+
+
+@app.route("/api/private")
+def api_private():
+    code = _env("EXCHANGE_CODE")
+    out = {"files": []}
+    if code and _has_gate(code, "exchange_access"):
+        fb_user = _account_gate()
+        service = drive_service()
+        if fb_user and service and _private_account_ok(service, fb_user):
+            folder = _private_user_folder_id(service, fb_user, create=False)
+            if folder:
+                out["files"] = list_folder(service, folder)
+    return jsonify(out)
+
+
+@app.route("/api/private_all")
+def api_private_all():
+    token = _env("ADMIN_TOKEN")
+    out = {"users": []}
+    if token and _has_gate(token, "admin_access"):
+        service = drive_service()
+        root = _private_root_id(service) if service else None
+        if service and root:
+            try:
+                res = service.files().list(
+                    q=f"'{root}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+                    fields="files(id,name)", pageSize=100).execute()
+                for folder in res.get("files") or []:
+                    out["users"].append({"name": folder["name"], "files": list_folder(service, folder["id"])})
+            except Exception:
+                out["users"] = []
+    return jsonify(out)
 
 
 @app.route("/api/files")
@@ -871,6 +1001,26 @@ def index():
         else:
             files = _cached_published(drive_service())
     cats = [{"name": c, "count": sum(1 for f in files if f["kind"] == c)} for c in CATS]
+    private_files = []
+    fb_user = _account_gate()
+    if entered and fb_user:
+        if _is_relay():
+            try:
+                import requests as _rq
+                _cookies = {}
+                for _k in ("exchange_access", "feedback_user"):
+                    if _k in request.cookies:
+                        _cookies[_k] = request.cookies[_k]
+                _r = _rq.get(_relay_backend() + "/api/private", cookies=_cookies, timeout=15)
+                private_files = _r.json().get("files", [])
+            except Exception:
+                private_files = []
+        else:
+            service = drive_service()
+            if service and _private_account_ok(service, fb_user):
+                folder = _private_user_folder_id(service, fb_user, create=False)
+                if folder:
+                    private_files = list_folder(service, folder)
     return render_template_string(
         PAGE,
         code_configured=bool(code),
@@ -879,7 +1029,8 @@ def index():
         cats=cats,
         files=files,
         feedback=_read_feedback(drive_service()) if entered else [],
-        fb_user=_account_gate(),
+        fb_user=fb_user,
+        private_files=private_files,
         max_mb=MAX_UPLOAD_MB,
         msg=request.args.get("msg", ""),
     )
@@ -1077,7 +1228,9 @@ def view(file_id):
         if not token or not _has_gate(token, "admin_access"):
             return "该文件尚未发布", 403
     else:
-        return "文件不存在或无权访问", 404
+        owner = _private_owner(service, meta)
+        if owner is None or (owner != _account_gate() and not _private_is_admin()):
+            return "文件不存在或无权访问", 404
     from googleapiclient.http import MediaIoBaseDownload
 
     ctype = meta.get("mimeType") or "application/octet-stream"
@@ -1131,8 +1284,11 @@ def download(file_id):
     except Exception:
         return "文件不存在或无权访问", 404
     # 安全底线：只有父文件夹是“已发布”的文件才能下载，待审核文件一律拒绝。
+    # 私人区文件例外：本人或站长可以下载，其他人不行。
     if PUBLISHED_FOLDER_ID not in (meta.get("parents") or []):
-        return "该文件尚未发布", 403
+        owner = _private_owner(service, meta)
+        if owner is None or (owner != _account_gate() and not _private_is_admin()):
+            return "该文件尚未发布", 403
     # 用 Drive 官方的 get_media 流式回传，令牌由 googleapiclient 自动刷新，
     # 不再手动拼 Bearer 令牌，避免过期令牌导致下载到空内容。
     from googleapiclient.http import MediaIoBaseDownload
@@ -1164,6 +1320,135 @@ def download(file_id):
         pass
     return Response(generate_dl(), headers=dl_headers)
 
+
+
+@app.route("/private/upload", methods=["POST"])
+def private_upload():
+    code = _env("EXCHANGE_CODE")
+    if not _has_gate(code, "exchange_access"):
+        return redirect("/?msg=请先输入访问口令")
+    fb_user = _account_gate()
+    if not fb_user:
+        return redirect("/?msg=私人区要先注册登录#private")
+    if _is_relay():
+        try:
+            import requests as _rq
+            _cookies = {}
+            for _k in ("exchange_access", "feedback_user"):
+                if _k in request.cookies:
+                    _cookies[_k] = request.cookies[_k]
+            _files = [("file", (u.filename, u.stream, u.mimetype)) for u in request.files.getlist("file") if u and u.filename]
+            _r = _rq.post(_relay_backend() + "/private/upload", cookies=_cookies, files=_files, timeout=300, allow_redirects=False)
+            if _r.status_code in (301, 302, 303) and _r.headers.get("Location"):
+                loc = _r.headers["Location"]
+                return redirect(loc if loc.startswith("/") else "/#private")
+            return redirect("/#private")
+        except Exception as e:
+            return redirect(f"/?msg=中转私人上传失败：{e}#private")
+    service = drive_service()
+    if service is None:
+        return redirect("/?msg=云盘暂未连接，私人上传暂不可用#private")
+    if not _private_account_ok(service, fb_user):
+        return redirect("/?msg=这个账号已被禁用或不存在#private")
+    folder = _private_user_folder_id(service, fb_user)
+    if not folder:
+        return redirect("/?msg=私人文件夹创建失败，请重试#private")
+    from googleapiclient.http import MediaIoBaseUpload
+    count = 0
+    for up in request.files.getlist("file"):
+        if not up or not up.filename:
+            continue
+        name = _safe_filename(up.filename)
+        if not name:
+            continue
+        try:
+            up.stream.seek(0)
+        except Exception:
+            pass
+        media = MediaIoBaseUpload(up.stream, mimetype=up.mimetype or "application/octet-stream", resumable=True, chunksize=1024 * 1024)
+        service.files().create(body={"name": name, "parents": [folder]}, media_body=media, fields="id").execute()
+        count += 1
+    if count == 0:
+        return redirect("/?msg=没有可上传的文件#private")
+    _log("私人上传", f"{fb_user} {count} 个文件")
+    return redirect(f"/?msg=已上传 {count} 个文件到私人区，只有你和站长能看见#private")
+
+
+@app.route("/private/delete", methods=["POST"])
+def private_delete():
+    code = _env("EXCHANGE_CODE")
+    if not _has_gate(code, "exchange_access"):
+        return redirect("/?msg=请先输入访问口令")
+    fb_user = _account_gate()
+    if _is_relay():
+        return _proxy_post_to_backend("/private/delete")
+    service = drive_service()
+    if service is None:
+        return redirect("/?msg=云盘暂未连接#private")
+    file_id = request.form.get("file_id", "")
+    if not file_id:
+        return redirect("/#private")
+    try:
+        meta = get_file(service, file_id)
+    except Exception:
+        return redirect("/?msg=文件不存在或无权访问#private")
+    owner = _private_owner(service, meta)
+    if owner is None or (owner != fb_user and not _private_is_admin()):
+        return redirect("/?msg=这不是你的私人文件#private")
+    service.files().update(fileId=file_id, body={"trashed": True}).execute()
+    _log("私人删除", meta.get("name", file_id))
+    return redirect("/#private")
+
+
+@app.route("/admin/private")
+def admin_private():
+    token = _env("ADMIN_TOKEN")
+    if not token or not _has_gate(token, "admin_access"):
+        return "请先在首页输入站长口令", 403
+    if _is_relay():
+        try:
+            import requests as _rq
+            _cookies = {}
+            if "admin_access" in request.cookies:
+                _cookies["admin_access"] = request.cookies["admin_access"]
+            _r = _rq.get(_relay_backend() + "/api/private_all", cookies=_cookies, timeout=15)
+            users = _r.json().get("users", [])
+        except Exception:
+            users = []
+    else:
+        service = drive_service()
+        users = []
+        root = _private_root_id(service) if service else None
+        if service and root:
+            try:
+                res = service.files().list(
+                    q=f"'{root}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+                    fields="files(id,name)", pageSize=100).execute()
+                for folder in res.get("files") or []:
+                    users.append({"name": folder["name"], "files": list_folder(service, folder["id"])})
+            except Exception:
+                users = []
+    rows = ""
+    for u in users:
+        rows += f"<div class=\"card section\"><h2>{u['name']} 的私人文件</h2>"
+        if u["files"]:
+            for f in u["files"]:
+                rows += (f"<div class=\"file\"><div class=\"fic\">{f['ext']}</div>"
+                         f"<div class=\"fmain\"><div class=\"fname\">{f['name']}</div><div class=\"fmeta\"><span>{f['size']}</span></div></div>"
+                         f"<div class=\"actions\"><a class=\"btn\" href=\"/view/{f['id']}\" target=\"_blank\">打开预览</a>"
+                         f"<a class=\"btn primary\" href=\"/download/{f['id']}\">下载</a></div></div>")
+        else:
+            rows += "<p class=\"empty\">这个账号的私人区是空的。</p>"
+        rows += "</div>"
+    if not rows:
+        rows = "<p class=\"empty\">目前还没有任何私人文件。</p>"
+    return ("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<title>私人区管理 - 交换站</title><style>" + BASE_CSS + "</style></head>"
+            "<body><div class=\"wrap\"><h1>私人区管理（站长可见全部）</h1>"
+            "<p class=\"note\">站长能看见所有人的私人文件，普通用户只能看见自己的。</p>"
+            + rows +
+            "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>")
 
 
 @app.route("/feedback", methods=["POST"])
@@ -1563,7 +1848,9 @@ def thumb(file_id):
         if not token or not _has_gate(token, "admin_access"):
             return "该文件尚未发布", 403
     else:
-        return "文件不存在或无权访问", 404
+        owner = _private_owner(service, meta)
+        if owner is None or (owner != _account_gate() and not _private_is_admin()):
+            return "文件不存在或无权访问", 404
     if (meta.get("mimeType") or "").startswith("video/"):
         # MP4 缩略图不用 ffmpeg：云盘本身会给视频生成缩略图，直接跳到云盘缩略图链接。
         # 该链接是云盘生成的临时链接，没有它时回退到类型图标。
