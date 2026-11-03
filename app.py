@@ -179,6 +179,66 @@ def _flush_drive_log():
         _DRIVE_LOG_BUFFER = lines + _DRIVE_LOG_BUFFER
 
 
+FEEDBACK_FILE_NAME = "交换站意见.txt"
+_FEEDBACK_CACHE = {"t": 0, "items": []}
+
+
+def _feedback_file_id(service):
+    if _env("FEEDBACK_DRIVE_FILE_ID"):
+        return _env("FEEDBACK_DRIVE_FILE_ID")
+    try:
+        res = service.files().list(q=f"name = '{FEEDBACK_FILE_NAME}' and trashed = false", fields="files(id)", pageSize=5).execute()
+        fl = res.get("files") or []
+        return fl[0]["id"] if fl else None
+    except Exception:
+        return None
+
+
+def _read_feedback(service):
+    """Return list of {id, time, text, status} newest first. Status: open=未解决, done=已解决."""
+    if service is None:
+        return []
+    try:
+        fid = _feedback_file_id(service)
+        if not fid:
+            return []
+        from googleapiclient.http import MediaIoBaseDownload
+        buf = io.BytesIO()
+        dl = MediaIoBaseDownload(buf, service.files().get_media(fileId=fid))
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        items = []
+        for line in buf.getvalue().decode("utf-8", errors="ignore").strip().split("\\n"):
+            if not line.strip():
+                continue
+            parts = line.split("\\t", 3)
+            if len(parts) == 4:
+                items.append({"id": parts[0], "time": parts[1], "status": parts[2], "text": parts[3]})
+        items.reverse()
+        return items
+    except Exception:
+        return []
+
+
+def _write_feedback(service, items_oldest_first):
+    """Overwrite the Drive feedback file with items in oldest-first order."""
+    from googleapiclient.http import MediaIoBaseUpload
+    body = "\\n".join(f"{it['id']}\\t{it['time']}\\t{it['status']}\\t{it['text']}" for it in items_oldest_first)
+    media = MediaIoBaseUpload(io.BytesIO(body.encode("utf-8")), mimetype="text/plain", resumable=False)
+    try:
+        fid = _feedback_file_id(service)
+        if fid:
+            service.files().update(fileId=fid, media_body=media).execute()
+        else:
+            meta = {"name": FEEDBACK_FILE_NAME, "mimeType": "text/plain"}
+            service.files().create(body=meta, media_body=media, fields="id").execute()
+        return True
+    except Exception as e:
+        print(f"[feedback] write failed: {e}", flush=True)
+        return False
+
+
 def _log(action, detail=""):
     """访问日志：只记时间、IP、动作、文件名，不记任何口令、密钥、完整 UA。
     内存里留近期 500 条供站长区查看，同时每 20 条或每次站长操作后缓冲写进
@@ -537,6 +597,7 @@ PAGE = (
     "<a href=\"#principle\" data-tab=\"principle\">原理区</a>"
     "<a href=\"#publish\" data-tab=\"publish\">发布区</a>"
     "<a href=\"#published\" data-tab=\"published\" class=\"active\">已发布区</a>"
+    "<a href=\"#feedback\" data-tab=\"feedback\">意见区</a>"
     "<a href=\"#admin\" data-tab=\"admin\">站长区</a></nav>"
     "<div id=\"progwrap\" style=\"display:none;margin:0 0 14px;padding:12px 14px;border:1px solid var(--line);border-radius:14px;background:var(--surface)\"><div style=\"font-weight:800;margin-bottom:8px\">上传进度（切到别的区也不会消失，传完前不要刷新或离开本页）</div><div style=\"background:var(--surface-2);border-radius:999px;overflow:hidden;height:14px\"><div id=\"progbar\" style=\"height:100%;width:0%;background:var(--green)\"></div></div><p class=\"note\" id=\"progtext\" style=\"margin-top:8px\">正在上传… 0%</p></div>"
     "<div class=\"tabpanel\" id=\"tab-principle\">"
@@ -607,12 +668,16 @@ PAGE = (
     "<script>var curCat='全部',curQ='';function applyFilter(){document.querySelectorAll('.catgroup').forEach(function(g){var show=curCat==='全部'||g.dataset.cat===curCat;var any=false;g.querySelectorAll('.file').forEach(function(r){var ok=(curCat==='全部'||r.dataset.cat===curCat)&&r.dataset.name.includes(curQ);r.style.display=ok?'':'none';if(ok)any=true;});g.style.display=(show&&any)?'':'none';});}function showCat(c,el){curCat=c;document.querySelectorAll('#cattabs .tab').forEach(function(t){t.classList.remove('active');});el.classList.add('active');applyFilter();}function onSearch(v){curQ=v.toLowerCase();applyFilter();}</script>"
     "</div>"
     "{% endif %}"
+    "<div class=\"tabpanel\" id=\"tab-feedback\"><div class=\"card section\"><h2>意见区</h2>"
+    "<p class=\"note\">有意见就写在这里，大家都能看见。站长处理完会把状态改成已解决。</p>"
+    "<form method=\"post\" action=\"/feedback\"><textarea class=\"textin\" name=\"text\" rows=\"3\" placeholder=\"写下你的意见…\" required style=\"width:100%\"></textarea><br><button class=\"btn primary\" style=\"margin-top:8px\">提交意见</button></form>"
+    "{% if feedback %}{% for fb in feedback %}<div class=\"logrow\"><div class=\"fname\">{{ fb.text }}</div><div class=\"fmeta\"><span>{{ fb.time }}</span><span>·</span>{% if fb.status == 'done' %}<span class=\"chip\">已解决</span>{% else %}<span class=\"chip wait\">未解决</span>{% endif %}</div></div>{% endfor %}{% else %}<p class=\"empty\">目前还没有意见。</p>{% endif %}</div></div>"
     "<div class=\"tabpanel\" id=\"tab-admin\"><div class=\"card section\"><h2>站长审核</h2>"
     "<p class=\"note\">站长入口与熟人入口分开，站长口令只在审核页使用。</p>"
     "<form method=\"post\" action=\"/admin/login\">"
     "<input class=\"textin\" type=\"password\" name=\"token\" placeholder=\"站长口令\" required> "
     "<button class=\"btn primary\" type=\"submit\">进入审核</button></form></div>"
-    "</div><script>function showTab(name){document.querySelectorAll('.tabpanel').forEach(function(el){el.classList.toggle('active',el.id==='tab-'+name);});document.querySelectorAll('#topnav a').forEach(function(a){a.classList.toggle('active',a.dataset.tab===name);});}document.querySelectorAll('#topnav a').forEach(function(a){a.addEventListener('click',function(e){e.preventDefault();location.hash=a.dataset.tab;showTab(a.dataset.tab);});});var h=(location.hash||'#published').replace('#','');if(['principle','publish','published','admin'].indexOf(h)<0){h='published';}showTab(h);</script>"
+    "</div><script>function showTab(name){document.querySelectorAll('.tabpanel').forEach(function(el){el.classList.toggle('active',el.id==='tab-'+name);});document.querySelectorAll('#topnav a').forEach(function(a){a.classList.toggle('active',a.dataset.tab===name);});}document.querySelectorAll('#topnav a').forEach(function(a){a.addEventListener('click',function(e){e.preventDefault();location.hash=a.dataset.tab;showTab(a.dataset.tab);});});var h=(location.hash||'#published').replace('#','');if(['principle','publish','published','feedback','admin'].indexOf(h)<0){h='published';}showTab(h);</script>"
     "<footer>交换站 · 熟人文件交换 · 上传需站长审核</footer></div></body></html>"
 )
 
@@ -635,7 +700,7 @@ ADMIN_PAGE = (
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<button class=\"btn danger\">不通过（移到回收站）</button></form></div></div>{% endfor %}</div>"
     "{% else %}<p class=\"empty\">目前没有待审核的文件。</p>{% endif %}"
-    "<p><a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    "<p><a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
 )
 ADMIN_PAGE = (
     "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
@@ -656,7 +721,7 @@ ADMIN_PAGE = (
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<button class=\"btn danger\">不通过（移到回收站）</button></form></div></div>{% endfor %}</div>"
     "{% else %}<p class=\"empty\">目前没有待审核的文件。</p>{% endif %}"
-    "<p><a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    "<p><a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
 )
 
 ADMIN_PUBLISHED_PAGE = (
@@ -724,6 +789,7 @@ def index():
         drive_configured=_drive_configured(),
         cats=cats,
         files=files,
+        feedback=_read_feedback(drive_service()) if entered else [],
         max_mb=MAX_UPLOAD_MB,
         msg=request.args.get("msg", ""),
     )
@@ -1009,6 +1075,50 @@ def download(file_id):
     return Response(generate_dl(), headers=dl_headers)
 
 
+
+@app.route("/feedback", methods=["POST"])
+def feedback_submit():
+    code = _env("EXCHANGE_CODE")
+    if not _has_gate(code, "exchange_access"):
+        return redirect("/?msg=请先输入访问口令")
+    text = (request.form.get("text") or "").strip().replace("\n", " ").replace("\t", " ")
+    if not text:
+        return redirect("/#feedback")
+    if len(text) > 500:
+        text = text[:500]
+    service = drive_service()
+    if service is None:
+        return redirect("/?msg=云盘暂未连接，意见暂无法保存#feedback")
+    items = _read_feedback(service)  # newest first
+    import time as _t, random as _r
+    now = datetime.now(timezone.utc) + timedelta(hours=8)
+    fid = now.strftime("%Y%m%d%H%M%S") + str(_r.randint(100, 999))
+    items.insert(0, {"id": fid, "time": now.strftime("%Y-%m-%d %H:%M"), "status": "open", "text": text})
+    # _write_feedback expects oldest first
+    if _write_feedback(service, list(reversed(items))):
+        _log("提意见", text[:20])
+        return redirect("/?msg=意见已提交，大家都能在意见区看见#feedback")
+    return redirect("/?msg=意见保存失败，请重试#feedback")
+
+
+@app.route("/feedback/resolve", methods=["POST"])
+def feedback_resolve():
+    token = _env("ADMIN_TOKEN")
+    if not token or not _has_gate(token, "admin_access"):
+        return "只有站长能改状态", 403
+    fid = request.form.get("file_id") or request.form.get("id") or ""
+    service = drive_service()
+    if service is None:
+        return "云盘暂未连接", 503
+    items = _read_feedback(service)
+    for it in items:
+        if it["id"] == fid:
+            it["status"] = "done" if it["status"] != "done" else "open"
+    _write_feedback(service, list(reversed(items)))
+    _log("改意见状态", fid)
+    return redirect("/admin")
+
+
 @app.route("/admin/login", methods=["POST"])
 def admin_login():
     token = _env("ADMIN_TOKEN")
@@ -1124,6 +1234,30 @@ def admin_delete():
     _invalidate_pub_cache()
     _log("删除已发布", _name)
     return redirect("/admin/published")
+
+
+
+@app.route("/admin/feedback")
+def admin_feedback():
+    token = _env("ADMIN_TOKEN")
+    if not token or not _has_gate(token, "admin_access"):
+        return "请先在首页输入站长口令", 403
+    service = drive_service()
+    items = _read_feedback(service) if service else []
+    rows = "".join(
+        f"<div class=\"logrow\"><div class=\"fname\">{it['text']}</div><div class=\"fmeta\"><span>{it['time']}</span><span>·</span><span>{'已解决' if it['status']=='done' else '未解决'}</span></div>"
+        f"<form method=\"post\" action=\"/feedback/resolve\" style=\"margin-top:6px\"><input type=\"hidden\" name=\"id\" value=\"{it['id']}\">"
+        f"<button class=\"btn\">{'改回未解决' if it['status']=='done' else '标为已解决'}</button></form></div>"
+        for it in items
+    ) or "<p class=\"empty\">目前还没有意见。</p>"
+    return render_template_string(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>意见管理 - 交换站</title><style>" + BASE_CSS + "</style></head><body><div class=\"wrap\">"
+        "<h1>意见管理</h1><p class=\"note\">只有站长能改状态，改完后意见区里大家都能看见已解决 / 未解决。</p>"
+        "<div class=\"card section\">" + rows + "</div>"
+        "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    )
 
 
 @app.route("/admin/logs")
