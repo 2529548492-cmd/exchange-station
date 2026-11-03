@@ -2311,11 +2311,23 @@ def thumb(file_id):
         if owner is None or (owner != _account_gate() and not _private_is_admin()):
             return "文件不存在或无权访问", 404
     if (meta.get("mimeType") or "").startswith("video/"):
-        # MP4 缩略图不用 ffmpeg：云盘本身会给视频生成缩略图，直接跳到云盘缩略图链接。
-        # 该链接是云盘生成的临时链接，没有它时回退到类型图标。
-        tl = meta.get("thumbnailLink")
-        if tl:
-            return redirect(tl)
+        # MP4 缩略图不用 ffmpeg：云盘本身会给视频生成缩略图。
+        # 2026-11-04 改：不再 redirect 到云盘缩略图链接（国内不开加速器打不开，
+        # 上海服务器自己也连不上谷歌），改由本站服务器把缩略图取回来、以字节
+        # 直接发给浏览器，这样站内 /thumb 在国内也能出图，上海站以后也能缓存它。
+        # tl 只来自云盘元数据，不是用户输入；只接受谷歌缩略图域名，防 SSRF。
+        tl = meta.get("thumbnailLink") or ""
+        if tl.startswith("https://") and ".googleusercontent.com" in tl:
+            try:
+                import requests as _rq
+                _r = _rq.get(tl, timeout=20, stream=True)
+                if _r.status_code == 200:
+                    _data = b"".join(_r.iter_content(chunk_size=65536))
+                    if _data and len(_data) < 5 * 1024 * 1024:
+                        _ct = _r.headers.get("Content-Type") or "image/jpeg"
+                        return Response(_data, headers={"Content-Type": _ct, "Cache-Control": "public, max-age=86400"})
+            except Exception:
+                pass
         return "暂无视频缩略图", 404
     from googleapiclient.http import MediaIoBaseDownload
 
