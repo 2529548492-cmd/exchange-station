@@ -76,6 +76,34 @@ def _has_gate(secret, cookie_name):
     return bool(value) and hmac.compare_digest(value, _gate_value(secret))
 
 
+def _relay_backend():
+    return (_env("RELAY_BACKEND") or "").rstrip("/")
+
+
+def _is_relay():
+    return bool(_relay_backend())
+
+
+def _proxy_to_backend(path):
+    """Stream a backend response back to the browser, forwarding gate cookies."""
+    import requests as _rq
+    url = _relay_backend() + path
+    # Forward only the gate cookies, never any other header
+    cookies = {}
+    for _k in ("exchange_access", "admin_access"):
+        if _k in request.cookies:
+            cookies[_k] = request.cookies[_k]
+    try:
+        r = _rq.get(url, cookies=cookies, stream=True, timeout=60)
+    except Exception as e:
+        return f"中转后端暂时连不上：{e}", 502
+    headers = {}
+    for _h in ("Content-Type", "Content-Disposition", "Content-Length", "Cache-Control"):
+        if _h in r.headers:
+            headers[_h] = r.headers[_h]
+    return Response(r.iter_content(chunk_size=256 * 1024), status=r.status_code, headers=headers)
+
+
 def _drive_configured():
     if _env("GOOGLE_OAUTH_REFRESH_TOKEN") and _env("GOOGLE_OAUTH_CLIENT_ID"):
         return True
@@ -652,13 +680,42 @@ ADMIN_PUBLISHED_PAGE = (
 )
 
 
+@app.route("/api/files")
+def api_files():
+    code = _env("EXCHANGE_CODE")
+    out = {"published": [], "pending": []}
+    if code and _has_gate(code, "exchange_access"):
+        try:
+            out["published"] = list_folder(drive_service(), PUBLISHED_FOLDER_ID)
+        except Exception:
+            out["published"] = []
+    token = _env("ADMIN_TOKEN")
+    if token and _has_gate(token, "admin_access"):
+        try:
+            out["pending"] = list_folder(drive_service(), PENDING_FOLDER_ID)
+        except Exception:
+            out["pending"] = []
+    return jsonify(out)
+
+
 @app.route("/")
 def index():
     code = _env("EXCHANGE_CODE")
     entered = _has_gate(code, "exchange_access")
     files = []
     if code and entered:
-        files = _cached_published(drive_service())
+        if _is_relay():
+            try:
+                import requests as _rq
+                _cookies = {}
+                if "exchange_access" in request.cookies:
+                    _cookies["exchange_access"] = request.cookies["exchange_access"]
+                _r = _rq.get(_relay_backend() + "/api/files", cookies=_cookies, timeout=15)
+                files = _r.json().get("published", [])
+            except Exception:
+                files = []
+        else:
+            files = _cached_published(drive_service())
     cats = [{"name": c, "count": sum(1 for f in files if f["kind"] == c)} for c in CATS]
     return render_template_string(
         PAGE,
@@ -701,6 +758,22 @@ def upload():
     code = _env("EXCHANGE_CODE")
     if not _has_gate(code, "exchange_access"):
         return redirect("/?msg=请先输入访问口令")
+    if _is_relay():
+        try:
+            import requests as _rq
+            _cookies = {}
+            for _k in ("exchange_access", "admin_access"):
+                if _k in request.cookies:
+                    _cookies[_k] = request.cookies[_k]
+            _files = [("file", (u.filename, u.stream, u.mimetype)) for u in request.files.getlist("file") if u and u.filename]
+            _r = _rq.post(_relay_backend() + "/upload", cookies=_cookies, files=_files, headers={"X-Requested-With": "XMLHttpRequest"}, timeout=300)
+            try:
+                _j = _r.json()
+                return jsonify(_j), _r.status_code
+            except Exception:
+                return _r.text, _r.status_code
+        except Exception as e:
+            return jsonify({"ok": False, "msg": f"中转上传失败：{e}"}), 502
     service = drive_service()
     if service is None:
         return redirect("/?msg=云盘暂未连接，上传暂不可用，请联系站长")
@@ -755,6 +828,16 @@ def direct_session():
     code = _env("EXCHANGE_CODE")
     if not _has_gate(code, "exchange_access"):
         return jsonify({"ok": False, "msg": "请先输入访问口令"}), 403
+    if _is_relay():
+        try:
+            import requests as _rq
+            _cookies = {}
+            if "exchange_access" in request.cookies:
+                _cookies["exchange_access"] = request.cookies["exchange_access"]
+            _r = _rq.post(_relay_backend() + "/direct_session", cookies=_cookies, json=request.get_json(silent=True) or {}, timeout=30)
+            return jsonify(_r.json()), _r.status_code
+        except Exception as e:
+            return jsonify({"ok": False, "msg": f"中转直传会话失败：{e}"}), 502
     data = request.get_json(silent=True) or {}
     name = _safe_filename(data.get("name", ""))
     try:
@@ -817,6 +900,8 @@ def direct_done():
 def view(file_id):
     """在线预览：已发布文件熟人可看，待审核文件只有站长可看。
     图片、PDF、文本、视频、音频会在浏览器里直接打开，其他类型浏览器会提示下载。"""
+    if _is_relay():
+        return _proxy_to_backend(f"/view/{file_id}")
     service = drive_service()
     if service is None:
         return "云盘暂未连接", 503
@@ -880,6 +965,8 @@ def download(file_id):
     code = _env("EXCHANGE_CODE")
     if not _has_gate(code, "exchange_access"):
         return redirect("/?msg=请先输入访问口令")
+    if _is_relay():
+        return _proxy_to_backend(f"/download/{file_id}")
     service = drive_service()
     if service is None:
         return "云盘暂未连接，下载暂不可用", 503
@@ -1100,6 +1187,8 @@ def admin_logs():
 def thumb(file_id):
     """图片缩略图：只给已发布（熟人）或待审核（站长）看，权限和预览一致。
     用 Pillow 缩到 160 像素宽再返回，没有 Pillow 时原图返回，浏览器按 CSS 缩放。"""
+    if _is_relay():
+        return _proxy_to_backend(f"/thumb/{file_id}")
     service = drive_service()
     if service is None:
         return "云盘暂未连接", 503
