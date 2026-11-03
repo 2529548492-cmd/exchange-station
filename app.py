@@ -146,19 +146,22 @@ def _disposition(kind, name):
     return f"{kind}; filename=\"{safe_ascii}\"; filename*=UTF-8''{quote(name, safe='')}"
 
 
+CATS = ["文档", "图片", "影音", "压缩包", "安装包", "其他"]
+
+
 def _file_kind(name, mime):
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
     if ext in ("jpg", "jpeg", "png", "gif", "webp", "bmp", "svg") or mime.startswith("image/"):
         return "图片"
-    if ext in ("mp4", "mov", "mkv", "avi", "webm") or mime.startswith("video/"):
-        return "视频"
-    if ext in ("mp3", "wav", "m4a", "flac", "ogg") or mime.startswith("audio/"):
-        return "音频"
-    if ext in ("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md"):
+    if ext in ("mp4", "mov", "mkv", "avi", "webm", "mp3", "wav", "m4a", "flac", "ogg") or mime.startswith(("video/", "audio/")):
+        return "影音"
+    if ext in ("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "epub"):
         return "文档"
     if ext in ("zip", "rar", "7z", "tar", "gz"):
         return "压缩包"
-    return "文件"
+    if ext in ("apk", "ipa", "exe", "msi", "dmg", "pkg", "deb", "rpm", "appimage"):
+        return "安装包"
+    return "其他"
 
 
 def _fmt_size(size):
@@ -330,6 +333,7 @@ BASE_CSS = """
   .btn.danger:hover{background:var(--red-soft)}
   .btn:active{transform:scale(.98)}
   @media(max-width:560px){.search{max-width:none}}
+  .catgroup{margin-top:14px}.cathead{margin:14px 0 2px;font-size:16px;display:flex;gap:10px;align-items:center}.cathead .count{margin-left:auto}
   .empty{padding:28px 10px;text-align:center;color:var(--muted);font-size:14px;border:1.5px dashed var(--line);border-radius:12px;margin-top:12px}
   .locked{padding:18px;border-radius:12px;background:var(--surface-2);border:1px solid var(--line);font-size:14px;color:var(--muted);margin-top:10px}
 
@@ -425,12 +429,18 @@ PAGE = (
     "{% if msg %}<p class=\"note\">{{ msg }}</p>{% endif %}</aside>"
     "<div class=\"maincol\"><div class=\"toolbar\"><input class=\"search\" id=\"search\" type=\"search\" placeholder=\"搜索文件名…\" oninput=\"onSearch(this.value)\"></div>"
     "<section class=\"card section\"><div class=\"section-head\"><h2>已发布</h2><span class=\"count\">{{ files|length }} 个</span></div>"
-    "{% if files %}{% for f in files %}"
-    "<div class=\"file\"><div class=\"fic\">{{ f.ext }}</div>"
+    "<div class=\"tabs\" id=\"cattabs\"><button class=\"tab active\" onclick=\"showCat('全部',this)\">全部（{{ files|length }}）</button>"
+    "{% for c in cats %}{% if c.count %}<button class=\"tab\" onclick=\"showCat('{{ c.name }}',this)\">{{ c.name }}（{{ c.count }}）</button>{% endif %}{% endfor %}</div>"
+    "{% if files %}{% for c in cats %}{% if c.count %}"
+    "<div class=\"catgroup\" data-cat=\"{{ c.name }}\"><h3 class=\"cathead\">{{ c.name }} <span class=\"count\">{{ c.count }} 个</span></h3>"
+    "{% for f in files %}{% if f.kind == c.name %}"
+    "<div class=\"file\" data-cat=\"{{ f.kind }}\" data-name=\"{{ f.name|lower }}\">"
+    "<div class=\"fic\">{{ f.ext }}</div>"
     "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.kind }}</span><span>·</span><span>{{ f.size }}</span></div></div>"
     "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a><a class=\"btn primary\" href=\"/download/{{ f.id }}\">下载</a></div></div>"
-    "{% endfor %}{% else %}<p class=\"empty\">目前还没有已发布的文件。</p>{% endif %}</section>"
-    "<script>function onSearch(v){v=v.toLowerCase();document.querySelectorAll('.file').forEach(function(r){r.style.display=r.textContent.toLowerCase().includes(v)?'':'none';});}</script>"
+    "{% endif %}{% endfor %}</div>"
+    "{% endif %}{% endfor %}{% else %}<p class=\"empty\">目前还没有已发布的文件。</p>{% endif %}</section>"
+    "<script>var curCat='全部',curQ='';function applyFilter(){document.querySelectorAll('.catgroup').forEach(function(g){var show=curCat==='全部'||g.dataset.cat===curCat;var any=false;g.querySelectorAll('.file').forEach(function(r){var ok=(curCat==='全部'||r.dataset.cat===curCat)&&r.dataset.name.includes(curQ);r.style.display=ok?'':'none';if(ok)any=true;});g.style.display=(show&&any)?'':'none';});}function showCat(c,el){curCat=c;document.querySelectorAll('#cattabs .tab').forEach(function(t){t.classList.remove('active');});el.classList.add('active');applyFilter();}function onSearch(v){curQ=v.toLowerCase();applyFilter();}</script>"
     "</div></div>"
     "{% endif %}"
     "<div class=\"card section\"><h2>站长审核</h2>"
@@ -503,11 +513,13 @@ def index():
     files = []
     if code and entered:
         files = list_folder(drive_service(), PUBLISHED_FOLDER_ID)
+    cats = [{"name": c, "count": sum(1 for f in files if f["kind"] == c)} for c in CATS]
     return render_template_string(
         PAGE,
         code_configured=bool(code),
         entered=entered,
         drive_configured=_drive_configured(),
+        cats=cats,
         files=files,
         max_mb=MAX_UPLOAD_MB,
         msg=request.args.get("msg", ""),
