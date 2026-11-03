@@ -38,6 +38,7 @@ import hmac
 import io
 import json
 import os
+import time
 from urllib.parse import quote
 
 from flask import Flask, Response, jsonify, redirect, render_template_string, request
@@ -1074,7 +1075,7 @@ def admin_logs():
             uniq.append(e)
     for e in uniq:
         if not e.get('loc'):
-            e['loc'] = _ip_loc(e['ip'])
+            e['loc'] = _ip_loc(e['ip']) or '属地未知'
     rows = "".join(
         f"<div class=\"logrow\"><div class=\"fname\">{e['time']} · {e['action']} · {e['detail']}</div><div class=\"fmeta\"><span>{e['ip']}</span><span>·</span><span>{e.get('loc','')}</span><span>·</span><span>{e['device']}</span></div></div>"
         for e in uniq[:200]
