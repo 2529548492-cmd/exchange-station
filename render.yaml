@@ -7,9 +7,9 @@ services:
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
     envVars:
       - key: DRIVE_PENDING_FOLDER_ID
-        value: 10sy_eATALXEAr1EhW67YVbYbVTeM7lI4
+        value: 1vlEHcik1BsdP8HxG9SIWqWeZYDuHf1B5
       - key: DRIVE_PUBLISHED_FOLDER_ID
-        value: 1fsc2jUUVJnqgupdl_-HY0D0nKVt6xMR3
+        value: 1w6lZz9yeTENzHdUy9Ljt_H5JkgEIVO5F
       - key: MAX_UPLOAD_MB
         value: 200
       - key: ADMIN_TOKEN
@@ -17,4 +17,10 @@ services:
       - key: EXCHANGE_CODE
         sync: false
       - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_ID
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_OAUTH_REFRESH_TOKEN
         sync: false

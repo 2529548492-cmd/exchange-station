@@ -20,6 +20,12 @@
 - DRIVE_PENDING_FOLDER_ID：待审核文件夹 ID（默认是已建好的那个）
 - DRIVE_PUBLISHED_FOLDER_ID：已发布文件夹 ID（默认是已建好的那个）
 - GOOGLE_SERVICE_ACCOUNT_JSON：服务账号 JSON 全文，或它的 Base64
+  （注意：服务账号自身没有 Drive 存储空间，往个人云盘新建文件会被
+  Google 以 storageQuotaExceeded 拒绝，见 2026-11-03 上传 500 日志；
+  因此生产上优先用下面的 OAuth 方式，服务账号只做备用/只读）
+- GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET /
+  GOOGLE_OAUTH_REFRESH_TOKEN：用户本人 OAuth 授权（推荐方式，文件记在
+  用户自己的云盘空间里）。三项齐全时优先用 OAuth，否则回落到服务账号。
 - ADMIN_TOKEN：站长审核口令
 - EXCHANGE_CODE：熟人进入网站的访问口令；未配置时首页会说明“口令由站长提供”
 - MAX_UPLOAD_MB：单文件上限（兆字节），默认 200，Render 免费版只有 512MB 内存
@@ -36,10 +42,10 @@ from flask import Flask, Response, jsonify, redirect, render_template_string, re
 app = Flask(__name__)
 
 PENDING_FOLDER_ID = os.environ.get(
-    "DRIVE_PENDING_FOLDER_ID", "10sy_eATALXEAr1EhW67YVbYbVTeM7lI4"
+    "DRIVE_PENDING_FOLDER_ID", "1vlEHcik1BsdP8HxG9SIWqWeZYDuHf1B5"
 )
 PUBLISHED_FOLDER_ID = os.environ.get(
-    "DRIVE_PUBLISHED_FOLDER_ID", "1fsc2jUUVJnqgupdl_-HY0D0nKVt6xMR3"
+    "DRIVE_PUBLISHED_FOLDER_ID", "1w6lZz9yeTENzHdUy9Ljt_H5JkgEIVO5F"
 )
 try:
     MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
@@ -67,11 +73,35 @@ def _has_gate(secret, cookie_name):
 
 
 def _drive_configured():
+    if _env("GOOGLE_OAUTH_REFRESH_TOKEN") and _env("GOOGLE_OAUTH_CLIENT_ID"):
+        return True
     return bool(_env("GOOGLE_SERVICE_ACCOUNT_JSON"))
 
 
 def drive_service():
-    """只在配置了服务账号时才连接 Drive，否则返回 None。"""
+    """只在配置了 Drive 凭证时才连接，否则返回 None。
+
+    优先用用户本人的 OAuth 刷新令牌（文件记在用户自己的云盘空间里，
+    服务账号没有存储空间，上传会被 Google 拒绝）；三项不全时回落到
+    服务账号（只读/移动仍可用，上传仍可能被拒绝）。
+    """
+    from googleapiclient.discovery import build
+
+    oauth_refresh = _env("GOOGLE_OAUTH_REFRESH_TOKEN")
+    oauth_id = _env("GOOGLE_OAUTH_CLIENT_ID")
+    oauth_secret = _env("GOOGLE_OAUTH_CLIENT_SECRET")
+    if oauth_refresh and oauth_id and oauth_secret:
+        from google.oauth2.credentials import Credentials
+
+        creds = Credentials(
+            token=None,
+            refresh_token=oauth_refresh,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=oauth_id,
+            client_secret=oauth_secret,
+            scopes=["https://www.googleapis.com/auth/drive"],
+        )
+        return build("drive", "v3", credentials=creds)
     raw = _env("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not raw:
         return None
@@ -83,7 +113,6 @@ def drive_service():
         except Exception:
             return None
     from google.oauth2 import service_account
-    from googleapiclient.discovery import build
 
     creds = service_account.Credentials.from_service_account_info(
         info, scopes=["https://www.googleapis.com/auth/drive"]
