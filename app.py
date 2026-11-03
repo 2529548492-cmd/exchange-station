@@ -575,9 +575,9 @@ def list_folder(service, folder_id):
                 "size_bytes": int(f.get("size") or 0),
                 "ext": (f["name"].rsplit(".", 1)[-1].upper()[:4] if "." in f["name"] else "FILE"),
                 "kind": _file_kind(f["name"], f.get("mimeType") or ""),
-                "is_image": (f.get("mimeType") or "").startswith("image/"),
-                "is_video": (f.get("mimeType") or "").startswith("video/"),
-                "is_audio": (f.get("mimeType") or "").startswith("audio/"),
+                "is_image": (f.get("mimeType") or "").startswith("image/") or (f["name"].rsplit(".", 1)[-1].lower() if "." in f["name"] else "") in ("jpg", "jpeg", "png", "gif", "webp", "bmp", "svg"),
+                "is_video": (f.get("mimeType") or "").startswith("video/") or (f["name"].rsplit(".", 1)[-1].lower() if "." in f["name"] else "") in ("mp4", "mov", "mkv", "webm", "avi"),
+                "is_audio": (f.get("mimeType") or "").startswith("audio/") or (f["name"].rsplit(".", 1)[-1].lower() if "." in f["name"] else "") in ("mp3", "flac", "wav", "ogg", "m4a"),
                 "thumb_link": f.get("thumbnailLink") or "",
             }
         )
@@ -2317,8 +2317,6 @@ def thumb(file_id):
         if tl:
             return redirect(tl)
         return "暂无视频缩略图", 404
-    if not (meta.get("mimeType") or "").startswith("image/"):
-        return "不是图片", 404
     from googleapiclient.http import MediaIoBaseDownload
 
     buf = io.BytesIO()
