@@ -83,19 +83,70 @@ def _drive_configured():
 
 
 ACCESS_LOG = deque(maxlen=500)
+_DRIVE_LOG_BUFFER = []
+_DRIVE_LOG_FILE_ID = [None]
+
+
+def _flush_drive_log():
+    """把缓冲的日志行追加到云盘里的 交换站访问日志.txt。
+    文件放在云盘根目录（不在待审核/已发布里，熟人看不到），找不到就新建一个。
+    失败时静默跳过，绝不影响上传/下载主流程；缓冲的行会留在内存里下次再试。"""
+    global _DRIVE_LOG_BUFFER
+    if not _DRIVE_LOG_BUFFER:
+        return
+    try:
+        service = drive_service()
+        if service is None:
+            return
+        lines = _DRIVE_LOG_BUFFER
+        _DRIVE_LOG_BUFFER = []
+        text = "".join(lines)
+        fid = _DRIVE_LOG_FILE_ID[0] or _env("ACCESS_LOG_DRIVE_FILE_ID")
+        if not fid:
+            res = service.files().list(
+                q="name = '交换站访问日志.txt' and trashed = false",
+                fields="files(id)", pageSize=5,
+            ).execute()
+            files = res.get("files") or []
+            fid = files[0]["id"] if files else None
+        if fid:
+            _DRIVE_LOG_FILE_ID[0] = fid
+            from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+
+            buf = io.BytesIO()
+            dl = MediaIoBaseDownload(buf, service.files().get_media(fileId=fid))
+            done = False
+            while not done:
+                _, done = dl.next_chunk()
+            old = buf.getvalue().decode("utf-8", errors="ignore")
+            media = MediaIoBaseUpload(io.BytesIO((old + text).encode("utf-8")), mimetype="text/plain", resumable=True)
+            service.files().update(fileId=fid, media_body=media).execute()
+        else:
+            from googleapiclient.http import MediaIoBaseUpload
+
+            media = MediaIoBaseUpload(io.BytesIO(text.encode("utf-8")), mimetype="text/plain", resumable=True)
+            created = service.files().create(body={"name": "交换站访问日志.txt"}, media_body=media, fields="id").execute()
+            _DRIVE_LOG_FILE_ID[0] = created.get("id")
+    except Exception as e:
+        print(f"[access] drive log flush failed: {e}", flush=True)
+        _DRIVE_LOG_BUFFER = lines + _DRIVE_LOG_BUFFER
 
 
 def _log(action, detail=""):
     """访问日志：只记时间、IP、动作、文件名，不记任何口令、密钥、完整 UA。
-    同时打印到 stdout，Render 后台 Logs 里也能看到；内存里的列表在服务
-    休眠/重启后会清空，所以这里只是近期的站内查看，长期记录看 Render Logs。"""
+    内存里留近期 500 条供站长区查看，同时每 20 条或每次站长操作后缓冲写进
+    云盘根目录的 交换站访问日志.txt，服务休眠/重启也不会丢长期记录。"""
     ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "?").split(",")[0].strip()
     ua = request.headers.get("User-Agent", "")
     device = "手机" if ("Mobile" in ua or "Android" in ua or "iPhone" in ua) else "电脑"
     now = datetime.now(timezone.utc) + timedelta(hours=8)
-    entry = {"time": now.strftime("%m-%d %H:%M"), "ip": ip, "device": device, "action": action, "detail": detail}
+    entry = {"time": now.strftime("%Y-%m-%d %H:%M"), "ip": ip, "device": device, "action": action, "detail": detail}
     ACCESS_LOG.appendleft(entry)
-    print(f"[access] {entry['time']} {ip} {device} {action} {detail}", flush=True)
+    line = f"{entry['time']} {ip} {device} {action} {detail}\n"
+    print(f"[access] {line.strip()}", flush=True)
+    _DRIVE_LOG_BUFFER.append(line)
+    if len(_DRIVE_LOG_BUFFER) >= 20 or action in ("审核通过", "审核不通过", "删除已发布", "改名"):
+        _flush_drive_log()
 
 
 def drive_service():
@@ -837,15 +888,48 @@ def admin_logs():
     token = _env("ADMIN_TOKEN")
     if not token or not _has_gate(token, "admin_access"):
         return "请先在首页输入站长口令", 403
+    # 打开日志页时先把缓冲写进云盘，再从云盘读回最近的记录，和内存里的合并去重。
+    _flush_drive_log()
+    entries = list(ACCESS_LOG)
+    try:
+        service = drive_service()
+        if service is not None:
+            fid = _DRIVE_LOG_FILE_ID[0] or _env("ACCESS_LOG_DRIVE_FILE_ID")
+            if not fid:
+                res = service.files().list(q="name = '交换站访问日志.txt' and trashed = false", fields="files(id)", pageSize=5).execute()
+                fl = res.get("files") or []
+                fid = fl[0]["id"] if fl else None
+            if fid:
+                _DRIVE_LOG_FILE_ID[0] = fid
+                from googleapiclient.http import MediaIoBaseDownload
+
+                buf = io.BytesIO()
+                dl = MediaIoBaseDownload(buf, service.files().get_media(fileId=fid))
+                done = False
+                while not done:
+                    _, done = dl.next_chunk()
+                for line in buf.getvalue().decode("utf-8", errors="ignore").strip().split("\n")[-200:]:
+                    parts = line.split(" ", 4)
+                    if len(parts) >= 5:
+                        entries.append({"time": parts[0] + " " + parts[1], "ip": parts[2], "device": parts[3], "action": parts[4], "detail": ""})
+    except Exception:
+        pass
+    seen = set()
+    uniq = []
+    for e in entries:
+        k = (e["time"], e["ip"], e["action"], e["detail"])
+        if k not in seen:
+            seen.add(k)
+            uniq.append(e)
     rows = "".join(
         f"<div class=\"file\"><div class=\"fmain\"><div class=\"fname\">{e['time']} · {e['action']} · {e['detail']}</div><div class=\"fmeta\"><span>{e['ip']}</span><span>·</span><span>{e['device']}</span></div></div></div>"
-        for e in ACCESS_LOG
+        for e in uniq[:200]
     ) or "<p class=\"empty\">暂无访问记录。</p>"
     return render_template_string(
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         "<title>访问日志 - 交换站</title><style>" + BASE_CSS + "</style></head><body><div class=\"wrap\">"
-        "<h1>访问日志</h1><p class=\"note\">只记时间、IP、设备类型、动作和文件名，不记口令。这里是近期记录（最多 500 条），服务休眠或重启后会清空，长期记录请去 Render 后台 Logs 里看。</p>"
+        "<h1>访问日志</h1><p class=\"note\">只记时间、IP、设备类型、动作和文件名，不记口令。长期记录存在云盘根目录的 交换站访问日志.txt 里（不在待审核/已发布里，熟人看不到），服务休眠或重启也不会丢。</p>"
         "<div class=\"card section\">" + rows + "</div>"
         "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
     )
