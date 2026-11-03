@@ -158,13 +158,56 @@ def _log(action, detail=""):
     ua = request.headers.get("User-Agent", "")
     device = "手机" if ("Mobile" in ua or "Android" in ua or "iPhone" in ua) else "电脑"
     now = datetime.now(timezone.utc) + timedelta(hours=8)
-    entry = {"time": now.strftime("%Y-%m-%d %H:%M"), "ip": ip, "device": device, "action": action, "detail": detail}
+    entry = {"time": now.strftime("%Y-%m-%d %H:%M"), "ip": ip, "loc": "", "device": device, "action": action, "detail": detail}
     ACCESS_LOG.appendleft(entry)
-    line = f"{entry['time']} {ip} {device} {action} {detail}\n"
+    line = f"{entry['time']} {ip} {entry['loc']} {device} {action} {detail}\n"
     print(f"[access] {line.strip()}", flush=True)
     _DRIVE_LOG_BUFFER.append(line)
     if len(_DRIVE_LOG_BUFFER) >= 20 or action in ("审核通过", "审核不通过", "删除已发布", "改名"):
         _flush_drive_log()
+
+
+def _IP_LOC_CACHE():
+    return getattr(_ip_loc, "_cache", None)
+
+def _ip_loc(ip):
+    """访问者 IP 属地：用 ip-api.com 查一次并缓存（仅站长日志页用，不影响公开页面速度）。
+    查不到、超时或 API 失败时返回空，不编造省市。内网地址直接标内网。"""
+    try:
+        if not ip or ip == "?":
+            return ""
+        parts = ip.split(".")
+        if len(parts) == 4:
+            a, b = int(parts[0]), int(parts[1])
+            if a == 10 or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168) or a == 127:
+                return "内网"
+        cache = getattr(_ip_loc, "_cache", None)
+        if cache is None:
+            cache = {}
+            _ip_loc._cache = cache
+        if ip in cache:
+            return cache[ip]
+        loc = ""
+        try:
+            import requests as _rq
+            r = _rq.get(f"http://ip-api.com/json/{ip}?fields=status,country,regionName,city", timeout=2)
+            d = r.json()
+            if d.get("status") == "success":
+                city = d.get("city") or ""
+                region = d.get("regionName") or ""
+                country = d.get("country") or ""
+                if country == "China":
+                    loc = (region + city) if region else "中国"
+                elif country:
+                    loc = country
+        except Exception:
+            loc = ""
+        cache[ip] = loc
+        return loc
+    except Exception:
+        return ""
+
+
 
 
 def drive_service():
@@ -373,6 +416,10 @@ BASE_CSS = """
   .file{display:flex;gap:14px;padding:15px 0;border-top:1px solid var(--line);align-items:center}
   .file:first-of-type{border-top:0}
   .filelist{margin-top:12px;width:100%}
+  .logrow{padding:12px 0;border-top:1px solid var(--line);width:100%}
+  .logrow:first-of-type{border-top:0}
+  .logrow .fname{white-space:normal;overflow:visible;text-overflow:clip;word-break:break-all;overflow-wrap:anywhere}
+  .logrow .fmeta{word-break:break-all;overflow-wrap:anywhere}
   .qrow{display:flex;gap:8px;align-items:center;padding:10px 0;border-top:1px solid var(--line);width:100%}
   .qnum{flex:0 0 auto;font-weight:900}
   .qname{flex:1 1 auto;min-width:0;word-break:break-all;overflow-wrap:anywhere;text-align:left}
@@ -521,7 +568,7 @@ PAGE = (
     "<div class=\"catgroup\" data-cat=\"{{ c.name }}\"><h3 class=\"cathead\">{{ c.name }} <span class=\"count\">{{ c.count }} 个</span></h3>"
     "{% for f in files %}{% if f.kind == c.name %}"
     "<div class=\"file\" data-cat=\"{{ f.kind }}\" data-name=\"{{ f.name|lower }}\">"
-    "{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" alt=\"\" loading=\"lazy\" onerror=\"this.outerHTML='<div class=\\'fic\\'>{{ f.ext }}</div>'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
+    "{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" alt=\"\" loading=\"lazy\" onerror=\"this.outerHTML='<div class=\\'fic\\'>{{ f.ext }}</div>'\">{% else %}{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}{% endif %}"
     "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.kind }}</span><span>·</span><span>{{ f.size }}</span></div>"
 "</div>"
     "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a><a class=\"btn primary\" href=\"/download/{{ f.id }}\">下载</a></div></div>"
@@ -547,7 +594,7 @@ ADMIN_PAGE = (
     + "</style></head><body><div class=\"wrap\"><h1>待审核文件</h1>"
     "{% if not drive_configured %}"
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
-    "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\"><div class=\"fic\">{{ f.ext }}</div>"
+    "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
     "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.size }}</span><span class=\"chip wait\">待审核</span></div></div>"
     "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a>"
     "<form class=\"renameform\" method=\"post\" action=\"/rename\" style=\"display:inline-flex\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
@@ -568,7 +615,7 @@ ADMIN_PAGE = (
     + "</style></head><body><div class=\"wrap\"><h1>待审核文件</h1>"
     "{% if not drive_configured %}"
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
-    "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\"><div class=\"fic\">{{ f.ext }}</div>"
+    "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
     "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.size }}</span><span class=\"chip wait\">待审核</span></div></div>"
     "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a>"
     "<form class=\"renameform\" method=\"post\" action=\"/rename\" style=\"display:inline-flex\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
@@ -589,7 +636,7 @@ ADMIN_PUBLISHED_PAGE = (
     + BASE_CSS
     + "</style></head><body><div class=\"wrap\"><h1>已发布管理</h1>"
     "<p class=\"note\">这里可以把已发布的文件移到回收站，熟人就再也下载不到了。回收站里的文件不在列表里，需要去云盘回收站看。</p>"
-    "{% if files %}<div class=\"card section\">{% for f in files %}<div class=\"file\"><div class=\"fic\">{{ f.ext }}</div>"
+    "{% if files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
     "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.kind }}</span><span>·</span><span>{{ f.size }}</span></div></div>"
     "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a>"
     "<form class=\"renameform\" method=\"post\" action=\"/rename\" style=\"display:inline-flex\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
@@ -1011,9 +1058,11 @@ def admin_logs():
                 while not done:
                     _, done = dl.next_chunk()
                 for line in buf.getvalue().decode("utf-8", errors="ignore").strip().split("\n")[-200:]:
-                    parts = line.split(" ", 4)
-                    if len(parts) >= 5:
-                        entries.append({"time": parts[0] + " " + parts[1], "ip": parts[2], "device": parts[3], "action": parts[4], "detail": ""})
+                    parts = line.split(" ", 5)
+                    if len(parts) >= 6:
+                        entries.append({"time": parts[0] + " " + parts[1], "ip": parts[2], "loc": parts[3], "device": parts[4], "action": parts[5], "detail": ""})
+                    elif len(parts) >= 5:
+                        entries.append({"time": parts[0] + " " + parts[1], "ip": parts[2], "loc": _ip_loc(parts[2]), "device": parts[3], "action": parts[4], "detail": ""})
     except Exception:
         pass
     seen = set()
@@ -1023,8 +1072,11 @@ def admin_logs():
         if k not in seen:
             seen.add(k)
             uniq.append(e)
+    for e in uniq:
+        if not e.get('loc'):
+            e['loc'] = _ip_loc(e['ip'])
     rows = "".join(
-        f"<div class=\"file\"><div class=\"fmain\"><div class=\"fname\">{e['time']} · {e['action']} · {e['detail']}</div><div class=\"fmeta\"><span>{e['ip']}</span><span>·</span><span>{e['device']}</span></div></div></div>"
+        f"<div class=\"logrow\"><div class=\"fname\">{e['time']} · {e['action']} · {e['detail']}</div><div class=\"fmeta\"><span>{e['ip']}</span><span>·</span><span>{e.get('loc','')}</span><span>·</span><span>{e['device']}</span></div></div>"
         for e in uniq[:200]
     ) or "<p class=\"empty\">暂无访问记录。</p>"
     return render_template_string(
