@@ -83,6 +83,7 @@ def _drive_configured():
 
 
 ACCESS_LOG = deque(maxlen=500)
+EXPECTED_SIZES = {}  # file_id -> expected bytes, from direct upload completion; only for files uploaded via this version
 _DRIVE_LOG_BUFFER = []
 _DRIVE_LOG_FILE_ID = [None]
 
@@ -475,8 +476,8 @@ PAGE = (
     "<button class=\"btn primary\" id=\"uploadbtn\" type=\"submit\" {% if not drive_configured %}disabled{% endif %}>上传，等待审核</button>"
     "</form>"
     "<script>var pf=document.querySelector('#tab-publish form');"
-    "async function putChunk(session,file,start,end,total){var chunk=file.slice(start,end);var r=await fetch(session,{method:'PUT',headers:{'Content-Range':'bytes '+start+'-'+(end-1)+'/'+total},body:chunk});if(r.status===308){var rg=r.headers.get('Range');return rg?parseInt(rg.split('-')[1])+1:start;}if(r.ok){return total;}throw new Error('直传失败 '+r.status);}"
-    "async function directOne(file,idx,totalFiles){var tx0=document.getElementById('progtext');if(tx0){tx0.textContent='正在向云盘申请直传通道: '+file.name;}var rs=await fetch('/direct_session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,size:file.size})});var sj=await rs.json();if(!sj.ok){throw new Error(sj.msg||'直传会话失败');}var session=sj.session;var CH=32*1024*1024;var off=0;var st=Date.now();var bar=document.getElementById('progbar');var tx=document.getElementById('progtext');while(off<file.size){var nxt=Math.min(off+CH,file.size);off=await putChunk(session,file,off,nxt,file.size);var pct=Math.round(off/file.size*100);var mb=(off/1048576).toFixed(1),tot=(file.size/1048576).toFixed(1);var sp=(off/1024)/Math.max(0.5,(Date.now()-st)/1000);var spd=sp>1024?(sp/1024).toFixed(1)+' MB/s':sp.toFixed(0)+' KB/s';if(bar){bar.style.width=pct+'%';}if(tx){tx.textContent='直传云盘 '+idx+'/'+totalFiles+'：'+file.name+' '+pct+'%（'+mb+' / '+tot+' MB，'+spd+'）';}}await fetch('/direct_done',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name})});}"
+    "var __lastFileMeta=null;async function putChunk(session,file,start,end,total){var chunk=file.slice(start,end);var r=await fetch(session,{method:'PUT',headers:{'Content-Range':'bytes '+start+'-'+(end-1)+'/'+total},body:chunk});if(r.status===308){var rg=r.headers.get('Range');return rg?parseInt(rg.split('-')[1])+1:start;}if(r.ok){try{__lastFileMeta=await r.json();}catch(e){}return total;}throw new Error('直传失败 '+r.status);}"
+    "async function directOne(file,idx,totalFiles){var tx0=document.getElementById('progtext');if(tx0){tx0.textContent='正在向云盘申请直传通道: '+file.name;}var rs=await fetch('/direct_session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,size:file.size})});var sj=await rs.json();if(!sj.ok){throw new Error(sj.msg||'直传会话失败');}var session=sj.session;var CH=32*1024*1024;var off=0;var st=Date.now();var bar=document.getElementById('progbar');var tx=document.getElementById('progtext');while(off<file.size){var nxt=Math.min(off+CH,file.size);off=await putChunk(session,file,off,nxt,file.size);var pct=Math.round(off/file.size*100);var mb=(off/1048576).toFixed(1),tot=(file.size/1048576).toFixed(1);var sp=(off/1024)/Math.max(0.5,(Date.now()-st)/1000);var spd=sp>1024?(sp/1024).toFixed(1)+' MB/s':sp.toFixed(0)+' KB/s';if(bar){bar.style.width=pct+'%';}if(tx){tx.textContent='直传云盘 '+idx+'/'+totalFiles+'：'+file.name+' '+pct+'%（'+mb+' / '+tot+' MB，'+spd+'）';}}await fetch('/direct_done',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,file_id:__lastFileMeta?__lastFileMeta.id:'',size:file.size})});}"
     "window.__uploading=false;window.addEventListener('beforeunload',function(e){if(window.__uploading){e.preventDefault();e.returnValue='正在上传，离开本页会中断上传';}});document.querySelectorAll('#topnav a').forEach(function(a){a.addEventListener('click',function(e){if(window.__uploading&&a.dataset.tab==='admin'){if(!confirm('正在上传，点站长区进入审核页会中断上传。确定要中断吗？')){e.preventDefault();e.stopImmediatePropagation();}}});});pf.addEventListener('submit',async function(e){e.preventDefault();window.__uploading=true;var b=document.getElementById('uploadbtn');var w=document.getElementById('progwrap');var tx=document.getElementById('progtext');if(!queue.length){return;}if(b){b.disabled=true;}if(w){w.style.display='block';}try{for(var k=0;k<queue.length;k++){await directOne(queue[k],k+1,queue.length);}window.location.href='/?msg='+encodeURIComponent('已上传 '+queue.length+' 个文件到待审核，站长通过后才会出现在已发布列表')+'#publish';}catch(err){if(tx){tx.textContent='直传失败，正在改用本站中转上传: '+err.message;}try{var fd2=new FormData();queue.forEach(function(f){fd2.append('file',f);});var x2=new XMLHttpRequest();x2.open('POST','/upload',true);x2.setRequestHeader('X-Requested-With','XMLHttpRequest');var bar2=document.getElementById('progbar');x2.upload.onprogress=function(ev){if(ev.lengthComputable){var pct=Math.round(ev.loaded/ev.total*100);if(bar2){bar2.style.width=pct+'%';}if(tx){tx.textContent='中转上传: '+pct+'% ('+(ev.loaded/1048576).toFixed(1)+' / '+(ev.total/1048576).toFixed(1)+' MB)';}}};x2.onload=function(){try{var r=JSON.parse(x2.responseText);if(r.ok){window.location.href='/?msg='+encodeURIComponent(r.msg)+'#publish';}else{alert(r.msg);if(b){b.disabled=false;}}}catch(e2){window.location.reload();}};x2.onerror=function(){if(tx){tx.textContent='上传失败，请检查网络后重试';}if(b){b.disabled=false;}window.__uploading=false;};x2.send(fd2);}catch(e3){if(tx){tx.textContent='上传失败：'+err.message+'，请检查网络后重试';}if(b){b.disabled=false;}}}});</script>"
     "<p class=\"note\">支持图片、文档、视频、音频、压缩包等常见类型，点打开预览可以在浏览器里直接看图片、PDF 和文本，不用先下载。</p>"
     "<script>var d=document.getElementById('drop'),i=document.getElementById('fileinput');"
@@ -735,6 +736,13 @@ def direct_done():
         return jsonify({"ok": False}), 403
     data = request.get_json(silent=True) or {}
     name = _safe_filename(data.get("name", "")) or "文件"
+    try:
+        fid = data.get("file_id", "")
+        sz = int(data.get("size") or 0)
+        if fid and sz > 0:
+            EXPECTED_SIZES[fid] = sz
+    except Exception:
+        pass
     _log("上传（直传）", name)
     return jsonify({"ok": True, "msg": "已上传到待审核，站长通过后才会出现在已发布列表"})
 
@@ -888,7 +896,16 @@ def approve():
     file_id = request.form.get("file_id", "")
     if not file_id or _admin_file_or_403(service, file_id) is None:
         return "该文件不在待审核里，无法通过", 403
-    _name = (get_file(service, file_id) or {}).get("name", file_id)
+    _info = get_file(service, file_id) or {}
+    _name = _info.get("name", file_id)
+    _expected = EXPECTED_SIZES.get(file_id)
+    if _expected:
+        try:
+            _actual = int(_info.get("size") or 0)
+        except Exception:
+            _actual = 0
+        if _actual != _expected:
+            return f"该文件还没传完，不能通过：云盘里只有 {_fmt_size(_actual)}，上传时应为 {_fmt_size(_expected)}，请等上传完成后再通过", 409
     service.files().update(
         fileId=file_id,
         addParents=PUBLISHED_FOLDER_ID,
