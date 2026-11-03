@@ -460,7 +460,7 @@ PAGE = (
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>网站可以打开，但上传和下载暂不可用。</div>"
     "{% endif %}"
     "<div class=\"tabpanel\" id=\"tab-publish\"><div class=\"card upload\"><h2>上传文件</h2>"
-    "<p class=\"note\">上传后别人看不到，等站长通过后才会出现在已发布列表。一次最多传 3 个文件，按 1、2、3 的顺序排好再传，总量不超过 {{ max_mb }} MB。</p>"
+    "<p class=\"note\">上传后别人看不到，等站长通过后才会出现在已发布列表。一次最多传 3 个文件，按 1、2、3 的顺序排好再传，总量不超过 {{ max_mb }} MB。文件直传云盘，不经过本站服务器中转，速度看你的上传网速；传完先到待审核，站长通过或删除。</p>"
     "<form method=\"post\" action=\"/upload\" enctype=\"multipart/form-data\">"
     "<div class=\"drop\" id=\"drop\"><strong>点这里选文件，或把文件拖进来</strong><span>支持多选 · 提交后进入待审核</span>"
     "<br><input type=\"file\" id=\"fileinput\" name=\"file\" multiple required></div>"
@@ -468,7 +468,10 @@ PAGE = (
     "<button class=\"btn primary\" id=\"uploadbtn\" type=\"submit\" {% if not drive_configured %}disabled{% endif %}>上传，等待审核</button>"
     "<div id=\"progwrap\" style=\"display:none;margin-top:14px\"><div style=\"background:var(--surface-2);border-radius:999px;overflow:hidden;height:14px\"><div id=\"progbar\" style=\"height:100%;width:0%;background:var(--green)\"></div></div>"
     "<p class=\"note\" id=\"progtext\">正在上传… 0%</p></div></form>"
-    "<script>var pf=document.querySelector('#tab-publish form');pf.addEventListener('submit',function(e){e.preventDefault();var b=document.getElementById('uploadbtn');var w=document.getElementById('progwrap');var bar=document.getElementById('progbar');var tx=document.getElementById('progtext');if(!i.files.length){return;}if(b){b.disabled=true;}if(w){w.style.display='block';}var fd=new FormData(pf);var x=new XMLHttpRequest();x.open('POST','/upload',true);x.setRequestHeader('X-Requested-With','XMLHttpRequest');var st=Date.now();x.upload.onprogress=function(ev){if(ev.lengthComputable){var pct=Math.round(ev.loaded/ev.total*100);var mb=(ev.loaded/1048576).toFixed(1),tot=(ev.total/1048576).toFixed(1);var sp=(ev.loaded/1024)/Math.max(0.5,(Date.now()-st)/1000);var spd=sp>1024?(sp/1024).toFixed(1)+' MB/s':sp.toFixed(0)+' KB/s';if(bar){bar.style.width=pct+'%';}if(tx){tx.textContent='正在上传… '+pct+'%（'+mb+' / '+tot+' MB，'+spd+'），请不要关闭页面';}}};x.onload=function(){if(b){b.disabled=false;b.textContent='上传，等待审核';}try{var r=JSON.parse(x.responseText);if(r.ok){window.location.href='/?msg='+encodeURIComponent(r.msg);}else{alert(r.msg);}}catch(err){window.location.reload();}};x.onerror=function(){alert('上传失败，可能是网络中断或文件过大，请重试');if(b){b.disabled=false;}};x.send(fd);});</script>"
+    "<script>var pf=document.querySelector('#tab-publish form');"
+    "async function putChunk(session,file,start,end,total){var chunk=file.slice(start,end);var r=await fetch(session,{method:'PUT',headers:{'Content-Range':'bytes '+start+'-'+(end-1)+'/'+total},body:chunk});if(r.status===308){var rg=r.headers.get('Range');return rg?parseInt(rg.split('-')[1])+1:start;}if(r.ok){return total;}throw new Error('直传失败 '+r.status);}"
+    "async function directOne(file,idx,totalFiles){var rs=await fetch('/direct_session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,size:file.size})});var sj=await rs.json();if(!sj.ok){throw new Error(sj.msg||'直传会话失败');}var session=sj.session;var CH=8*1024*1024;var off=0;var st=Date.now();var bar=document.getElementById('progbar');var tx=document.getElementById('progtext');while(off<file.size){var nxt=Math.min(off+CH,file.size);off=await putChunk(session,file,off,nxt,file.size);var pct=Math.round(off/file.size*100);var mb=(off/1048576).toFixed(1),tot=(file.size/1048576).toFixed(1);var sp=(off/1024)/Math.max(0.5,(Date.now()-st)/1000);var spd=sp>1024?(sp/1024).toFixed(1)+' MB/s':sp.toFixed(0)+' KB/s';if(bar){bar.style.width=pct+'%';}if(tx){tx.textContent='直传云盘 '+idx+'/'+totalFiles+'：'+file.name+' '+pct+'%（'+mb+' / '+tot+' MB，'+spd+'）';}}await fetch('/direct_done',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name})});}"
+    "pf.addEventListener('submit',async function(e){e.preventDefault();var b=document.getElementById('uploadbtn');var w=document.getElementById('progwrap');var tx=document.getElementById('progtext');if(!queue.length){return;}if(b){b.disabled=true;}if(w){w.style.display='block';}try{for(var k=0;k<queue.length;k++){await directOne(queue[k],k+1,queue.length);}window.location.href='/?msg='+encodeURIComponent('已上传 '+queue.length+' 个文件到待审核，站长通过后才会出现在已发布列表')+'#publish';}catch(err){if(tx){tx.textContent='上传失败：'+err.message+'，请检查网络后重试';}if(b){b.disabled=false;}}});</script>"
     "<p class=\"note\">支持图片、文档、视频、音频、压缩包等常见类型，点打开预览可以在浏览器里直接看图片、PDF 和文本，不用先下载。</p>"
     "<script>var d=document.getElementById('drop'),i=document.getElementById('fileinput');"
     "d.addEventListener('click',function(e){if(e.target!==i){i.click();}});"
@@ -667,6 +670,67 @@ def upload():
     if request.headers.get("X-Requested-With") == "XMLHttpRequest":
         return jsonify({"ok": True, "msg": msg})
     return redirect(f"/?msg={msg}")
+
+
+@app.route("/direct_session", methods=["POST"])
+def direct_session():
+    """直传云盘第一步（服务器端，不暴露任何密钥给浏览器）：
+    熟人进站后，服务器用自己的 OAuth 凭证向谷歌申请一个一次性直传会话，
+    只对应这一个文件、只进待审核文件夹；浏览器拿到的是这个会话地址，
+    不是账号密钥，文件直传云盘不再经过 Render 中转，速度只看上传者网速。
+    会话地址本身有写权限，所以绝不记进日志、不写进页面源码，只当次返回。"""
+    code = _env("EXCHANGE_CODE")
+    if not _has_gate(code, "exchange_access"):
+        return jsonify({"ok": False, "msg": "请先输入访问口令"}), 403
+    data = request.get_json(silent=True) or {}
+    name = _safe_filename(data.get("name", ""))
+    try:
+        size = int(data.get("size") or 0)
+    except Exception:
+        size = 0
+    if not name or size <= 0 or size > MAX_UPLOAD_MB * 1024 * 1024:
+        return jsonify({"ok": False, "msg": "文件名或大小不对（单批总量不超过 500 MB）"}), 400
+    try:
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        import requests as _rq
+
+        oauth_refresh = _env("GOOGLE_OAUTH_REFRESH_TOKEN")
+        oauth_id = _env("GOOGLE_OAUTH_CLIENT_ID")
+        oauth_secret = _env("GOOGLE_OAUTH_CLIENT_SECRET")
+        if not (oauth_refresh and oauth_id and oauth_secret):
+            return jsonify({"ok": False, "msg": "云盘直传暂未开通（需要站长本人的 OAuth 授权）"}), 503
+        creds = Credentials(
+            token=None, refresh_token=oauth_refresh, token_uri="https://oauth2.googleapis.com/token",
+            client_id=oauth_id, client_secret=oauth_secret,
+            scopes=["https://www.googleapis.com/auth/drive"],
+        )
+        creds.refresh(Request())
+        meta = {"name": name, "parents": [PENDING_FOLDER_ID]}
+        r = _rq.post(
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable",
+            headers={"Authorization": f"Bearer {creds.token}", "Content-Type": "application/json; charset=UTF-8"},
+            json=meta, timeout=30,
+        )
+        if r.status_code != 200 or not r.headers.get("Location"):
+            return jsonify({"ok": False, "msg": "云盘直传会话创建失败，请重试"}), 502
+        return jsonify({"ok": True, "session": r.headers["Location"]})
+    except Exception as e:
+        print(f"[direct] session failed: {e}", flush=True)
+        return jsonify({"ok": False, "msg": "云盘直传会话创建失败，请重试"}), 502
+
+
+@app.route("/direct_done", methods=["POST"])
+def direct_done():
+    """直传完成登记：浏览器传完后告诉服务器一声，服务器记一条上传日志；
+    实际文件已经在待审核里，站长在站长区通过或删除，不通过就点不通过进回收站。"""
+    code = _env("EXCHANGE_CODE")
+    if not _has_gate(code, "exchange_access"):
+        return jsonify({"ok": False}), 403
+    data = request.get_json(silent=True) or {}
+    name = _safe_filename(data.get("name", "")) or "文件"
+    _log("上传（直传）", name)
+    return jsonify({"ok": True, "msg": "已上传到待审核，站长通过后才会出现在已发布列表"})
 
 
 @app.route("/view/<file_id>")
