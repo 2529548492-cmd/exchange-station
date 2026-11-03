@@ -38,6 +38,11 @@ import hmac
 import io
 import json
 import os
+import tempfile
+import threading
+import shutil
+import subprocess
+import struct
 import time
 from urllib.parse import quote
 
@@ -560,6 +565,8 @@ def list_folder(service, folder_id):
     for f in res.get("files", []):
         if (f.get("mimeType") or "") == "application/vnd.google-apps.folder":
             continue
+        if folder_id == PUBLISHED_FOLDER_ID and (f.get("name") or "").startswith("_preview_"):
+            continue
         out.append(
             {
                 "id": f["id"],
@@ -881,7 +888,7 @@ PAGE = (
     "var dropped=0;function addQ(fs){var before=queue.length;Array.from(fs).forEach(function(f){if(queue.length<30){queue.push(f);}else{dropped++;}});syncInput();show();}"
     "i.addEventListener('change',function(){addQ(i.files);});</script>"
     "{% if msg %}<p class=\"note\">{{ msg }}</p>{% endif %}</div></div>"
-    '<div class="tabpanel active" id="tab-published"><div class="pub-toolbar"><input class="search" id="search" type="search" placeholder="搜索文件名…" oninput="onSearch(this.value)"><button class="btn" id="openDrawerBtn" type="button">导航</button><button class="btn" id="selBtn" type="button">选择</button></div><section class="card section"><div class="section-head"><h2>已发布</h2><span class="count">{{ files|length }} 个</span></div>{% if msg %}<p class="note" style="margin-top:10px">{{ msg }}</p>{% endif %}<div class="folderbar" id="folderbar"><button class="tab active" data-folder="all" onclick="showFolder(\'all\',this)">全部（{{ files|length }}）</button>{% for fo in folders %}<button class="tab" data-folder="{{ fo.id }}" onclick="showFolder(\'{{ fo.id }}\',this)">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}<button class="tab" id="newFolderBtn" type="button">+ 新建文件夹</button></div><form id="newFolderForm" method="post" action="/folder/create" style="display:none;gap:8px;margin-top:10px"><input class="textin" name="name" placeholder="新文件夹名字，比如：旅行" required maxlength="50" style="flex:1"><button class="btn primary" type="submit">创建</button><button class="btn" type="button" id="newFolderCancel">取消</button></form><div class="tabs" id="cattabs"><button class="tab active" onclick="showCat(\'全部\',this)">全部（{{ files|length }}）</button>{% for c in cats %}{% if c.count %}<button class="tab" onclick="showCat(\'{{ c.name }}\',this)">{{ c.name }}（{{ c.count }}）</button>{% endif %}{% endfor %}</div><form id="moveForm" method="post" action="/folder/move" style="display:none;margin-top:12px;margin-bottom:4px;gap:8px;flex-wrap:wrap;align-items:center"><span id="selCount" style="font-weight:800"></span><input type="hidden" name="dest_folder_id" id="moveDest"><input type="hidden" name="file_ids" id="moveFileIds"><button class="btn primary" type="button" id="moveBtn">移动</button><button class="btn" type="button" id="dlSelBtn">选择下载</button></form><div class="album-grid" id="albumGrid">{% for f in files %}<div class="tile" data-cat="{{ f.kind }}" data-folder="{{ f.folder_id }}" data-name="{{ f.name|lower }}" data-id="{{ f.id }}" data-dl="/download/{{ f.id }}" data-view="/view/{{ f.id }}" data-isimg="{{ \'1\' if f.is_image else \'0\' }}" data-isvid="{{ \'1\' if f.is_video else \'0\' }}" data-isaud="{{ \'1\' if f.is_audio else \'0\' }}"><span class="tile-check"></span>{% if f.is_image or f.is_video %}<img class="tileimg" src="/thumb/{{ f.id }}" alt="" loading="lazy" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'grid\';"><div class="tilefic" style="display:none">{{ f.ext }}</div>{% else %}<div class="tilefic">{{ f.ext }}</div>{% endif %}<div class="tileinfo"><div class="tile-name">{{ f.name }}</div><div class="tile-meta">{{ f.kind }} · {{ f.size }}{% if f.folder_name %} · {{ f.folder_name }}{% endif %}</div></div></div>{% endfor %}</div><p class="empty" id="folderEmpty" style="display:none">这个文件夹里还没有文件。</p>{% if not files %}<p class="empty">目前还没有已发布的文件。</p>{% endif %}<p class="note">点图片默认就是预览；点右上角“选择”，再点图片打勾，就可以批量下载或移动到文件夹。</p></section><div id="previewOverlay"><div id="previewCard"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b id="previewTitle" style="word-break:break-all"></b><button class="btn" id="previewClose" type="button">关闭</button></div><div id="previewBody" style="margin-top:12px"></div></div></div><div id="moveOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40;align-items:center;justify-content:center;padding:16px;box-sizing:border-box"><div style="background:var(--surface);border-radius:18px;padding:16px;width:100%;max-width:420px;max-height:90vh;overflow:auto"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b>移到哪里？</b><button class="btn" type="button" id="moveCancel">取消</button></div><p class="note" style="margin-top:8px">点一个文件夹，选中的文件就会移过去。</p><button class="btn" type="button" data-dest="{{ published_id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">已发布根目录</button>{% for fo in folders %}<button class="btn" type="button" data-dest="{{ fo.id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}</div></div><script>var curCat=\'全部\',curFolder=\'all\',curQ=\'\',selectMode=false,selected=new Set();function applyFilter(){var vis=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){var okCat=curCat===\'全部\'||t.dataset.cat===curCat;var okFolder=curFolder===\'all\'||t.dataset.folder===curFolder;var okQ=t.dataset.name.includes(curQ);var show=(okCat&&okFolder&&okQ);t.style.display=show?\'\':\'none\';if(show)vis++;});var fe=document.getElementById(\'folderEmpty\');if(fe)fe.style.display=(curFolder!==\'all\'&&vis===0)?\'block\':\'none\';}function showCat(c,el){curCat=c;document.querySelectorAll(\'#cattabs .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function showFolder(fid,el){curFolder=fid;document.querySelectorAll(\'#folderbar .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function onSearch(v){curQ=v.toLowerCase();applyFilter();}function updateSel(){var mf=document.getElementById(\'moveForm\');var sc=document.getElementById(\'selCount\');var ids=document.getElementById(\'moveFileIds\');if(sc)sc.textContent=\'已选 \'+selected.size+\' 个 · 选择模式中，点图片是打勾，点右上角“取消选择”退出后才能查看\';if(ids)ids.value=Array.from(selected).join(\',\');if(mf)mf.style.display=selected.size?\'flex\':\'none\';}function openPreview(t){var ov=document.getElementById(\'previewOverlay\');var ti=document.getElementById(\'previewTitle\');var bd=document.getElementById(\'previewBody\');if(!ov||!ti||!bd)return;ti.textContent=t.querySelector(\'.tile-name\').textContent;var view=t.dataset.view,dl=t.dataset.dl;if(t.dataset.isimg===\'1\'){bd.innerHTML=\'<img src="\'+view+\'" style="width:100%;border-radius:12px"><p class="note" id="previewErr" style="display:none">图片预览加载失败，可能是原图太大或网络中断，点下面下载后本地查看。</p><a class="btn primary" href="\'+dl+\'">下载原图</a>\';var _im=bd.querySelector(\'img\');if(_im){_im.onerror=function(){_im.style.display=\'none\';var e=document.getElementById(\'previewErr\');if(e)e.style.display=\'block\';};}}else if(t.dataset.isvid===\'1\'){bd.innerHTML=\'<video controls preload="metadata" src="\'+view+\'" style="width:100%;border-radius:12px"></video><p class="note">大视频在线播需要先缓冲一会儿；如果一直转圈，点下面下载后本地播放更快。</p><a class="btn primary" href="\'+dl+\'">下载视频</a>\';}else if(t.dataset.isaud===\'1\'){bd.innerHTML=\'<audio controls src="\'+view+\'" style="width:100%"></audio>\';}else if(t.dataset.cat===\'文档\'){bd.innerHTML=\'<iframe src="\'+view+\'" style="width:100%;height:420px;border:0;border-radius:12px"></iframe><p style="margin-top:10px"><a class="btn primary" href="\'+dl+\'">下载</a></p>\';}else{bd.innerHTML=\'<p class="note">这个类型不能在线预览，请下载后打开。</p><a class="btn primary" href="\'+dl+\'">下载</a>\';}ov.style.display=\'flex\';}function closePreview(){var ov=document.getElementById(\'previewOverlay\');var bd=document.getElementById(\'previewBody\');if(bd){bd.querySelectorAll(\'video,audio\').forEach(function(m){m.pause();m.removeAttribute(\'src\');m.load();});bd.innerHTML=\'\';}if(ov)ov.style.display=\'none\';}function dlTile(t){var url=t.dataset.dl;var name=t.querySelector(\'.tile-name\').textContent;var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.responseType=\'blob\';x.onload=function(){if(x.status===200){var a=document.createElement(\'a\');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}else{alert(\'下载失败，请重试\');}};x.onerror=function(){alert(\'下载失败，请检查网络后重试\');};x.send();}document.getElementById(\'albumGrid\').addEventListener(\'click\',function(e){var t=e.target.closest(\'.tile\');if(!t)return;if(selectMode){var id=t.dataset.id;if(selected.has(id)){selected.delete(id);t.classList.remove(\'selected\');}else{selected.add(id);t.classList.add(\'selected\');}updateSel();}else{openPreview(t);}});document.getElementById(\'previewClose\').addEventListener(\'click\',closePreview);document.getElementById(\'previewOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'previewOverlay\')closePreview();});document.getElementById(\'selBtn\').addEventListener(\'click\',function(){selectMode=!selectMode;var g=document.getElementById(\'albumGrid\');if(selectMode){g.classList.add(\'selecting\');this.textContent=\'取消选择\';}else{selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});g.classList.remove(\'selecting\');this.textContent=\'选择\';}updateSel();});document.getElementById(\'dlSelBtn\').addEventListener(\'click\',function(){var tiles=[];document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(selected.has(t.dataset.id))tiles.push(t);});if(!tiles.length)return;var i=0;function next(){if(i>=tiles.length){alert(\'已开始下载 \'+tiles.length+\' 个文件（浏览器可能逐个询问是否允许多个下载）。\');selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});document.getElementById(\'albumGrid\').classList.remove(\'selecting\');selectMode=false;document.getElementById(\'selBtn\').textContent=\'选择\';updateSel();return;}dlTile(tiles[i]);i++;setTimeout(next,600);}next();});document.getElementById(\'newFolderBtn\').addEventListener(\'click\',function(){var f=document.getElementById(\'newFolderForm\');f.style.display=\'flex\';});document.getElementById(\'newFolderCancel\').addEventListener(\'click\',function(){document.getElementById(\'newFolderForm\').style.display=\'none\';});document.getElementById(\'moveForm\').addEventListener(\'submit\',function(e){if(!selected.size){e.preventDefault();alert(\'请先勾选文件\');}});document.getElementById(\'moveBtn\').addEventListener(\'click\',function(){if(!selected.size){alert(\'请先勾选文件\');return;}var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'flex\';});document.getElementById(\'moveCancel\').addEventListener(\'click\',function(){var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'none\';});document.getElementById(\'moveOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'moveOverlay\'){e.target.style.display=\'none\';}});document.querySelectorAll(\'#moveOverlay [data-dest]\').forEach(function(b){b.addEventListener(\'click\',function(){var d=document.getElementById(\'moveDest\');if(d)d.value=b.dataset.dest;document.getElementById(\'moveForm\').submit();});});</script></div>'
+    '<div class="tabpanel active" id="tab-published"><div class="pub-toolbar"><input class="search" id="search" type="search" placeholder="搜索文件名…" oninput="onSearch(this.value)"><button class="btn" id="openDrawerBtn" type="button">导航</button><button class="btn" id="selBtn" type="button">选择</button></div><section class="card section"><div class="section-head"><h2>已发布</h2><span class="count">{{ files|length }} 个</span></div>{% if msg %}<p class="note" style="margin-top:10px">{{ msg }}</p>{% endif %}<div class="folderbar" id="folderbar"><button class="tab active" data-folder="all" onclick="showFolder(\'all\',this)">全部（{{ files|length }}）</button>{% for fo in folders %}<button class="tab" data-folder="{{ fo.id }}" onclick="showFolder(\'{{ fo.id }}\',this)">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}<button class="tab" id="newFolderBtn" type="button">+ 新建文件夹</button></div><form id="newFolderForm" method="post" action="/folder/create" style="display:none;gap:8px;margin-top:10px"><input class="textin" name="name" placeholder="新文件夹名字，比如：旅行" required maxlength="50" style="flex:1"><button class="btn primary" type="submit">创建</button><button class="btn" type="button" id="newFolderCancel">取消</button></form><div class="tabs" id="cattabs"><button class="tab active" onclick="showCat(\'全部\',this)">全部（{{ files|length }}）</button>{% for c in cats %}{% if c.count %}<button class="tab" onclick="showCat(\'{{ c.name }}\',this)">{{ c.name }}（{{ c.count }}）</button>{% endif %}{% endfor %}</div><form id="moveForm" method="post" action="/folder/move" style="display:none;margin-top:12px;margin-bottom:4px;gap:8px;flex-wrap:wrap;align-items:center"><span id="selCount" style="font-weight:800"></span><input type="hidden" name="dest_folder_id" id="moveDest"><input type="hidden" name="file_ids" id="moveFileIds"><button class="btn primary" type="button" id="moveBtn">移动</button><button class="btn" type="button" id="dlSelBtn">选择下载</button></form><div class="album-grid" id="albumGrid">{% for f in files %}<div class="tile" data-cat="{{ f.kind }}" data-folder="{{ f.folder_id }}" data-name="{{ f.name|lower }}" data-id="{{ f.id }}" data-dl="/download/{{ f.id }}" data-view="/view/{{ f.id }}" data-isimg="{{ \'1\' if f.is_image else \'0\' }}" data-isvid="{{ \'1\' if f.is_video else \'0\' }}" data-isaud="{{ \'1\' if f.is_audio else \'0\' }}" data-size="{{ f.size_bytes }}"><span class="tile-check"></span>{% if f.is_image or f.is_video %}<img class="tileimg" src="/thumb/{{ f.id }}" alt="" loading="lazy" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'grid\';"><div class="tilefic" style="display:none">{{ f.ext }}</div>{% else %}<div class="tilefic">{{ f.ext }}</div>{% endif %}<div class="tileinfo"><div class="tile-name">{{ f.name }}</div><div class="tile-meta">{{ f.kind }} · {{ f.size }}{% if f.folder_name %} · {{ f.folder_name }}{% endif %}</div></div></div>{% endfor %}</div><p class="empty" id="folderEmpty" style="display:none">这个文件夹里还没有文件。</p>{% if not files %}<p class="empty">目前还没有已发布的文件。</p>{% endif %}<p class="note">点图片默认就是预览；点右上角“选择”，再点图片打勾，就可以批量下载或移动到文件夹。</p></section><div id="previewOverlay"><div id="previewCard"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b id="previewTitle" style="word-break:break-all"></b><button class="btn" id="previewClose" type="button">关闭</button></div><div id="previewBody" style="margin-top:12px"></div></div></div><div id="moveOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40;align-items:center;justify-content:center;padding:16px;box-sizing:border-box"><div style="background:var(--surface);border-radius:18px;padding:16px;width:100%;max-width:420px;max-height:90vh;overflow:auto"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b>移到哪里？</b><button class="btn" type="button" id="moveCancel">取消</button></div><p class="note" style="margin-top:8px">点一个文件夹，选中的文件就会移过去。</p><button class="btn" type="button" data-dest="{{ published_id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">已发布根目录</button>{% for fo in folders %}<button class="btn" type="button" data-dest="{{ fo.id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}</div></div><script>var curCat=\'全部\',curFolder=\'all\',curQ=\'\',selectMode=false,selected=new Set();function applyFilter(){var vis=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){var okCat=curCat===\'全部\'||t.dataset.cat===curCat;var okFolder=curFolder===\'all\'||t.dataset.folder===curFolder;var okQ=t.dataset.name.includes(curQ);var show=(okCat&&okFolder&&okQ);t.style.display=show?\'\':\'none\';if(show)vis++;});var fe=document.getElementById(\'folderEmpty\');if(fe)fe.style.display=(curFolder!==\'all\'&&vis===0)?\'block\':\'none\';}function showCat(c,el){curCat=c;document.querySelectorAll(\'#cattabs .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function showFolder(fid,el){curFolder=fid;document.querySelectorAll(\'#folderbar .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function onSearch(v){curQ=v.toLowerCase();applyFilter();}function updateSel(){var mf=document.getElementById(\'moveForm\');var sc=document.getElementById(\'selCount\');var ids=document.getElementById(\'moveFileIds\');if(sc)sc.textContent=\'已选 \'+selected.size+\' 个 · 选择模式中，点图片是打勾，点右上角“取消选择”退出后才能查看\';if(ids)ids.value=Array.from(selected).join(\',\');if(mf)mf.style.display=selected.size?\'flex\':\'none\';}function openPreview(t){var ov=document.getElementById(\'previewOverlay\');var ti=document.getElementById(\'previewTitle\');var bd=document.getElementById(\'previewBody\');if(!ov||!ti||!bd)return;ti.textContent=t.querySelector(\'.tile-name\').textContent;var view=t.dataset.view,dl=t.dataset.dl;if(t.dataset.isimg===\'1\'){var _th=t.querySelector(\'.tileimg\');var _tu=_th?_th.getAttribute(\'src\'):\'\';bd.innerHTML=\'<img id="pvThumb" src="\'+_tu+\'" style="width:100%;border-radius:12px"><img id="pvOrig" src="\'+view+\'" style="width:100%;border-radius:12px;display:none"><p class="note" id="previewErr" style="display:none">图片预览加载失败，可能是原图太大或网络中断，点下面下载后本地查看。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载原图</a>\';var _im=bd.querySelector(\'img\');if(_im){_im.onerror=function(){_im.style.display=\'none\';var e=document.getElementById(\'previewErr\');if(e)e.style.display=\'block\';};}var _og=bd.querySelector(\'#pvOrig\');var _tb=bd.querySelector(\'#pvThumb\');if(_og){_og.onload=function(){if(_tb)_tb.style.display=\'none\';_og.style.display=\'block\';};}}else if(t.dataset.isvid===\'1\'){bd.innerHTML=\'<video id="pvVideo" controls preload="metadata" src="\'+view+\'" style="width:100%;border-radius:12px"></video><div style="display:flex;gap:8px;margin:10px 0"><button class="btn" id="qLowBtn" type="button">流畅</button><button class="btn" id="qHighBtn" type="button">高清</button></div><div id="qNote" class="note"></div><p class="note">大视频在线播需要先缓冲一会儿；如果一直转圈，点下面下载后本地播放更快。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载视频</a>\';var _vid=bd.querySelector(\'#pvVideo\');var _ql=bd.querySelector(\'#qLowBtn\');var _qh=bd.querySelector(\'#qHighBtn\');var _qn=bd.querySelector(\'#qNote\');var _qrow=_ql?_ql.parentElement:null;function _setQ(mode,play){if(!_vid)return;if(mode===\'low\'){_vid.src=\'/preview/\'+t.dataset.id;}else{_vid.src=view;}_vid.load();if(play){try{_vid.play();}catch(e){}}if(_ql){_ql.style.background=mode===\'low\'?\'var(--green)\':\'\';_ql.style.color=mode===\'low\'?\'#fff\':\'\';}if(_qh){_qh.style.background=mode===\'high\'?\'var(--green)\':\'\';_qh.style.color=mode===\'high\'?\'#fff\':\'\';}try{localStorage.setItem(\'video_quality\',mode);}catch(e){}}if(_ql)_ql.addEventListener(\'click\',function(){_setQ(\'low\',true);});if(_qh)_qh.addEventListener(\'click\',function(){_setQ(\'high\',true);});if(_vid)_vid.addEventListener(\'error\',function(){if(_vid.src.indexOf(\'/preview/\')>=0){_vid.src=view;_vid.load();}});fetch(\'/preview_status/\'+t.dataset.id).then(function(r){return r.json();}).then(function(j){if(j.has_preview){var saved=null;try{saved=localStorage.getItem(\'video_quality\');}catch(e){}_setQ(saved===\'high\'?\'high\':\'low\',false);if(_qn)_qn.textContent=\'流畅版是低清预览，起播快；点高清切回原片，加载慢自己受着。\';}else{if(_qrow)_qrow.style.display=\'none\';if(_qn)_qn.textContent=\'低清版还没生成，先看原片。\';}}).catch(function(){if(_qrow)_qrow.style.display=\'none\';});}else if(t.dataset.isaud===\'1\'){bd.innerHTML=\'<audio controls src="\'+view+\'" style="width:100%"></audio>\';}else if(t.dataset.cat===\'文档\'){bd.innerHTML=\'<iframe src="\'+view+\'" style="width:100%;height:420px;border:0;border-radius:12px"></iframe><p style="margin-top:10px"><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a></p>\';}else{bd.innerHTML=\'<p class="note">这个类型不能在线预览，请下载后打开。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a>\';}ov.style.display=\'flex\';}function closePreview(){var ov=document.getElementById(\'previewOverlay\');var bd=document.getElementById(\'previewBody\');if(bd){bd.querySelectorAll(\'video,audio\').forEach(function(m){m.pause();m.removeAttribute(\'src\');m.load();});bd.innerHTML=\'\';}if(ov)ov.style.display=\'none\';}function dlTile(t){var url=t.dataset.dl;var name=t.querySelector(\'.tile-name\').textContent;var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.responseType=\'blob\';x.onload=function(){if(x.status===200){var a=document.createElement(\'a\');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}else{alert(\'下载失败，请重试\');}};x.onerror=function(){alert(\'下载失败，请检查网络后重试\');};x.send();}document.getElementById(\'albumGrid\').addEventListener(\'click\',function(e){var t=e.target.closest(\'.tile\');if(!t)return;if(selectMode){var id=t.dataset.id;if(selected.has(id)){selected.delete(id);t.classList.remove(\'selected\');}else{selected.add(id);t.classList.add(\'selected\');}updateSel();}else{openPreview(t);}});document.getElementById(\'previewClose\').addEventListener(\'click\',closePreview);document.getElementById(\'previewOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'previewOverlay\')closePreview();});document.getElementById(\'selBtn\').addEventListener(\'click\',function(){selectMode=!selectMode;var g=document.getElementById(\'albumGrid\');if(selectMode){g.classList.add(\'selecting\');this.textContent=\'取消选择\';}else{selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});g.classList.remove(\'selecting\');this.textContent=\'选择\';}updateSel();});document.getElementById(\'dlSelBtn\').addEventListener(\'click\',function(){var tiles=[];document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(selected.has(t.dataset.id))tiles.push(t);});if(!tiles.length)return;var i=0;function next(){if(i>=tiles.length){alert(\'已开始下载 \'+tiles.length+\' 个文件（浏览器可能逐个询问是否允许多个下载）。\');selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});document.getElementById(\'albumGrid\').classList.remove(\'selecting\');selectMode=false;document.getElementById(\'selBtn\').textContent=\'选择\';updateSel();return;}dlTile(tiles[i]);i++;setTimeout(next,600);}next();});document.getElementById(\'newFolderBtn\').addEventListener(\'click\',function(){var f=document.getElementById(\'newFolderForm\');f.style.display=\'flex\';});document.getElementById(\'newFolderCancel\').addEventListener(\'click\',function(){document.getElementById(\'newFolderForm\').style.display=\'none\';});document.getElementById(\'moveForm\').addEventListener(\'submit\',function(e){if(!selected.size){e.preventDefault();alert(\'请先勾选文件\');}});document.getElementById(\'moveBtn\').addEventListener(\'click\',function(){if(!selected.size){alert(\'请先勾选文件\');return;}var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'flex\';});document.getElementById(\'moveCancel\').addEventListener(\'click\',function(){var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'none\';});document.getElementById(\'moveOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'moveOverlay\'){e.target.style.display=\'none\';}});document.querySelectorAll(\'#moveOverlay [data-dest]\').forEach(function(b){b.addEventListener(\'click\',function(){var d=document.getElementById(\'moveDest\');if(d)d.value=b.dataset.dest;document.getElementById(\'moveForm\').submit();});});function _segDl(url,name,size,progEl,doneCb){var CH=8*1024*1024,PAR=3,TRY=3,total=Math.ceil(size/CH),parts=new Array(total),done=0,failed=false,next=0,inflight=0;function show(){if(progEl)progEl.textContent=\'下载中 \'+Math.round(done/total*100)+\'%（\'+(done*CH>size?size:done*CH)+\' / \'+size+\' 字节）\';}function fetchC(idx,att,cb){var st=idx*CH,en=Math.min(size-1,st+CH-1);var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.setRequestHeader(\'Range\',\'bytes=\'+st+\'-\'+en);x.responseType=\'blob\';x.onload=function(){if(x.status===206||x.status===200){cb(null,x.response);}else if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk failed\'));}};x.onerror=function(){if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk network error\'));}};x.send();}function launch(){while(!failed&&inflight<PAR&&next<total){(function(idx){inflight++;fetchC(idx,0,function(err,blob){inflight--;if(failed)return;if(err){failed=true;if(doneCb)doneCb(err);return;}parts[idx]=blob;done++;show();if(done===total){var a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob(parts));a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);if(doneCb)doneCb(null);}else{launch();}});})(next);next++;}}show();launch();}document.getElementById(\'previewBody\').addEventListener(\'click\',function(e){var a=e.target.closest?e.target.closest(\'.segdl\'):null;if(!a)return;var sz=parseInt(a.dataset.size||\'0\',10);if(!sz||sz<20*1024*1024||sz>500*1024*1024)return;e.preventDefault();var prog=document.getElementById(\'segProg\');if(!prog){prog=document.createElement(\'div\');prog.id=\'segProg\';prog.className=\'note\';var _pb=document.getElementById(\'previewBody\');if(_pb)_pb.appendChild(prog);}_segDl(a.dataset.dl,a.dataset.name||\'download\',sz,prog,function(err){if(err&&prog)prog.textContent=\'下载失败，请重试\';else if(prog)prog.textContent=\'下载完成\';});});var _pre={};function _preOrig(t){if(!t||t.dataset.isimg!==\'1\')return;var u=t.dataset.view;if(!u||_pre[u])return;_pre[u]=1;var im=new Image();im.src=u;}document.addEventListener(\'touchstart\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);},{passive:true});document.addEventListener(\'mouseover\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);});function _preVisible(){if(navigator.connection&&navigator.connection.saveData)return;var n=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(n>=6)return;if(t.style.display===\'none\')return;var r=t.getBoundingClientRect();if(r.bottom<0||r.top>window.innerHeight)return;var b=Object.keys(_pre).length;_preOrig(t);if(Object.keys(_pre).length>b)n++;});}if(\'requestIdleCallback\' in window){requestIdleCallback(_preVisible,{timeout:2000});}else{setTimeout(_preVisible,1500);}</script></div>'
     "{% endif %}"
     "<script>function dlFile(btn){var row=btn.closest('.file');var wrap=row.querySelector('.dlprog');var bar=row.querySelector('.dlbar');var tx=row.querySelector('.dltext');if(!wrap)return;wrap.style.display='block';btn.disabled=true;var url=btn.getAttribute('data-dl');var name=btn.getAttribute('data-name');var x=new XMLHttpRequest();x.open('GET',url,true);x.responseType='blob';x.onprogress=function(ev){if(ev.lengthComputable){var pct=Math.round(ev.loaded/ev.total*100);bar.style.width=pct+'%';tx.textContent='下载中… '+pct+'%（'+(ev.loaded/1048576).toFixed(1)+' / '+(ev.total/1048576).toFixed(1)+' MB）';}else{tx.textContent='下载中… '+(ev.loaded/1048576).toFixed(1)+' MB';}};x.onload=function(){if(x.status===200){bar.style.width='100%';tx.textContent='下载完成';var a=document.createElement('a');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}else{tx.textContent='下载失败，请重试';}btn.disabled=false;};x.onerror=function(){tx.textContent='下载失败，请检查网络后重试';btn.disabled=false;};x.send();}</script>"
         '<div class="tabpanel" id="tab-private"><div class="card section"><h2>私人区</h2>'
@@ -1815,6 +1822,281 @@ def _admin_file_or_403(service, file_id):
     return meta
 
 
+
+def _preview_name(file_id):
+    return "_preview_" + file_id + ".mp4"
+
+
+def _find_preview(service, file_id):
+    try:
+        res = service.files().list(
+            q="'" + PUBLISHED_FOLDER_ID + "' in parents and name = '" + _preview_name(file_id) + "' and trashed = false",
+            fields="files(id,name)", pageSize=10).execute()
+        files = res.get("files") or []
+        return files[0]["id"] if files else None
+    except Exception:
+        return None
+
+
+_PREVIEW_RUNNING = set()
+
+
+def _preview_job(file_id):
+    if file_id in _PREVIEW_RUNNING:
+        return
+    _PREVIEW_RUNNING.add(file_id)
+    try:
+        _preview_job_inner(file_id)
+    finally:
+        _PREVIEW_RUNNING.discard(file_id)
+
+
+def _preview_job_inner(file_id):
+    """Background low-res preview: 480p 800k + faststart, best-effort only.
+    Any failure leaves the original untouched; playback falls back to original."""
+    try:
+        if shutil.which("ffmpeg") is None:
+            print("preview skipped, no ffmpeg: " + file_id)
+            return
+        service = drive_service()
+        if service is None:
+            return
+        meta = get_file(service, file_id) or {}
+        if PUBLISHED_FOLDER_ID not in (meta.get("parents") or []):
+            if not _is_published_parent(service, meta.get("parents") or []):
+                return
+        old = _find_preview(service, file_id)
+        if old:
+            try:
+                service.files().update(fileId=old, body={"trashed": True}).execute()
+            except Exception:
+                pass
+        tmpdir = tempfile.mkdtemp(prefix="preview-")
+        try:
+            orig = os.path.join(tmpdir, "orig.mp4")
+            out = os.path.join(tmpdir, "preview.mp4")
+            from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+            with open(orig, "wb") as fh:
+                dl = MediaIoBaseDownload(fh, service.files().get_media(fileId=file_id))
+                done = False
+                while not done:
+                    _, done = dl.next_chunk()
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-i", orig, "-vf", "scale=854:480",
+                 "-b:v", "800k", "-b:a", "96k", "-preset", "veryfast",
+                 "-movflags", "+faststart", "-c:v", "libx264", "-c:a", "aac", out],
+                capture_output=True, timeout=1800)
+            if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
+                print("preview transcode failed: " + file_id)
+                return
+            media = MediaFileUpload(out, mimetype="video/mp4", resumable=True)
+            service.files().create(
+                body={"name": _preview_name(file_id), "parents": [PUBLISHED_FOLDER_ID]},
+                media_body=media).execute()
+            print("preview done " + file_id)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    except Exception as e:
+        print("preview failed " + file_id + ": " + str(e))
+
+
+
+@app.route("/preview/<file_id>")
+def preview(file_id):
+    """Low-res preview stream: resolves original -> preview file, then streams it
+    through the normal view logic (gate + Range). 404 if no preview exists yet."""
+    if _is_relay():
+        return _proxy_to_backend("/preview/" + file_id)
+    service = drive_service()
+    if service is None:
+        return "云盘暂未连接", 503
+    meta = get_file(service, file_id) or {}
+    if PUBLISHED_FOLDER_ID not in (meta.get("parents") or []):
+        # Also allow published subfolders via _is_published_parent
+        if not _is_published_parent(service, meta.get("parents") or []):
+            return "文件不存在或无权访问", 404
+    pid = _find_preview(service, file_id)
+    if not pid:
+        return "低清预览还没生成", 404
+    return view(pid)
+
+
+@app.route("/preview_status/<file_id>")
+def preview_status(file_id):
+    """Lightweight JSON: does a low-res preview exist for this published video?"""
+    if _is_relay():
+        return _proxy_to_backend("/preview_status/" + file_id)
+    service = drive_service()
+    if service is None:
+        return jsonify({"has_preview": False})
+    pid = _find_preview(service, file_id)
+    if not pid:
+        try:
+            meta = get_file(service, file_id) or {}
+            _pub = PUBLISHED_FOLDER_ID in (meta.get("parents") or []) or _is_published_parent(service, meta.get("parents") or [])
+            if _pub and (meta.get("name") or "").lower().endswith(".mp4"):
+                threading.Thread(target=_preview_job, args=(file_id,), daemon=True).start()
+        except Exception:
+            pass
+    return jsonify({"has_preview": bool(pid)})
+
+
+def _read_boxes(f, start, end):
+    boxes = []
+    f.seek(start)
+    while f.tell() + 8 <= end:
+        pos = f.tell()
+        hdr = f.read(8)
+        if len(hdr) < 8:
+            break
+        size, typ = struct.unpack(">I4s", hdr)
+        typ = typ.decode("latin1")
+        hdr_len = 8
+        if size == 1:
+            size = struct.unpack(">Q", f.read(8))[0]
+            hdr_len = 16
+        elif size == 0:
+            size = end - pos
+        boxes.append((typ, pos, size, hdr_len))
+        if size <= 0:
+            break
+        f.seek(pos + size)
+    return boxes
+
+def _patch_moov(moov_bytes, delta):
+    # Walk moov recursively, patch stco (32-bit) and co64 (64-bit) entries.
+    # moov_bytes includes its own 8/16-byte header.
+    def walk(buf, base, end):
+        i = base
+        while i + 8 <= end:
+            size, typ = struct.unpack(">I4s", buf[i:i+8])
+            typ = typ.decode("latin1")
+            hdr_len = 8
+            if size == 1:
+                size = struct.unpack(">Q", buf[i+8:i+16])[0]
+                hdr_len = 16
+            elif size == 0:
+                size = end - i
+            if typ == "stco":
+                # version/flags 4 bytes, then entry_count 4 bytes, then entries
+                cnt_off = i + hdr_len + 4
+                cnt = struct.unpack(">I", buf[cnt_off:cnt_off+4])[0]
+                for k in range(cnt):
+                    off = cnt_off + 4 + k * 4
+                    v = struct.unpack(">I", buf[off:off+4])[0]
+                    struct.pack_into(">I", buf, off, (v + delta) & 0xFFFFFFFF)
+            elif typ == "co64":
+                cnt_off = i + hdr_len + 4
+                cnt = struct.unpack(">I", buf[cnt_off:cnt_off+4])[0]
+                for k in range(cnt):
+                    off = cnt_off + 4 + k * 8
+                    v = struct.unpack(">Q", buf[off:off+8])[0]
+                    struct.pack_into(">Q", buf, off, v + delta)
+            elif typ in ("moov", "trak", "mdia", "minf", "stbl", "edts", "dinf", "udta", "meta"):
+                # meta has 4 extra bytes after header before children
+                child_base = i + hdr_len + (4 if typ == "meta" else 0)
+                walk(buf, child_base, i + size)
+            if size <= 0:
+                break
+            i += size
+    buf = bytearray(moov_bytes)
+    # moov header itself
+    size, typ = struct.unpack(">I4s", buf[0:8])
+    hdr_len = 16 if size == 1 else 8
+    walk(buf, hdr_len, len(buf))
+    return bytes(buf)
+
+def faststart(in_path, out_path):
+    with open(in_path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        total = f.tell()
+        boxes = _read_boxes(f, 0, total)
+    types = [b[0] for b in boxes]
+    if "moov" not in types or "mdat" not in types:
+        return False, "no moov/mdat"
+    moov_idx = types.index("moov")
+    mdat_idx = types.index("mdat")
+    if moov_idx < mdat_idx:
+        return False, "already faststart"
+    # Read moov
+    _, moov_pos, moov_size, _ = boxes[moov_idx]
+    with open(in_path, "rb") as f:
+        f.seek(moov_pos)
+        moov_bytes = f.read(moov_size)
+    patched = _patch_moov(moov_bytes, moov_size)
+    # New order: ftyp first (if present), then moov, then others in original order
+    order = []
+    for idx, b in enumerate(boxes):
+        if idx == moov_idx:
+            continue
+        order.append(idx)
+    # Put ftyp first
+    ftyp_idx = types.index("ftyp") if "ftyp" in types else None
+    new_order = []
+    if ftyp_idx is not None:
+        new_order.append(ftyp_idx)
+        order.remove(ftyp_idx)
+    # Write
+    with open(in_path, "rb") as fin, open(out_path, "wb") as fout:
+        # ftyp
+        if ftyp_idx is not None:
+            _, pos, size, _ = boxes[ftyp_idx]
+            fin.seek(pos)
+            remaining = size
+            while remaining > 0:
+                chunk = fin.read(min(1024*1024, remaining))
+                if not chunk:
+                    break
+                fout.write(chunk)
+                remaining -= len(chunk)
+        fout.write(patched)
+        for idx in order:
+            _, pos, size, _ = boxes[idx]
+            fin.seek(pos)
+            remaining = size
+            while remaining > 0:
+                chunk = fin.read(min(1024*1024, remaining))
+                if not chunk:
+                    break
+                fout.write(chunk)
+                remaining -= len(chunk)
+    return True, "moved"
+
+def _faststart_job(file_id):
+    """Background faststart after approval: download, move moov, verify, re-upload.
+    Best-effort only: any failure leaves the original file untouched."""
+    try:
+        service = drive_service()
+        if service is None:
+            return
+        meta = get_file(service, file_id) or {}
+        parents = meta.get("parents") or []
+        if PUBLISHED_FOLDER_ID not in parents:
+            return
+        tmpdir = tempfile.mkdtemp(prefix="faststart-")
+        try:
+            orig = os.path.join(tmpdir, "orig.mp4")
+            out = os.path.join(tmpdir, "fast.mp4")
+            from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+            with open(orig, "wb") as fh:
+                dl = MediaIoBaseDownload(fh, service.files().get_media(fileId=file_id))
+                done = False
+                while not done:
+                    _, done = dl.next_chunk()
+            moved, _reason = faststart(orig, out)
+            if not moved:
+                return
+            if os.path.getsize(out) != os.path.getsize(orig):
+                return
+            media = MediaFileUpload(out, mimetype="video/mp4", resumable=True)
+            service.files().update(fileId=file_id, media_body=media).execute()
+            print("faststart done " + file_id)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    except Exception as e:
+        print("faststart failed " + file_id + ": " + str(e))
+
+
 @app.route("/admin/approve", methods=["POST"])
 def approve():
     token = _env("ADMIN_TOKEN")
@@ -1845,6 +2127,16 @@ def approve():
     ).execute()
     _log("审核通过", _name)
     _invalidate_pub_cache()
+    try:
+        if _name.lower().endswith(".mp4"):
+            threading.Thread(target=_preview_job, args=(file_id,), daemon=True).start()
+    except Exception:
+        pass
+    try:
+        if _name.lower().endswith(".mp4"):
+            threading.Thread(target=_faststart_job, args=(file_id,), daemon=True).start()
+    except Exception:
+        pass
     return redirect("/admin")
 
 
