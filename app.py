@@ -84,6 +84,23 @@ def _drive_configured():
 
 ACCESS_LOG = deque(maxlen=500)
 EXPECTED_SIZES = {}  # file_id -> expected bytes, from direct upload completion; only for files uploaded via this version
+_PUB_CACHE = {'t': 0, 'files': None}
+
+
+def _cached_published(service):
+    now = time.time()
+    if _PUB_CACHE['files'] is not None and now - _PUB_CACHE['t'] < 30:
+        return _PUB_CACHE['files']
+    files = list_folder(service, PUBLISHED_FOLDER_ID)
+    _PUB_CACHE['files'] = files
+    _PUB_CACHE['t'] = now
+    return files
+
+
+def _invalidate_pub_cache():
+    _PUB_CACHE['files'] = None
+    _PUB_CACHE['t'] = 0
+
 _DRIVE_LOG_BUFFER = []
 _DRIVE_LOG_FILE_ID = [None]
 
@@ -592,7 +609,7 @@ def index():
     entered = _has_gate(code, "exchange_access")
     files = []
     if code and entered:
-        files = list_folder(drive_service(), PUBLISHED_FOLDER_ID)
+        files = _cached_published(drive_service())
     cats = [{"name": c, "count": sum(1 for f in files if f["kind"] == c)} for c in CATS]
     return render_template_string(
         PAGE,
@@ -912,6 +929,7 @@ def approve():
         removeParents=PENDING_FOLDER_ID,
     ).execute()
     _log("审核通过", _name)
+    _invalidate_pub_cache()
     return redirect("/admin")
 
 
@@ -962,6 +980,7 @@ def admin_delete():
         return "该文件不在已发布里，无法删除", 403
     _name = (get_file(service, file_id) or {}).get("name", file_id)
     service.files().update(fileId=file_id, body={"trashed": True}).execute()
+    _invalidate_pub_cache()
     _log("删除已发布", _name)
     return redirect("/admin/published")
 
@@ -1103,6 +1122,7 @@ def rename():
     if "." not in new_name and "." in old_name:
         new_name = new_name + "." + old_name.rsplit(".", 1)[-1]
     service.files().update(fileId=file_id, body={"name": new_name}).execute()
+    _invalidate_pub_cache()
     _log("改名", f"{old_name} -> {new_name}")
     return redirect(request.form.get("back", "/") or "/")
 

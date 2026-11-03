@@ -4,7 +4,7 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 300 --workers 1
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 300 --workers 1 --worker-class gthread --threads 4
     envVars:
       - key: DRIVE_PENDING_FOLDER_ID
         value: 1vlEHcik1BsdP8HxG9SIWqWeZYDuHf1B5
