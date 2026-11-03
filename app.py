@@ -94,14 +94,14 @@ def _proxy_to_backend(path):
         if _k in request.cookies:
             cookies[_k] = request.cookies[_k]
     try:
-        r = _rq.get(url, cookies=cookies, stream=True, timeout=60)
+        r = _rq.get(url, cookies=cookies, stream=True, timeout=300)
     except Exception as e:
         return f"中转后端暂时连不上：{e}", 502
     headers = {}
     for _h in ("Content-Type", "Content-Disposition", "Content-Length", "Cache-Control"):
         if _h in r.headers:
             headers[_h] = r.headers[_h]
-    return Response(r.iter_content(chunk_size=256 * 1024), status=r.status_code, headers=headers)
+    return Response(r.iter_content(chunk_size=1024 * 1024), status=r.status_code, headers=headers)
 
 
 def _drive_configured():
@@ -650,15 +650,15 @@ PAGE = (
     "<a href=\"#published\" data-tab=\"published\" class=\"active\">已发布区</a>"
     "<a href=\"#feedback\" data-tab=\"feedback\">意见区</a>"
     "<a href=\"#admin\" data-tab=\"admin\">站长区</a></nav>"
-    "<div id=\"progwrap\" style=\"display:none;margin:0 0 14px;padding:12px 14px;border:1px solid var(--line);border-radius:14px;background:var(--surface)\"><div style=\"font-weight:800;margin-bottom:8px\">上传进度（切到别的区也不会消失，传完前不要刷新或离开本页）</div><div style=\"background:var(--surface-2);border-radius:999px;overflow:hidden;height:14px\"><div id=\"progbar\" style=\"height:100%;width:0%;background:var(--green);transition:width .3s\"></div></div><p class=\"note\" id=\"progtext\" style=\"margin-top:8px\">正在上传… 0%</p></div>"
+    "<div id=\"progwrap\" style=\"display:none;margin:0 0 14px;padding:12px 14px;border:1px solid var(--line);border-radius:14px;background:var(--surface)\"><div style=\"font-weight:800;margin-bottom:8px\">上传进度</div><div style=\"background:var(--surface-2);border-radius:999px;overflow:hidden;height:14px\"><div id=\"progbar\" style=\"height:100%;width:0%;background:var(--green);transition:width .3s\"></div></div><p class=\"note\" id=\"progtext\" style=\"margin-top:8px\">正在上传… 0%</p></div>"
     "<div class=\"tabpanel\" id=\"tab-principle\">"
     "<p class=\"lead\">熟人之间传文件的地方。<strong>上传不会立刻公开</strong> —— 先进入待审核，站长通过后，其他人才能在已发布里下载。</p>"
     "<div class=\"flow\"><div class=\"step\"><b><span class=\"num\">1</span> 上传文件</b><p>选文件提交就行，不用注册。</p></div>"
     "<div class=\"arrow\">→</div><div class=\"step mid\"><b><span class=\"num\">2</span> 待审核</b><p>文件先躺在这里，只有站长能看到和处理。</p></div>"
     "<div class=\"arrow\">→</div><div class=\"step\"><b><span class=\"num\">3</span> 已发布 · 下载</b><p>通过后出现在已发布列表，熟人随时下载。</p></div></div>"
     "<div class=\"card section\"><h2>这个站是怎么回事</h2>"
-    "<p>文件最后存在站长的云盘里，网站本身只是一个中转和审核的门面，不存文件。一次上传总量不超过 {{ max_mb }} MB，图片、文档、视频、音频、压缩包、安装包都能传，传上去先待审核，站长通过后才公开。</p>"
-    "<p class=\"note\">网页本身只有约 15 KB，没有大图大库，打开不卡；第一次打开慢通常是免费服务器刚睡醒，需要唤醒一下，不是网页本身大。</p></div></div>"
+    "<p>上传 → 站长审核 → 已发布下载。</p>"
+    "</div></div>"
     "{% if not code_configured %}"
     "<div class=\"card section warn\"><strong>本站需要访问口令</strong><br>"
     "访问口令由站长提供。站长请先在 Render 环境变量中设置 EXCHANGE_CODE，再把口令私下发给熟人。</div>"
@@ -673,19 +673,19 @@ PAGE = (
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>网站可以打开，但上传和下载暂不可用。</div>"
     "{% endif %}"
     "<div class=\"tabpanel\" id=\"tab-publish\"><div class=\"card upload\"><h2>上传文件</h2>"
-    "<p class=\"note\">上传后别人看不到，等站长通过后才会出现在已发布列表。一次最多传 30 个文件，按顺序排好再传，总量不超过 {{ max_mb }} MB（单次总量上限 2 GB）。文件直传云盘，不经过本站服务器中转，速度看你的上传网速；传完先到待审核，站长通过或删除。</p>"
+    "<p class=\"note\">最多 30 个 · 总共 2 GB · 先审核后公开</p>"
     "<form method=\"post\" action=\"/upload\" enctype=\"multipart/form-data\">"
-    "<div class=\"drop\" id=\"drop\"><strong>点这里选文件，或把文件拖进来</strong><span>支持多选 · 提交后进入待审核</span>"
+    "<div class=\"drop\" id=\"drop\"><strong>点这里选文件，或拖进来</strong><span>最多 30 个 · 总共 2 GB</span>"
     "<br><input type=\"file\" id=\"fileinput\" name=\"file\" multiple required></div>"
     "<div class=\"filelist\" id=\"filelist\"></div>"
-    "<button class=\"btn primary\" id=\"uploadbtn\" type=\"submit\" {% if not drive_configured %}disabled{% endif %}>上传，等待审核</button>"
+    "<button class=\"btn primary\" id=\"uploadbtn\" type=\"submit\" {% if not drive_configured %}disabled{% endif %}>上传</button>"
     "<p class=\"note\" id=\"uploadstatus\" style=\"margin-top:10px\"></p>"
     "</form>"
     "<script>var pf=document.querySelector('#tab-publish form');"
     "var __lastFileMeta=null;var __up={done:0,total:0,start:0,lastT:0,lastDone:0};function __fmtSp(bps){return bps>1048576?(bps/1048576).toFixed(1)+' MB/s':(bps/1024).toFixed(0)+' KB/s';}function __showProg(curFile,idx,totalFiles){var bar=document.getElementById('progbar');var tx=document.getElementById('progtext');if(!bar||!tx)return;var pct=__up.total?Math.round(__up.done/__up.total*100):0;bar.style.width=pct+'%';var el=(Date.now()-__up.start)/1000;var bps=el>0.5?__up.done/el:0;var eta=bps>0?'，还剩约'+Math.round((__up.total-__up.done)/bps)+'秒':'';var stalled=(Date.now()-__up.lastT>30000&&__up.done<__up.total)?'（进度 30 秒没动，网可能卡住了，别刷新，等它自己续传）':'';tx.textContent='上传中 '+idx+'/'+totalFiles+'：'+curFile+' '+pct+'%（'+(__up.done/1048576).toFixed(1)+' / '+(__up.total/1048576).toFixed(1)+' MB，'+__fmtSp(bps)+eta+'）'+stalled;}function putChunk(session,file,start,end,total,base){return new Promise(function(res,rej){var x=new XMLHttpRequest();x.open('PUT',session,true);x.setRequestHeader('Content-Range','bytes '+start+'-'+(end-1)+'/'+total);x.upload.onprogress=function(ev){if(ev.lengthComputable){__up.done=base+ev.loaded;__up.lastT=Date.now();__showProg(file.name,__up.idx,__up.n);}};x.onload=function(){if(x.status===308){var rg=x.getResponseHeader('Range');res(rg?parseInt(rg.split('-')[1])+1:start);}else if(x.status>=200&&x.status<300){try{__lastFileMeta=JSON.parse(x.responseText);}catch(e){}res(total);}else{rej(new Error('直传失败 '+x.status));}};x.onerror=function(){rej(new Error('直传网络失败'));};x.send(file.slice(start,end));});}"
     "async function directOne(file,idx,totalFiles){var tx0=document.getElementById('progtext');if(tx0){tx0.textContent='正在向云盘申请直传通道: '+file.name;}var ac=new AbortController();var to=setTimeout(function(){if(tx0){tx0.textContent='直传通道申请超过15秒没回音，可能是服务器刚睡醒，正在重试…';}},15000);var rs=await fetch('/direct_session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,size:file.size}),signal:ac.signal});clearTimeout(to);var sj=await rs.json();if(!sj.ok){throw new Error(sj.msg||'直传会话失败');}var session=sj.session;var CH=8*1024*1024;var off=0;var fileBase=__up.done;__up.idx=idx;__up.n=totalFiles;__up.lastT=Date.now();while(off<file.size){var nxt=Math.min(off+CH,file.size);off=await putChunk(session,file,off,nxt,file.size,fileBase+off);__up.done=fileBase+off;__up.lastT=Date.now();__showProg(file.name,idx,totalFiles);}await fetch('/direct_done',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,file_id:__lastFileMeta?__lastFileMeta.id:'',size:file.size})});}"
     "window.__uploading=false;window.addEventListener('beforeunload',function(e){if(window.__uploading){e.preventDefault();e.returnValue='正在上传，离开本页会中断上传';}});document.querySelectorAll('#topnav a').forEach(function(a){a.addEventListener('click',function(e){if(window.__uploading&&a.dataset.tab==='admin'){if(!confirm('正在上传，点站长区进入审核页会中断上传。确定要中断吗？')){e.preventDefault();e.stopImmediatePropagation();}}});});pf.addEventListener('submit',async function(e){e.preventDefault();window.__uploading=true;var us=document.getElementById('uploadstatus');if(us){us.textContent='已点上传，正在向云盘申请直传通道…（如果这行一直不动，说明页面是旧版，请刷新一次再传）';}var b=document.getElementById('uploadbtn');var w=document.getElementById('progwrap');var tx=document.getElementById('progtext');if(!queue.length){if(b){b.disabled=false;}window.__uploading=false;return;}if(b){b.disabled=true;}if(w){w.style.display='block';}__up.done=0;__up.total=queue.reduce(function(a,f){return a+f.size;},0);__up.start=Date.now();__up.lastT=Date.now();try{for(var k=0;k<queue.length;k++){await directOne(queue[k],k+1,queue.length);}window.location.href='/?msg='+encodeURIComponent('已上传 '+queue.length+' 个文件到待审核，站长通过后才会出现在已发布列表')+'#publish';}catch(err){if(tx){tx.textContent='直传失败，正在改用本站中转上传: '+err.message;}try{var fd2=new FormData();queue.forEach(function(f){fd2.append('file',f);});var x2=new XMLHttpRequest();x2.open('POST','/upload',true);x2.setRequestHeader('X-Requested-With','XMLHttpRequest');var bar2=document.getElementById('progbar');x2.upload.onprogress=function(ev){if(ev.lengthComputable){var pct=Math.round(ev.loaded/ev.total*100);if(bar2){bar2.style.width=pct+'%';}if(tx){tx.textContent='中转上传: '+pct+'% ('+(ev.loaded/1048576).toFixed(1)+' / '+(ev.total/1048576).toFixed(1)+' MB)';}}};x2.onload=function(){try{var r=JSON.parse(x2.responseText);if(r.ok){window.location.href='/?msg='+encodeURIComponent(r.msg)+'#publish';}else{alert(r.msg);if(b){b.disabled=false;}}}catch(e2){window.location.reload();}};x2.onerror=function(){if(tx){tx.textContent='上传失败，请检查网络后重试';}if(b){b.disabled=false;}window.__uploading=false;};x2.send(fd2);}catch(e3){if(tx){tx.textContent='上传失败：'+err.message+'，请检查网络后重试';}if(b){b.disabled=false;}}}});</script>"
-    "<p class=\"note\">支持图片、文档、视频、音频、压缩包等常见类型，点打开预览可以在浏览器里直接看图片、PDF 和文本，不用先下载。</p>"
+    ""
     "<script>var d=document.getElementById('drop'),i=document.getElementById('fileinput');"
     "d.addEventListener('click',function(e){if(e.target!==i){i.click();}});"
     "i.addEventListener('click',function(e){e.stopPropagation();});"
@@ -713,14 +713,15 @@ PAGE = (
     "{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" alt=\"\" loading=\"lazy\" onerror=\"this.outerHTML='<div class=\\'fic\\'>{{ f.ext }}</div>'\">{% else %}{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}{% endif %}"
     "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.kind }}</span><span>·</span><span>{{ f.size }}</span></div>"
 "</div>"
-    "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a><a class=\"btn primary\" href=\"/download/{{ f.id }}\">下载</a></div></div>"
+    "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a><button class=\"btn primary\" data-dl=\"/download/{{ f.id }}\" data-name=\"{{ f.name }}\" onclick=\"dlFile(this)\">下载</button></div><div class=\"dlprog\" style=\"display:none;margin-top:8px\"><div style=\"background:var(--surface-2);border-radius:999px;overflow:hidden;height:10px\"><div class=\"dlbar\" style=\"height:100%;width:0%;background:var(--green);transition:width .3s\"></div></div><p class=\"note dltext\" style=\"margin-top:4px\">下载中… 0%</p></div></div>"
     "{% endif %}{% endfor %}</div>"
     "{% endif %}{% endfor %}{% else %}<p class=\"empty\">目前还没有已发布的文件。</p>{% endif %}</section>"
     "<script>var curCat='全部',curQ='';function applyFilter(){document.querySelectorAll('.catgroup').forEach(function(g){var show=curCat==='全部'||g.dataset.cat===curCat;var any=false;g.querySelectorAll('.file').forEach(function(r){var ok=(curCat==='全部'||r.dataset.cat===curCat)&&r.dataset.name.includes(curQ);r.style.display=ok?'':'none';if(ok)any=true;});g.style.display=(show&&any)?'':'none';});}function showCat(c,el){curCat=c;document.querySelectorAll('#cattabs .tab').forEach(function(t){t.classList.remove('active');});el.classList.add('active');applyFilter();}function onSearch(v){curQ=v.toLowerCase();applyFilter();}</script>"
     "</div>"
     "{% endif %}"
+    "<script>function dlFile(btn){var row=btn.closest('.file');var wrap=row.querySelector('.dlprog');var bar=row.querySelector('.dlbar');var tx=row.querySelector('.dltext');if(!wrap)return;wrap.style.display='block';btn.disabled=true;var url=btn.getAttribute('data-dl');var name=btn.getAttribute('data-name');var x=new XMLHttpRequest();x.open('GET',url,true);x.responseType='blob';x.onprogress=function(ev){if(ev.lengthComputable){var pct=Math.round(ev.loaded/ev.total*100);bar.style.width=pct+'%';tx.textContent='下载中… '+pct+'%（'+(ev.loaded/1048576).toFixed(1)+' / '+(ev.total/1048576).toFixed(1)+' MB）';}else{tx.textContent='下载中… '+(ev.loaded/1048576).toFixed(1)+' MB';}};x.onload=function(){if(x.status===200){bar.style.width='100%';tx.textContent='下载完成';var a=document.createElement('a');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}else{tx.textContent='下载失败，请重试';}btn.disabled=false;};x.onerror=function(){tx.textContent='下载失败，请检查网络后重试';btn.disabled=false;};x.send();}</script>"
     "<div class=\"tabpanel\" id=\"tab-feedback\"><div class=\"card section\"><h2>意见区</h2>"
-    "<p class=\"note\">有意见就写在这里，大家都能看见。站长处理完会把状态改成已解决。</p>"
+    "<p class=\"note\">大家都能看见，站长处理后改成已解决。</p>"
     "{% if fb_user %}<p class=\"note\">当前账号：{{ fb_user }} · <a href=\"/logout_feedback\">退出</a></p><form method=\"post\" action=\"/feedback\"><textarea class=\"textin\" name=\"text\" rows=\"3\" placeholder=\"写下你的意见…\" required style=\"width:100%\"></textarea><br><button class=\"btn primary\" style=\"margin-top:8px\">提交意见</button></form>"
     "{% else %}<div class=\"card section\"><h3>提意见要先注册 / 登录</h3><p class=\"note\">意见大家都能看见，但提意见要先有账号，这样才知道是谁提的。注册的账号密码存在云端，站长能看见和管理，请不要用重要密码注册。</p>"
     "<form method=\"post\" action=\"/register\"><input class=\"textin\" name=\"name\" placeholder=\"账号名\" required> <input class=\"textin\" type=\"password\" name=\"password\" placeholder=\"密码\" required> <button class=\"btn primary\">注册</button></form>"
@@ -920,7 +921,7 @@ def upload():
             up.stream,
             mimetype=up.mimetype or "application/octet-stream",
             resumable=True,
-            chunksize=256 * 1024,
+            chunksize=1024 * 1024,
         )
         service.files().create(
             body={"name": name, "parents": [PENDING_FOLDER_ID]},
@@ -1061,7 +1062,7 @@ def view(file_id):
     def generate_view():
         buf = io.BytesIO()
         downloader = MediaIoBaseDownload(buf, service.files().get_media(fileId=file_id))
-        downloader._chunksize = 256 * 1024
+        downloader._chunksize = 1024 * 1024
         done = False
         while not done:
             buf.seek(0)
@@ -1105,7 +1106,7 @@ def download(file_id):
     def generate_dl():
         buf = io.BytesIO()
         downloader = MediaIoBaseDownload(buf, service.files().get_media(fileId=file_id))
-        downloader._chunksize = 256 * 1024
+        downloader._chunksize = 1024 * 1024
         done = False
         while not done:
             buf.seek(0)
