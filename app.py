@@ -483,8 +483,9 @@ PAGE = (
     "<br><input type=\"file\" id=\"fileinput\" name=\"file\" multiple required></div>"
     "<div class=\"filelist\" id=\"filelist\"></div>"
     "<button class=\"btn primary\" id=\"uploadbtn\" type=\"submit\" {% if not drive_configured %}disabled{% endif %}>上传，等待审核</button>"
-    "<p class=\"note\" id=\"uploading\" style=\"display:none\">正在上传，请不要关闭页面，大文件需要一点时间…</p></form>"
-    "<script>document.querySelector('#tab-publish form').addEventListener('submit',function(){var b=document.getElementById('uploadbtn');if(b){b.disabled=true;b.textContent='正在上传…';}var u=document.getElementById('uploading');if(u){u.style.display='block';}});</script>"
+    "<div id=\"progwrap\" style=\"display:none;margin-top:14px\"><div style=\"background:var(--surface-2);border-radius:999px;overflow:hidden;height:14px\"><div id=\"progbar\" style=\"height:100%;width:0%;background:var(--green)\"></div></div>"
+    "<p class=\"note\" id=\"progtext\">正在上传… 0%</p></div></form>"
+    "<script>var pf=document.querySelector('#tab-publish form');pf.addEventListener('submit',function(e){e.preventDefault();var b=document.getElementById('uploadbtn');var w=document.getElementById('progwrap');var bar=document.getElementById('progbar');var tx=document.getElementById('progtext');if(!i.files.length){return;}if(b){b.disabled=true;}if(w){w.style.display='block';}var fd=new FormData(pf);var x=new XMLHttpRequest();x.open('POST','/upload',true);x.setRequestHeader('X-Requested-With','XMLHttpRequest');var st=Date.now();x.upload.onprogress=function(ev){if(ev.lengthComputable){var pct=Math.round(ev.loaded/ev.total*100);var mb=(ev.loaded/1048576).toFixed(1),tot=(ev.total/1048576).toFixed(1);var sp=(ev.loaded/1024)/Math.max(0.5,(Date.now()-st)/1000);var spd=sp>1024?(sp/1024).toFixed(1)+' MB/s':sp.toFixed(0)+' KB/s';if(bar){bar.style.width=pct+'%';}if(tx){tx.textContent='正在上传… '+pct+'%（'+mb+' / '+tot+' MB，'+spd+'），请不要关闭页面';}}};x.onload=function(){if(b){b.disabled=false;b.textContent='上传，等待审核';}try{var r=JSON.parse(x.responseText);if(r.ok){window.location.href='/?msg='+encodeURIComponent(r.msg);}else{alert(r.msg);}}catch(err){window.location.reload();}};x.onerror=function(){alert('上传失败，可能是网络中断或文件过大，请重试');if(b){b.disabled=false;}};x.send(fd);});</script>"
     "<p class=\"note\">支持图片、文档、视频、音频、压缩包等常见类型，点打开预览可以在浏览器里直接看图片、PDF 和文本，不用先下载。</p>"
     "<script>var d=document.getElementById('drop'),i=document.getElementById('fileinput');"
     "d.addEventListener('click',function(e){if(e.target!==i){i.click();}});"
@@ -668,9 +669,14 @@ def upload():
         ).execute()
         count += 1
     if count == 0:
+        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            return jsonify({"ok": False, "msg": "没有可上传的文件"})
         return redirect("/?msg=没有可上传的文件")
     _log("上传", f"{count} 个文件")
-    return redirect(f"/?msg=已上传 {count} 个文件到待审核，站长通过后才会出现在已发布列表")
+    msg = f"已上传 {count} 个文件到待审核，站长通过后才会出现在已发布列表"
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return jsonify({"ok": True, "msg": msg})
+    return redirect(f"/?msg={msg}")
 
 
 @app.route("/view/<file_id>")
