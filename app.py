@@ -36,6 +36,7 @@ import hmac
 import io
 import json
 import os
+from urllib.parse import quote
 
 from flask import Flask, Response, jsonify, redirect, render_template_string, request
 
@@ -118,6 +119,12 @@ def drive_service():
         info, scopes=["https://www.googleapis.com/auth/drive"]
     )
     return build("drive", "v3", credentials=creds)
+
+
+def _disposition(kind, name):
+    """Content-Disposition: filename* 必须做百分号编码，否则中文文件名会让 gunicorn 报 Invalid HTTP Header，Render 对外就是 502。"""
+    safe_ascii = "".join(c if 32 <= ord(c) < 127 and c not in '"\\' else "_" for c in name) or "file"
+    return f"{kind}; filename=\"{safe_ascii}\"; filename*=UTF-8''{quote(name, safe='')}"
 
 
 def _file_kind(name, mime):
@@ -518,7 +525,7 @@ def view(file_id):
     return Response(
         data,
         headers={
-            "Content-Disposition": f"inline; filename*=UTF-8''{meta['name']}",
+            "Content-Disposition": _disposition("inline", meta["name"]),
             "Content-Type": meta.get("mimeType") or "application/octet-stream",
         },
     )
@@ -554,7 +561,7 @@ def download(file_id):
     return Response(
         data,
         headers={
-            "Content-Disposition": f"attachment; filename*=UTF-8''{meta['name']}",
+            "Content-Disposition": _disposition("attachment", meta["name"]),
             "Content-Type": meta.get("mimeType") or "application/octet-stream",
         },
     )
