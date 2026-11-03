@@ -908,13 +908,18 @@ def download(file_id):
                 yield chunk
 
     _log("下载", meta.get("name", file_id))
-    return Response(
-        generate_dl(),
-        headers={
-            "Content-Disposition": _disposition("attachment", meta["name"]),
-            "Content-Type": meta.get("mimeType") or "application/octet-stream",
-        },
-    )
+    dl_headers = {
+        "Content-Disposition": _disposition("attachment", meta["name"]),
+        "Content-Type": meta.get("mimeType") or "application/octet-stream",
+    }
+    # Drive 元数据里有真实大小时必须带上 Content-Length，否则手机浏览器不知道总大小，会显示 -1.0 B
+    try:
+        _sz = int(meta.get("size") or 0)
+        if _sz > 0:
+            dl_headers["Content-Length"] = str(_sz)
+    except Exception:
+        pass
+    return Response(generate_dl(), headers=dl_headers)
 
 
 @app.route("/admin/login", methods=["POST"])
