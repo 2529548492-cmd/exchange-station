@@ -875,7 +875,7 @@ def index():
         PAGE,
         code_configured=bool(code),
         entered=entered,
-        drive_configured=_drive_configured(),
+        drive_configured=True if _is_relay() else _drive_configured(),
         cats=cats,
         files=files,
         feedback=_read_feedback(drive_service()) if entered else [],
@@ -1635,7 +1635,7 @@ def rename():
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "drive_configured": _drive_configured()})
+    return jsonify({"ok": True, "drive_configured": True if _is_relay() else _drive_configured()})
 
 
 @app.errorhandler(413)
