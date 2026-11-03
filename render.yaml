@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: exchange-station
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: DRIVE_PENDING_FOLDER_ID
+        value: 10sy_eATALXEAr1EhW67YVbYbVTeM7lI4
+      - key: DRIVE_PUBLISHED_FOLDER_ID
+        value: 1fsc2jUUVJnqgupdl_-HY0D0nKVt6xMR3
+      - key: MAX_UPLOAD_MB
+        value: 200
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: EXCHANGE_CODE
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
