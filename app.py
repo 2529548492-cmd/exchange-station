@@ -104,6 +104,40 @@ def _proxy_to_backend(path):
     return Response(r.iter_content(chunk_size=1024 * 1024), status=r.status_code, headers=headers)
 
 
+def _relay_files():
+    """In relay mode, fetch published+pending lists from the backend (Render)."""
+    import requests as _rq
+    cookies = {}
+    for _k in ("exchange_access", "admin_access"):
+        if _k in request.cookies:
+            cookies[_k] = request.cookies[_k]
+    try:
+        r = _rq.get(_relay_backend() + "/api/files", cookies=cookies, timeout=15)
+        return r.json()
+    except Exception:
+        return {"published": [], "pending": []}
+
+
+def _proxy_post_to_backend(path):
+    """Forward an admin POST form to the backend and return its result."""
+    import requests as _rq
+    cookies = {}
+    for _k in ("exchange_access", "admin_access"):
+        if _k in request.cookies:
+            cookies[_k] = request.cookies[_k]
+    try:
+        r = _rq.post(_relay_backend() + path, cookies=cookies, data=request.form.to_dict(), timeout=60, allow_redirects=False)
+    except Exception as e:
+        return f"中转后端暂时连不上：{e}", 502
+    if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("Location"):
+        loc = r.headers["Location"]
+        # Backend redirects to its own /admin pages; keep the user on the relay host
+        if loc.startswith("/"):
+            return redirect(loc)
+        return redirect("/")
+    return (r.text, r.status_code)
+
+
 def _drive_configured():
     if _env("GOOGLE_OAUTH_REFRESH_TOKEN") and _env("GOOGLE_OAUTH_CLIENT_ID"):
         return True
@@ -1165,6 +1199,8 @@ def feedback_resolve():
     token = _env("ADMIN_TOKEN")
     if not token or not _has_gate(token, "admin_access"):
         return "只有站长能改状态", 403
+    if _is_relay():
+        return _proxy_post_to_backend("/feedback/resolve")
     fid = request.form.get("file_id") or request.form.get("id") or ""
     service = drive_service()
     if service is None:
@@ -1260,6 +1296,8 @@ def admin_accounts_change():
     token = _env("ADMIN_TOKEN")
     if not token or not _has_gate(token, "admin_access"):
         return "只有站长能改", 403
+    if _is_relay():
+        return _proxy_post_to_backend("/admin/accounts/change")
     name = request.form.get("name") or ""
     new_pw = request.form.get("new_password") or ""
     service = drive_service()
@@ -1276,6 +1314,8 @@ def admin_accounts_toggle():
     token = _env("ADMIN_TOKEN")
     if not token or not _has_gate(token, "admin_access"):
         return "只有站长能改", 403
+    if _is_relay():
+        return _proxy_post_to_backend("/admin/accounts/toggle")
     name = request.form.get("name") or ""
     service = drive_service()
     accounts = _read_accounts(service) if service else []
@@ -1309,9 +1349,12 @@ def admin():
         return "站长口令还没配置，请联系站长在 Render 环境变量中设置 ADMIN_TOKEN", 503
     if not _has_gate(token, "admin_access"):
         return "请先在首页输入站长口令", 403
-    files = list_folder(drive_service(), PENDING_FOLDER_ID)
+    if _is_relay():
+        files = _relay_files().get("pending", [])
+    else:
+        files = list_folder(drive_service(), PENDING_FOLDER_ID)
     return render_template_string(
-        ADMIN_PAGE, files=files, drive_configured=_drive_configured()
+        ADMIN_PAGE, files=files, drive_configured=True
     )
 
 
@@ -1327,6 +1370,8 @@ def approve():
     token = _env("ADMIN_TOKEN")
     if not token or not _has_gate(token, "admin_access"):
         return "请先在首页输入站长口令", 403
+    if _is_relay():
+        return _proxy_post_to_backend("/admin/approve")
     service = drive_service()
     if service is None:
         return "云盘暂未连接", 503
@@ -1358,6 +1403,8 @@ def reject():
     token = _env("ADMIN_TOKEN")
     if not token or not _has_gate(token, "admin_access"):
         return "请先在首页输入站长口令", 403
+    if _is_relay():
+        return _proxy_post_to_backend("/admin/reject")
     service = drive_service()
     if service is None:
         return "云盘暂未连接", 503
@@ -1375,9 +1422,12 @@ def admin_published():
     token = _env("ADMIN_TOKEN")
     if not token or not _has_gate(token, "admin_access"):
         return "请先在首页输入站长口令", 403
-    files = list_folder(drive_service(), PUBLISHED_FOLDER_ID)
+    if _is_relay():
+        files = _relay_files().get("published", [])
+    else:
+        files = list_folder(drive_service(), PUBLISHED_FOLDER_ID)
     return render_template_string(
-        ADMIN_PUBLISHED_PAGE, files=files, drive_configured=_drive_configured()
+        ADMIN_PUBLISHED_PAGE, files=files, drive_configured=True
     )
 
 
@@ -1386,6 +1436,8 @@ def admin_delete():
     token = _env("ADMIN_TOKEN")
     if not token or not _has_gate(token, "admin_access"):
         return "请先在首页输入站长口令", 403
+    if _is_relay():
+        return _proxy_post_to_backend("/admin/delete")
     service = drive_service()
     if service is None:
         return "云盘暂未连接", 503
@@ -1546,6 +1598,9 @@ def rename():
     """改名：只有站长能改名（已发布和待审核都行），熟人不能改已发布区的文件。
     原因：本站没有每人账号，分不出谁是原上传者，放开给熟人等于谁都能改别人的名字。
     只改名字不改内容，后缀不写时自动保留原后缀；改名会记进访问日志。"""
+    if _is_relay():
+        # Rename form posts here in relay mode too; backend checks admin gate itself
+        return _proxy_post_to_backend("/rename")
     service = drive_service()
     if service is None:
         return "云盘暂未连接", 503
