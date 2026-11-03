@@ -11,7 +11,7 @@ services:
       - key: DRIVE_PUBLISHED_FOLDER_ID
         value: 1w6lZz9yeTENzHdUy9Ljt_H5JkgEIVO5F
       - key: MAX_UPLOAD_MB
-        value: 500
+        value: 2048
       - key: ADMIN_TOKEN
         sync: false
       - key: EXCHANGE_CODE
