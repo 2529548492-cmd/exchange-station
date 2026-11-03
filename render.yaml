@@ -4,14 +4,14 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 300 --workers 1
     envVars:
       - key: DRIVE_PENDING_FOLDER_ID
         value: 1vlEHcik1BsdP8HxG9SIWqWeZYDuHf1B5
       - key: DRIVE_PUBLISHED_FOLDER_ID
         value: 1w6lZz9yeTENzHdUy9Ljt_H5JkgEIVO5F
       - key: MAX_UPLOAD_MB
-        value: 200
+        value: 500
       - key: ADMIN_TOKEN
         sync: false
       - key: EXCHANGE_CODE
