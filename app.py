@@ -322,6 +322,7 @@ BASE_CSS = """
   .file{display:flex;gap:14px;padding:15px 0;border-top:1px solid var(--line);align-items:center}
   .file:first-of-type{border-top:0}
   .renameform{display:flex;gap:6px;margin-top:8px}.renametext{flex:1;min-width:0;padding:8px 10px;border-radius:10px;border:1px solid var(--line);background:var(--surface);color:var(--ink);font-size:14px}
+  .topnav{position:sticky;top:0;z-index:20;background:var(--bg);padding:10px 0;display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--line);margin-bottom:16px}.topnav a{flex:1;text-align:center;text-decoration:none;border:1px solid var(--line);background:var(--surface);color:var(--ink);padding:11px 6px;border-radius:12px;font-weight:800;font-size:15px}.topnav a.active{background:var(--green);border-color:var(--green);color:#fff}.tabpanel{display:none}.tabpanel.active{display:block}
   .thumb{width:46px;height:46px;object-fit:cover;border-radius:12px;border:1px solid var(--line);flex-shrink:0;background:var(--surface-2)}
   .fic{width:46px;height:46px;border-radius:12px;background:var(--surface-2);border:1px solid var(--line);display:grid;place-items:center;flex-shrink:0;font-size:11px;font-weight:900;letter-spacing:.04em;color:var(--green-ink)}
   .fic.pdf{color:#b42318}.fic.zip{color:#7a4a00}.fic.img{color:#175c8a}.fic.audio{color:#6d3bbf}
@@ -396,12 +397,21 @@ PAGE = (
     "<title>交换站</title><style>"
     + BASE_CSS
     + "</style></head><body><div class=\"wrap\">"
-    "<div class=\"top\"><div><h1>交换站</h1>"
-    "<p class=\"lead\">熟人之间传文件的地方。<strong>上传不会立刻公开</strong> —— 先进入待审核，站长通过后，其他人才能在已发布里下载。</p></div>"
+    "<div class=\"top\"><div><h1>交换站</h1></div>"
     "<div class=\"badge-live\"><span class=\"dot\"></span> 仅熟人使用 · 需审核</div></div>"
+    "<nav class=\"topnav\" id=\"topnav\">"
+    "<a href=\"#principle\" data-tab=\"principle\">原理区</a>"
+    "<a href=\"#publish\" data-tab=\"publish\">发布区</a>"
+    "<a href=\"#published\" data-tab=\"published\" class=\"active\">已发布区</a>"
+    "<a href=\"#admin\" data-tab=\"admin\">站长区</a></nav>"
+    "<div class=\"tabpanel\" id=\"tab-principle\">"
+    "<p class=\"lead\">熟人之间传文件的地方。<strong>上传不会立刻公开</strong> —— 先进入待审核，站长通过后，其他人才能在已发布里下载。</p>"
     "<div class=\"flow\"><div class=\"step\"><b><span class=\"num\">1</span> 上传文件</b><p>选文件提交就行，不用注册。</p></div>"
     "<div class=\"arrow\">→</div><div class=\"step mid\"><b><span class=\"num\">2</span> 待审核</b><p>文件先躺在这里，只有站长能看到和处理。</p></div>"
     "<div class=\"arrow\">→</div><div class=\"step\"><b><span class=\"num\">3</span> 已发布 · 下载</b><p>通过后出现在已发布列表，熟人随时下载。</p></div></div>"
+    "<div class=\"card section\"><h2>这个站是怎么回事</h2>"
+    "<p>文件最后存在站长的云盘里，网站本身只是一个中转和审核的门面，不存文件。一次上传总量不超过 {{ max_mb }} MB，图片、文档、视频、音频、压缩包、安装包都能传，传上去先待审核，站长通过后才公开。</p>"
+    "<p class=\"note\">网页本身只有约 15 KB，没有大图大库，打开不卡；第一次打开慢通常是免费服务器刚睡醒，需要唤醒一下，不是网页本身大。</p></div></div>"
     "{% if not code_configured %}"
     "<div class=\"card section warn\"><strong>本站需要访问口令</strong><br>"
     "访问口令由站长提供。站长请先在 Render 环境变量中设置 EXCHANGE_CODE，再把口令私下发给熟人。</div>"
@@ -415,7 +425,7 @@ PAGE = (
     "{% if not drive_configured %}"
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>网站可以打开，但上传和下载暂不可用。</div>"
     "{% endif %}"
-    "<div class=\"layout\"><aside class=\"card upload\"><h2>上传文件</h2>"
+    "<div class=\"tabpanel\" id=\"tab-publish\"><div class=\"card upload\"><h2>上传文件</h2>"
     "<p class=\"note\">上传后别人看不到，等站长通过后才会出现在已发布列表。一次上传总量不超过 {{ max_mb }} MB，例如一次拖 3 个视频，总共别超 {{ max_mb }} MB 就行。</p>"
     "<form method=\"post\" action=\"/upload\" enctype=\"multipart/form-data\">"
     "<div class=\"drop\" id=\"drop\"><strong>点这里选文件，或把文件拖进来</strong><span>支持多选 · 提交后进入待审核</span>"
@@ -431,8 +441,8 @@ PAGE = (
     "d.addEventListener('drop',function(e){e.preventDefault();d.classList.remove('over');i.files=e.dataTransfer.files;show();});"
     "function show(){var l=document.getElementById('filelist');var fs=Array.from(i.files);var tot=fs.reduce(function(a,f){return a+f.size;},0);var mb=(tot/1048576).toFixed(1);l.textContent=fs.map(function(f){return f.name+'（'+(f.size<1048576?(f.size/1024).toFixed(1)+' KB':(f.size/1048576).toFixed(1)+' MB')+'）';}).join('\n')+'\n共 '+fs.length+' 个文件，总计 '+mb+' MB'+(tot>{{ max_mb }}*1048576?'，已超过 {{ max_mb }} MB 上限，请减少文件或分批上传':'');var b=document.getElementById('uploadbtn');if(b){b.disabled=tot>{{ max_mb }}*1048576;}}"
     "i.addEventListener('change',show);</script>"
-    "{% if msg %}<p class=\"note\">{{ msg }}</p>{% endif %}</aside>"
-    "<div class=\"maincol\"><div class=\"toolbar\"><input class=\"search\" id=\"search\" type=\"search\" placeholder=\"搜索文件名…\" oninput=\"onSearch(this.value)\"></div>"
+    "{% if msg %}<p class=\"note\">{{ msg }}</p>{% endif %}</div></div>"
+    "<div class=\"tabpanel active\" id=\"tab-published\"><div class=\"toolbar\"><input class=\"search\" id=\"search\" type=\"search\" placeholder=\"搜索文件名…\" oninput=\"onSearch(this.value)\"></div>"
     "<section class=\"card section\"><div class=\"section-head\"><h2>已发布</h2><span class=\"count\">{{ files|length }} 个</span></div>"
     "<div class=\"tabs\" id=\"cattabs\"><button class=\"tab active\" onclick=\"showCat('全部',this)\">全部（{{ files|length }}）</button>"
     "{% for c in cats %}{% if c.count %}<button class=\"tab\" onclick=\"showCat('{{ c.name }}',this)\">{{ c.name }}（{{ c.count }}）</button>{% endif %}{% endfor %}</div>"
@@ -449,13 +459,14 @@ PAGE = (
     "{% endif %}{% endfor %}</div>"
     "{% endif %}{% endfor %}{% else %}<p class=\"empty\">目前还没有已发布的文件。</p>{% endif %}</section>"
     "<script>var curCat='全部',curQ='';function applyFilter(){document.querySelectorAll('.catgroup').forEach(function(g){var show=curCat==='全部'||g.dataset.cat===curCat;var any=false;g.querySelectorAll('.file').forEach(function(r){var ok=(curCat==='全部'||r.dataset.cat===curCat)&&r.dataset.name.includes(curQ);r.style.display=ok?'':'none';if(ok)any=true;});g.style.display=(show&&any)?'':'none';});}function showCat(c,el){curCat=c;document.querySelectorAll('#cattabs .tab').forEach(function(t){t.classList.remove('active');});el.classList.add('active');applyFilter();}function onSearch(v){curQ=v.toLowerCase();applyFilter();}</script>"
-    "</div></div>"
+    "</div>"
     "{% endif %}"
-    "<div class=\"card section\"><h2>站长审核</h2>"
+    "<div class=\"tabpanel\" id=\"tab-admin\"><div class=\"card section\"><h2>站长审核</h2>"
     "<p class=\"note\">站长入口与熟人入口分开，站长口令只在审核页使用。</p>"
     "<form method=\"post\" action=\"/admin/login\">"
     "<input class=\"textin\" type=\"password\" name=\"token\" placeholder=\"站长口令\" required> "
     "<button class=\"btn primary\" type=\"submit\">进入审核</button></form></div>"
+    "</div><script>function showTab(name){document.querySelectorAll('.tabpanel').forEach(function(el){el.classList.toggle('active',el.id==='tab-'+name);});document.querySelectorAll('#topnav a').forEach(function(a){a.classList.toggle('active',a.dataset.tab===name);});}document.querySelectorAll('#topnav a').forEach(function(a){a.addEventListener('click',function(e){e.preventDefault();location.hash=a.dataset.tab;showTab(a.dataset.tab);});});var h=(location.hash||'#published').replace('#','');if(['principle','publish','published','admin'].indexOf(h)<0){h='published';}showTab(h);</script>"
     "<footer>交换站 · 熟人文件交换 · 上传需站长审核</footer></div></body></html>"
 )
 
