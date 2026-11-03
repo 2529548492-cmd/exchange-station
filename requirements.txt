@@ -3,3 +3,4 @@ google-api-python-client==2.170.0
 google-auth==2.40.0
 gunicorn==23.0.0
 requests==2.32.3
+Pillow==10.4.0

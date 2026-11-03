@@ -195,6 +195,7 @@ def list_folder(service, folder_id):
                 "size": _fmt_size(f.get("size")),
                 "ext": (f["name"].rsplit(".", 1)[-1].upper()[:4] if "." in f["name"] else "FILE"),
                 "kind": _file_kind(f["name"], f.get("mimeType") or ""),
+                "is_image": (f.get("mimeType") or "").startswith("image/"),
             }
         )
     return out
@@ -318,6 +319,7 @@ BASE_CSS = """
 
   .file{display:flex;gap:14px;padding:15px 0;border-top:1px solid var(--line);align-items:center}
   .file:first-of-type{border-top:0}
+  .thumb{width:46px;height:46px;object-fit:cover;border-radius:12px;border:1px solid var(--line);flex-shrink:0;background:var(--surface-2)}
   .fic{width:46px;height:46px;border-radius:12px;background:var(--surface-2);border:1px solid var(--line);display:grid;place-items:center;flex-shrink:0;font-size:11px;font-weight:900;letter-spacing:.04em;color:var(--green-ink)}
   .fic.pdf{color:#b42318}.fic.zip{color:#7a4a00}.fic.img{color:#175c8a}.fic.audio{color:#6d3bbf}
   .fmain{flex:1;min-width:0}
@@ -368,7 +370,7 @@ BASE_CSS = """
     .textin{font-size:16px;padding:13px}
     .drop{padding:28px 14px}
     .file{display:grid;grid-template-columns:46px 1fr;gap:10px 12px;align-items:start}
-    .file .fic{grid-row:1}
+    .file .fic,.file .thumb{grid-row:1}
     .file .fmain{min-width:0}
     .fname{white-space:normal;overflow:visible;text-overflow:clip;font-size:15.5px}
     .fmeta{word-break:break-all}
@@ -435,7 +437,7 @@ PAGE = (
     "<div class=\"catgroup\" data-cat=\"{{ c.name }}\"><h3 class=\"cathead\">{{ c.name }} <span class=\"count\">{{ c.count }} 个</span></h3>"
     "{% for f in files %}{% if f.kind == c.name %}"
     "<div class=\"file\" data-cat=\"{{ f.kind }}\" data-name=\"{{ f.name|lower }}\">"
-    "<div class=\"fic\">{{ f.ext }}</div>"
+    "{% if f.is_image %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" alt=\"\" loading=\"lazy\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
     "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.kind }}</span><span>·</span><span>{{ f.size }}</span></div></div>"
     "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a><a class=\"btn primary\" href=\"/download/{{ f.id }}\">下载</a></div></div>"
     "{% endif %}{% endfor %}</div>"
@@ -821,6 +823,52 @@ def admin_logs():
         "<div class=\"card section\">" + rows + "</div>"
         "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
     )
+
+
+@app.route("/thumb/<file_id>")
+def thumb(file_id):
+    """图片缩略图：只给已发布（熟人）或待审核（站长）看，权限和预览一致。
+    用 Pillow 缩到 160 像素宽再返回，没有 Pillow 时原图返回，浏览器按 CSS 缩放。"""
+    service = drive_service()
+    if service is None:
+        return "云盘暂未连接", 503
+    try:
+        meta = get_file(service, file_id)
+    except Exception:
+        return "文件不存在或无权访问", 404
+    parents = meta.get("parents") or []
+    is_published = PUBLISHED_FOLDER_ID in parents
+    is_pending = PENDING_FOLDER_ID in parents
+    if is_published:
+        code = _env("EXCHANGE_CODE")
+        if not _has_gate(code, "exchange_access"):
+            return "请先输入访问口令", 403
+    elif is_pending:
+        token = _env("ADMIN_TOKEN")
+        if not token or not _has_gate(token, "admin_access"):
+            return "该文件尚未发布", 403
+    else:
+        return "文件不存在或无权访问", 404
+    if not (meta.get("mimeType") or "").startswith("image/"):
+        return "不是图片", 404
+    from googleapiclient.http import MediaIoBaseDownload
+
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, service.files().get_media(fileId=file_id))
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    data = buf.getvalue()
+    try:
+        from PIL import Image
+
+        im = Image.open(io.BytesIO(data))
+        im.thumbnail((320, 320))
+        out = io.BytesIO()
+        im.convert("RGB").save(out, format="JPEG", quality=80)
+        return Response(out.getvalue(), headers={"Content-Type": "image/jpeg", "Cache-Control": "public, max-age=86400"})
+    except Exception:
+        return Response(data, headers={"Content-Type": meta.get("mimeType") or "image/jpeg", "Cache-Control": "public, max-age=86400"})
 
 
 @app.route("/health")
