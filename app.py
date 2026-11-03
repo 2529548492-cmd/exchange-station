@@ -32,6 +32,8 @@
 """
 import base64
 import hashlib
+from collections import deque
+from datetime import datetime, timedelta, timezone
 import hmac
 import io
 import json
@@ -77,6 +79,23 @@ def _drive_configured():
     if _env("GOOGLE_OAUTH_REFRESH_TOKEN") and _env("GOOGLE_OAUTH_CLIENT_ID"):
         return True
     return bool(_env("GOOGLE_SERVICE_ACCOUNT_JSON"))
+
+
+
+ACCESS_LOG = deque(maxlen=500)
+
+
+def _log(action, detail=""):
+    """访问日志：只记时间、IP、动作、文件名，不记任何口令、密钥、完整 UA。
+    同时打印到 stdout，Render 后台 Logs 里也能看到；内存里的列表在服务
+    休眠/重启后会清空，所以这里只是近期的站内查看，长期记录看 Render Logs。"""
+    ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "?").split(",")[0].strip()
+    ua = request.headers.get("User-Agent", "")
+    device = "手机" if ("Mobile" in ua or "Android" in ua or "iPhone" in ua) else "电脑"
+    now = datetime.now(timezone.utc) + timedelta(hours=8)
+    entry = {"time": now.strftime("%m-%d %H:%M"), "ip": ip, "device": device, "action": action, "detail": detail}
+    ACCESS_LOG.appendleft(entry)
+    print(f"[access] {entry['time']} {ip} {device} {action} {detail}", flush=True)
 
 
 def drive_service():
@@ -438,7 +457,7 @@ ADMIN_PAGE = (
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<button class=\"btn danger\">不通过（移到回收站）</button></form></div></div>{% endfor %}</div>"
     "{% else %}<p class=\"empty\">目前没有待审核的文件。</p>{% endif %}"
-    "<p><a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    "<p><a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
 )
 ADMIN_PAGE = (
     "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
@@ -456,7 +475,7 @@ ADMIN_PAGE = (
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<button class=\"btn danger\">不通过（移到回收站）</button></form></div></div>{% endfor %}</div>"
     "{% else %}<p class=\"empty\">目前没有待审核的文件。</p>{% endif %}"
-    "<p><a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    "<p><a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
 )
 
 ADMIN_PUBLISHED_PAGE = (
@@ -501,11 +520,13 @@ def enter():
     if not code:
         return redirect("/?msg=本站还没配置访问口令，请联系站长")
     if request.form.get("code", "") != code:
+        _log("熟人进站失败", "口令不对")
         return redirect("/?msg=访问口令不对，请再试一次")
     resp = redirect("/")
     resp.set_cookie(
         "exchange_access", _gate_value(code), httponly=True, samesite="Lax"
     )
+    _log("熟人进站", "")
     return resp
 
 
@@ -557,6 +578,7 @@ def upload():
         count += 1
     if count == 0:
         return redirect("/?msg=没有可上传的文件")
+    _log("上传", f"{count} 个文件")
     return redirect(f"/?msg=已上传 {count} 个文件到待审核，站长通过后才会出现在已发布列表")
 
 
@@ -587,6 +609,14 @@ def view(file_id):
     from googleapiclient.http import MediaIoBaseDownload
 
     ctype = meta.get("mimeType") or "application/octet-stream"
+    # 安全：HTML/SVG 等可在同源执行的网页内容绝不能 inline 预览，否则上传者写的脚本
+    # 会在站长浏览器里以本站身份调用审核接口。只对图片、PDF、纯文本、音视频 inline，
+    # 其他一律走下载。
+    _safe_inline = ctype.startswith(("image/", "video/", "audio/")) or ctype in (
+        "application/pdf", "text/plain", "text/markdown",
+    ) or ctype.startswith("text/plain")
+    if not _safe_inline:
+        return redirect(f"/download/{file_id}")
     # 文本预览必须带 charset=utf-8，否则浏览器默认按 Latin-1 解码，中文会乱码。
     if ctype.startswith("text/") and "charset" not in ctype:
         ctype = ctype + "; charset=utf-8"
@@ -604,6 +634,7 @@ def view(file_id):
             if chunk:
                 yield chunk
 
+    _log("打开预览", meta.get("name", file_id))
     return Response(
         generate_view(),
         headers={
@@ -645,6 +676,7 @@ def download(file_id):
             if chunk:
                 yield chunk
 
+    _log("下载", meta.get("name", file_id))
     return Response(
         generate_dl(),
         headers={
@@ -660,8 +692,10 @@ def admin_login():
     if not token:
         return "站长口令还没配置，请联系站长在 Render 环境变量中设置 ADMIN_TOKEN", 503
     if request.form.get("token", "") != token:
+        _log("站长进审核失败", "口令不对")
         return "口令不对", 403
     resp = redirect("/admin")
+    _log("站长进审核", "")
     resp.set_cookie("admin_access", _gate_value(token), httponly=True, samesite="Lax")
     return resp
 
@@ -697,11 +731,13 @@ def approve():
     file_id = request.form.get("file_id", "")
     if not file_id or _admin_file_or_403(service, file_id) is None:
         return "该文件不在待审核里，无法通过", 403
+    _name = (get_file(service, file_id) or {}).get("name", file_id)
     service.files().update(
         fileId=file_id,
         addParents=PUBLISHED_FOLDER_ID,
         removeParents=PENDING_FOLDER_ID,
     ).execute()
+    _log("审核通过", _name)
     return redirect("/admin")
 
 
@@ -716,7 +752,9 @@ def reject():
     file_id = request.form.get("file_id", "")
     if not file_id or _admin_file_or_403(service, file_id) is None:
         return "该文件不在待审核里，无法处理", 403
+    _name = (get_file(service, file_id) or {}).get("name", file_id)
     service.files().update(fileId=file_id, body={"trashed": True}).execute()
+    _log("审核不通过", _name)
     return redirect("/admin")
 
 
@@ -748,8 +786,29 @@ def admin_delete():
         return "文件不存在或无权访问", 404
     if PUBLISHED_FOLDER_ID not in (meta.get("parents") or []):
         return "该文件不在已发布里，无法删除", 403
+    _name = (get_file(service, file_id) or {}).get("name", file_id)
     service.files().update(fileId=file_id, body={"trashed": True}).execute()
+    _log("删除已发布", _name)
     return redirect("/admin/published")
+
+
+@app.route("/admin/logs")
+def admin_logs():
+    token = _env("ADMIN_TOKEN")
+    if not token or not _has_gate(token, "admin_access"):
+        return "请先在首页输入站长口令", 403
+    rows = "".join(
+        f"<div class=\"file\"><div class=\"fmain\"><div class=\"fname\">{e['time']} · {e['action']} · {e['detail']}</div><div class=\"fmeta\"><span>{e['ip']}</span><span>·</span><span>{e['device']}</span></div></div></div>"
+        for e in ACCESS_LOG
+    ) or "<p class=\"empty\">暂无访问记录。</p>"
+    return render_template_string(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>访问日志 - 交换站</title><style>" + BASE_CSS + "</style></head><body><div class=\"wrap\">"
+        "<h1>访问日志</h1><p class=\"note\">只记时间、IP、设备类型、动作和文件名，不记口令。这里是近期记录（最多 500 条），服务休眠或重启后会清空，长期记录请去 Render 后台 Logs 里看。</p>"
+        "<div class=\"card section\">" + rows + "</div>"
+        "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    )
 
 
 @app.route("/health")
