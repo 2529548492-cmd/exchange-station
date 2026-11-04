@@ -539,14 +539,20 @@ def _use_baidu_meta():
 # ---------------- 百度刷新令牌持久化（轮换令牌问题） ----------------
 # 百度刷新一次就可能轮换刷新令牌：响应里带回新的 refresh_token，旧的随即
 # 作废；只靠环境变量里的副本，下次重启/刷新必然再报 sign 不匹配。
-# 所以：刷新成功且响应带新令牌时，立刻把新令牌写回百度应用根目录的令牌
-# 文件（只含 refresh_token 与更新时间，不含任何其他密钥）；本进程优先用已
-# 知的最新值，环境变量只作初始回退。令牌文件在应用根目录，不在已发布/
-# 待审核里，永远不成格子。
-# 已知的边界（诚实写明）：令牌文件本身也要 access_token 才能读；若本进程
-# 的 access_token 缓存已空、且环境变量里的旧令牌又已作废，那就读不出文件、
-# 只能重新授权——这一步没有不经授权的解法。并发刷新被顶掉时，下面的重试
-# 逻辑用还有效的 access_token 重读文件、用最新值再刷一次。
+# 所以：刷新成功且响应带新令牌时，立刻把新令牌写回谷歌云盘根目录的令牌
+# 文件（只含 refresh_token 与更新时间，不含任何其他密钥），与 AI 结论/留言
+# 文件同一个做法；本进程优先用已知的最新值，环境变量只作回退。谷歌文件
+# 用谷歌 OAuth 就能读，不需要百度身份，所以冷启动缓存为空时也能读到最新
+# 令牌——这正是上一版“百度令牌文件”没根治的原因：百度文件要 access_token
+# 才能读，冷启动时缓存为空、环境变量旧令牌又已作废，就读不出文件、只能
+# 重新授权。百度令牌文件仍保留，作第三 fallback（暖进程有缓存 access_token
+# 时可读）。谷歌令牌文件在云盘根目录，不在已发布文件夹里，永远不成格子。
+# 已知的边界（诚实写明）：若谷歌令牌文件和环境变量同时过期（例如重新授
+# 权后一次成功刷新都没发生过、或两边都被轮换顶掉），仍只能重新授权一次；
+# 中继模式下上海直连谷歌不通，轮换后只能写百度令牌文件那份，谷歌文件会
+# 滞后——Render 暖进程可经百度文件追回，冷启动 Render 则仍可能读到旧值。
+# 并发刷新被顶掉时，下面的重试逻辑先重读持久存储、再用缓存 access_token
+# 重读百度令牌文件，用最新值再刷一次。
 _BAIDU_TOKEN_FILE_NAME = "交换站百度令牌.txt"
 _BAIDU_REFRESH = {"value": None}
 
@@ -635,11 +641,129 @@ def _baidu_write_token_file(access_token, refresh_token):
         print(f"[baidu-token] persist failed: {e}", flush=True)
 
 
+_DRIVE_BAIDU_TOKEN_FILE_NAME = "交换站百度令牌.txt"
+
+
+def _drive_baidu_token_file_id(service):
+    """谷歌云盘里找百度令牌文件 id，找不到/读不出返回 None（不记值）。"""
+    try:
+        res = service.files().list(q=f"name = '{_DRIVE_BAIDU_TOKEN_FILE_NAME}' and trashed = false", fields="files(id)", pageSize=5).execute()
+        fl = res.get("files") or []
+        return fl[0]["id"] if fl else None
+    except Exception:
+        return None
+
+
+def _drive_read_baidu_refresh(service):
+    """读谷歌云盘根目录的百度令牌文件，返回 refresh_token 或 None；失败一律 None，绝不记值。"""
+    if service is None:
+        return None
+    try:
+        fid = _drive_baidu_token_file_id(service)
+        if not fid:
+            return None
+        from googleapiclient.http import MediaIoBaseDownload
+        buf = io.BytesIO()
+        dl = MediaIoBaseDownload(buf, service.files().get_media(fileId=fid))
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        data = json.loads(buf.getvalue().decode("utf-8", errors="ignore") or "{}")
+        if not isinstance(data, dict):
+            return None
+        v = (data.get("refresh_token") or "").strip()
+        return v or None
+    except Exception:
+        return None
+
+
+def _drive_write_baidu_refresh(service, refresh_token):
+    """把新 refresh_token 写回谷歌云盘令牌文件；失败返回 False，绝不抛异常、绝不记值。"""
+    if service is None:
+        return False
+    from googleapiclient.http import MediaIoBaseUpload
+    payload = json.dumps({"refresh_token": refresh_token,
+                          "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")},
+                         ensure_ascii=False)
+    media = MediaIoBaseUpload(io.BytesIO(payload.encode("utf-8")), mimetype="application/json", resumable=False)
+    try:
+        fid = _drive_baidu_token_file_id(service)
+        if fid:
+            service.files().update(fileId=fid, media_body=media).execute()
+        else:
+            meta = {"name": _DRIVE_BAIDU_TOKEN_FILE_NAME, "mimeType": "application/json"}
+            service.files().create(body=meta, media_body=media, fields="id").execute()
+        return True
+    except Exception as e:
+        print(f"[baidu-token] drive persist failed: {e}", flush=True)
+        return False
+
+
+def _relay_read_baidu_refresh():
+    """中继模式：经 Render 只读接口读 Drive 令牌文件；中继不通/无值返回 None。值只在内存里过，不记日志。"""
+    if not _is_relay():
+        return None
+    try:
+        import requests as _rq
+        cookies = {}
+        for _k in ("exchange_access", "admin_access", "secondary_access"):
+            try:
+                if _k in request.cookies:
+                    cookies[_k] = request.cookies[_k]
+            except Exception:
+                pass
+        r = _rq.get(_relay_backend() + "/api/baidu_token", cookies=cookies, timeout=15)
+        j = r.json() if r.status_code == 200 else {}
+        v = (j.get("refresh_token") or "").strip() if isinstance(j, dict) else ""
+        return v or None
+    except Exception:
+        return None
+
+
+def _stored_baidu_refresh():
+    """冷启动可读的持久令牌值：中继模式走中继读，否则读 Drive 文件；都没有返回 None（调用方再回退环境变量）。"""
+    if _is_relay():
+        return _relay_read_baidu_refresh()
+    try:
+        return _drive_read_baidu_refresh(drive_service())
+    except Exception:
+        return None
+
+
+def _persist_baidu_refresh(access_token, refresh_token):
+    """刷新成功后持久化新令牌：直连模式写 Drive 文件（主）+ 百度令牌文件（第三 fallback）；
+    中继模式直连谷歌不通，Drive 写会失败，只剩百度令牌文件那份（已知边界，见本节注释）。
+    任一写失败都不阻塞本次百度调用，只记日志（不记值）。"""
+    try:
+        if not _is_relay():
+            _drive_write_baidu_refresh(drive_service(), refresh_token)
+    except Exception as e:
+        print(f"[baidu-token] drive persist failed: {e}", flush=True)
+    try:
+        _baidu_write_token_file(access_token, refresh_token)
+    except Exception as e:
+        print(f"[baidu-token] baidu file persist failed: {e}", flush=True)
+
+
 def _baidu_refresh_token():
-    cur = _baidu_current_refresh()
-    # 刷新前预读：进程已有缓存 access_token 时，先看令牌文件里有没有更新的
-    # refresh_token（另一台服务器刚轮换过），有就优先用它，避免拿旧令牌白跑一次。
-    # 读不到（无缓存 token / token 已过期 / 文件不存在）就照常用当前值刷新。
+    # 候选值顺序（冷启动可读优先）：
+    # 1. 内存最新值；2. Drive 令牌文件（中继模式走中继读），没有/读不出 → 3. 环境变量；
+    # 4. 百度令牌文件（仅进程已有缓存 access_token 时可读，暖进程第三 fallback）。
+    # 内存有值时仍先看持久存储有没有更新的轮换值（另一台服务器刚轮换过），有就优先用它。
+    cur = _BAIDU_REFRESH["value"]
+    if cur:
+        try:
+            stored = _stored_baidu_refresh()
+        except Exception:
+            stored = None
+        if stored and stored != cur:
+            cur = stored
+    else:
+        try:
+            cur = _stored_baidu_refresh() or _env("BAIDU_REFRESH_TOKEN")
+        except Exception:
+            cur = _env("BAIDU_REFRESH_TOKEN")
+    # 暖进程：已有缓存 access_token 时，再看百度令牌文件里有没有更新的值。
     try:
         _cached = _BAIDU_TOKEN.get("token")
         if _cached:
@@ -651,22 +775,35 @@ def _baidu_refresh_token():
     try:
         tok, new_refresh = _baidu_refresh_with(cur)
     except Exception:
-        # 并发刷新被顶掉时的恢复：用内存里还有效的 access_token 重读令牌文件，
-        # 拿到最新 refresh_token 再重试一次；仍失败才真正报错，绝不静默用过期令牌。
-        cached = _BAIDU_TOKEN["token"]
-        if cached:
-            latest = _baidu_read_token_file(cached)
-            if latest and latest != cur:
-                tok, new_refresh = _baidu_refresh_with(latest)
-                _BAIDU_REFRESH["value"] = latest
-                cur = latest
+        # 被顶掉时的恢复：先重读持久存储（Drive/中继）再重试；仍不行再用缓存
+        # access_token 重读百度令牌文件重试；都失败才真正报错，绝不静默用过期令牌。
+        latest = None
+        try:
+            latest = _stored_baidu_refresh()
+        except Exception:
+            latest = None
+        if latest and latest != cur:
+            tok, new_refresh = _baidu_refresh_with(latest)
+            _BAIDU_REFRESH["value"] = latest
+            cur = latest
+        else:
+            cached = _BAIDU_TOKEN["token"]
+            if cached:
+                latest2 = _baidu_read_token_file(cached)
+                if latest2 and latest2 != cur:
+                    tok, new_refresh = _baidu_refresh_with(latest2)
+                    _BAIDU_REFRESH["value"] = latest2
+                    cur = latest2
+                else:
+                    raise
             else:
                 raise
+    if new_refresh:
+        if new_refresh != cur:
+            _BAIDU_REFRESH["value"] = new_refresh
+            _persist_baidu_refresh(tok, new_refresh)
         else:
-            raise
-    if new_refresh and new_refresh != cur:
-        _BAIDU_REFRESH["value"] = new_refresh
-        _baidu_write_token_file(tok, new_refresh)
+            _BAIDU_REFRESH["value"] = new_refresh
     return tok
 
 
@@ -2499,6 +2636,30 @@ def api_announcement():
     if not _has_gate(code, "exchange_access"):
         return jsonify({"ok": False}), 403
     return jsonify({"ok": True, "announcement": _announcement_display(drive_service())})
+
+
+@app.route("/api/baidu_token")
+def api_baidu_token():
+    """中继模式的上海站只读接口：返回 Drive 令牌文件里的百度 refresh_token。
+    门禁：必须带有效的熟人口令、站长口令或二级口令 cookie 之一，否则 403；
+    值只经中继返回给本站服务器，绝不记日志、不出现在页面或报错里；不提供写接口。"""
+    ok = False
+    try:
+        if _has_gate(_env("EXCHANGE_CODE"), "exchange_access"):
+            ok = True
+        elif _has_gate(_env("ADMIN_TOKEN"), "admin_access"):
+            ok = True
+        elif _has_gate(_env("SECONDARY_ADMIN_TOKEN"), "secondary_access"):
+            ok = True
+    except Exception:
+        ok = False
+    if not ok:
+        return jsonify({"ok": False}), 403
+    try:
+        v = _drive_read_baidu_refresh(drive_service())
+    except Exception:
+        v = None
+    return jsonify({"ok": True, "refresh_token": v})
 
 
 @app.route("/")
