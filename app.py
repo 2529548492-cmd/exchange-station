@@ -1553,7 +1553,7 @@ ADMIN_PAGE = (
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>审核 - 交换站</title><style>"
     + BASE_CSS
-    + "</style></head><body><div class=\"wrap\"><h1>待审核文件</h1>{% if is_secondary %}<p class=\"note\">当前身份：二级管理员（不能查看账号密码、不能改动任何权限）</p>{% endif %}{% if ai_configured %}<div class=\"card section\"><form method=\"post\" action=\"/admin/ai_review_all\" style=\"display:inline\"><button class=\"btn primary\">一键 AI 初审全部</button></form><span class=\"note\"> AI 通过的文件会自动发布；可疑、无法判断或调用失败的留在待审核等站长人工看。</span></div>{% else %}<div class=\"card section warn\">AI 审核未配置（需配置 DEEPSEEK_API_KEY 后可用），原有审核流程不受影响。</div>{% endif %}"
+    + "</style></head><body><div class=\"wrap\"><h1>待审核文件</h1>{% if is_secondary %}<p class=\"note\">当前身份：二级管理员（不能查看账号密码、不能改动任何权限）</p>{% endif %}{% if ai_configured %}<div class=\"card section\"><span class=\"note\">上传后自动审核：AI 通过的文件会自动发布；可疑、无法判断或调用失败的留在待审核等站长人工看。</span></div>{% else %}<div class=\"card section warn\">AI 审核未配置（需配置 DEEPSEEK_API_KEY 后可用），原有审核流程不受影响。</div>{% endif %}"
     "{% if not drive_configured %}"
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
     "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
@@ -1574,7 +1574,7 @@ ADMIN_PAGE = (
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>审核 - 交换站</title><style>"
     + BASE_CSS
-    + "</style></head><body><div class=\"wrap\"><h1>待审核文件</h1>{% if is_secondary %}<p class=\"note\">当前身份：二级管理员（不能查看账号密码、不能改动任何权限）</p>{% endif %}{% if ai_configured %}<div class=\"card section\"><form method=\"post\" action=\"/admin/ai_review_all\" style=\"display:inline\"><button class=\"btn primary\">一键 AI 初审全部</button></form><span class=\"note\"> AI 通过的文件会自动发布；可疑、无法判断或调用失败的留在待审核等站长人工看。</span></div>{% else %}<div class=\"card section warn\">AI 审核未配置（需配置 DEEPSEEK_API_KEY 后可用），原有审核流程不受影响。</div>{% endif %}"
+    + "</style></head><body><div class=\"wrap\"><h1>待审核文件</h1>{% if is_secondary %}<p class=\"note\">当前身份：二级管理员（不能查看账号密码、不能改动任何权限）</p>{% endif %}{% if ai_configured %}<div class=\"card section\"><span class=\"note\">上传后自动审核：AI 通过的文件会自动发布；可疑、无法判断或调用失败的留在待审核等站长人工看。</span></div>{% else %}<div class=\"card section warn\">AI 审核未配置（需配置 DEEPSEEK_API_KEY 后可用），原有审核流程不受影响。</div>{% endif %}"
     "{% if not drive_configured %}"
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
     "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
