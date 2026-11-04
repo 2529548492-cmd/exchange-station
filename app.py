@@ -1120,6 +1120,7 @@ BASE_CSS = """
   .chip{font-size:11.5px;font-weight:800;padding:2px 8px;border-radius:999px;background:var(--green-soft);color:var(--green-ink)}
   .chip.wait{background:var(--amber-soft);color:var(--amber)}
   .chip.sample{background:var(--surface-2);color:var(--muted);border:1px solid var(--line)}
+  .chip.bad{background:var(--red-soft);color:var(--red)}
   .actions{display:flex;gap:8px;flex-shrink:0;flex-wrap:wrap}
   .btn{border:1px solid var(--line);background:var(--surface);color:var(--ink);padding:9px 15px;border-radius:10px;cursor:pointer;font-weight:700;font-size:14px}
   .btn.primary{background:var(--green);border-color:var(--green);color:#fff}
@@ -1278,11 +1279,11 @@ ADMIN_PAGE = (
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>审核 - 交换站</title><style>"
     + BASE_CSS
-    + "</style></head><body><div class=\"wrap\"><h1>待审核文件</h1>"
+    + "</style></head><body><div class=\"wrap\"><h1>待审核文件</h1>{% if ai_configured %}<div class=\"card section\"><form method=\"post\" action=\"/admin/ai_review_all\" style=\"display:inline\"><button class=\"btn primary\">一键 AI 初审全部</button></form><span class=\"note\"> AI 只给初步结论，不会自动发布；最终仍由站长亲手通过。</span></div>{% else %}<div class=\"card section warn\">AI 审核未配置（需配置 DEEPSEEK_API_KEY 后可用），原有审核流程不受影响。</div>{% endif %}"
     "{% if not drive_configured %}"
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
     "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
-    "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.size }}</span><span class=\"chip wait\">待审核</span></div></div>"
+    "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.size }}</span><span class=\"chip wait\">待审核</span></div></div><div class=\"airow\">{% if f.ai %}<span class=\"chip {% if f.ai.verdict == '可疑' %}bad{% elif f.ai.verdict == '通过' %}{% elif f.ai.verdict == 'failed' %}wait{% else %}sample{% endif %}\">AI：{{ f.ai.verdict }}</span><span class=\"note\">{{ f.ai.reason }}{% if f.ai.confidence is not none %}（置信度 {{ f.ai.confidence }}）{% endif %}{% if f.ai.note %} · {{ f.ai.note }}{% endif %}</span>{% if f.ai.verdict == 'failed' %}<form method=\"post\" action=\"/admin/ai_review\" style=\"display:inline\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn\">重试初审</button></form>{% endif %}{% elif ai_configured %}<span class=\"note\">尚未 AI 初审</span><form method=\"post\" action=\"/admin/ai_review\" style=\"display:inline\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn\">AI 初审</button></form>{% endif %}</div>"
     "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a>"
     "<form class=\"renameform\" method=\"post\" action=\"/rename\" style=\"display:inline-flex\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<input type=\"hidden\" name=\"back\" value=\"/admin\"><input class=\"renametext\" type=\"text\" name=\"new_name\" placeholder=\"改个名字…\" required>"
@@ -1299,11 +1300,11 @@ ADMIN_PAGE = (
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>审核 - 交换站</title><style>"
     + BASE_CSS
-    + "</style></head><body><div class=\"wrap\"><h1>待审核文件</h1>"
+    + "</style></head><body><div class=\"wrap\"><h1>待审核文件</h1>{% if ai_configured %}<div class=\"card section\"><form method=\"post\" action=\"/admin/ai_review_all\" style=\"display:inline\"><button class=\"btn primary\">一键 AI 初审全部</button></form><span class=\"note\"> AI 只给初步结论，不会自动发布；最终仍由站长亲手通过。</span></div>{% else %}<div class=\"card section warn\">AI 审核未配置（需配置 DEEPSEEK_API_KEY 后可用），原有审核流程不受影响。</div>{% endif %}"
     "{% if not drive_configured %}"
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
     "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
-    "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.size }}</span><span class=\"chip wait\">待审核</span></div></div>"
+    "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.size }}</span><span class=\"chip wait\">待审核</span></div></div><div class=\"airow\">{% if f.ai %}<span class=\"chip {% if f.ai.verdict == '可疑' %}bad{% elif f.ai.verdict == '通过' %}{% elif f.ai.verdict == 'failed' %}wait{% else %}sample{% endif %}\">AI：{{ f.ai.verdict }}</span><span class=\"note\">{{ f.ai.reason }}{% if f.ai.confidence is not none %}（置信度 {{ f.ai.confidence }}）{% endif %}{% if f.ai.note %} · {{ f.ai.note }}{% endif %}</span>{% if f.ai.verdict == 'failed' %}<form method=\"post\" action=\"/admin/ai_review\" style=\"display:inline\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn\">重试初审</button></form>{% endif %}{% elif ai_configured %}<span class=\"note\">尚未 AI 初审</span><form method=\"post\" action=\"/admin/ai_review\" style=\"display:inline\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn\">AI 初审</button></form>{% endif %}</div>"
     "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a>"
     "<form class=\"renameform\" method=\"post\" action=\"/rename\" style=\"display:inline-flex\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<input type=\"hidden\" name=\"back\" value=\"/admin\"><input class=\"renametext\" type=\"text\" name=\"new_name\" placeholder=\"改个名字…\" required>"
@@ -1393,6 +1394,8 @@ def api_files():
     if token and _has_gate(token, "admin_access"):
         try:
             out["pending"] = list_folder(drive_service(), PENDING_FOLDER_ID)
+            for f in out["pending"]:
+                f["ai"] = _ai_get_result(f["id"])
         except Exception:
             out["pending"] = []
     return jsonify(out)
@@ -2173,8 +2176,10 @@ def admin():
         files = _relay_files().get("pending", [])
     else:
         files = list_folder(drive_service(), PENDING_FOLDER_ID)
+        for f in files:
+            f["ai"] = _ai_get_result(f["id"])
     return render_template_string(
-        ADMIN_PAGE, files=files, drive_configured=True
+        ADMIN_PAGE, files=files, drive_configured=True, ai_configured=_ai_configured()
     )
 
 
@@ -2183,6 +2188,189 @@ def _admin_file_or_403(service, file_id):
     if PENDING_FOLDER_ID not in (meta.get("parents") or []):
         return None
     return meta
+
+# ---------------- AI 初步审核（DeepSeek，第一版：只给结论，不自动发布） ----------------
+# 密钥只从环境变量读，绝不写进代码、日志或页面；未配置时待审核页只显示
+# “AI 审核未配置”，不报错、不阻塞原有审核流程。
+_AI_TEXT_EXTS = {"txt", "md", "markdown", "csv", "json", "srt", "vtt", "ass", "lrc", "log"}
+_AI_TEXT_LIMIT = 6000
+_AI_ZIP_MAX_BYTES = 20 * 1024 * 1024
+_AI_ZIP_NAME_LIMIT = 200
+_AI_RESULTS = {}
+_AI_LOCK = threading.Lock()
+_AI_ALL_RUNNING = set()
+
+
+def _ai_configured():
+    return bool(_env("DEEPSEEK_API_KEY"))
+
+
+def _ai_get_result(file_id):
+    with _AI_LOCK:
+        r = _AI_RESULTS.get(file_id)
+        return dict(r) if r else None
+
+
+def _ai_set_result(file_id, verdict, reason, confidence=None, note=""):
+    with _AI_LOCK:
+        _AI_RESULTS[file_id] = {"verdict": verdict, "reason": reason, "confidence": confidence, "note": note}
+
+
+def _ai_fetch_head(service, file_id, limit):
+    """只取文件前 limit 字节（小分块、到量即停），不把整个大文件拉下来。"""
+    from googleapiclient.http import MediaIoBaseDownload
+    buf = io.BytesIO()
+    dl = MediaIoBaseDownload(buf, service.files().get_media(fileId=file_id), chunksize=256 * 1024)
+    done = False
+    while not done:
+        _, done = dl.next_chunk()
+        if buf.tell() >= limit:
+            break
+    return buf.getvalue()[:limit]
+
+
+def _ai_collect_evidence(service, meta):
+    """返回送审证据。文本抽前部；压缩包只在 <=20MB 时整包列清单；
+    图片/视频/音频/超大压缩包第一版只按文件名初审，并明确标注。"""
+    name = meta.get("name") or ""
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    base = {"name": name, "size": meta.get("size"), "ext": ext}
+    if ext in _AI_TEXT_EXTS:
+        try:
+            raw = _ai_fetch_head(service, meta["id"], _AI_TEXT_LIMIT + 1024)
+            text = raw.decode("utf-8", errors="ignore")[:_AI_TEXT_LIMIT]
+            return dict(base, kind="text", excerpt=text)
+        except Exception:
+            return dict(base, kind="text", excerpt="", note="正文读取失败，仅按文件名初审")
+    if ext == "zip":
+        try:
+            size = int(meta.get("size") or 0)
+        except Exception:
+            size = 0
+        if size > _AI_ZIP_MAX_BYTES:
+            return dict(base, kind="name_only", note="压缩包过大未列清单，仅文件名初审，未看内容")
+        try:
+            import zipfile
+            raw = _ai_fetch_head(service, meta["id"], _AI_ZIP_MAX_BYTES)
+            zf = zipfile.ZipFile(io.BytesIO(raw))
+            names = [i.filename for i in zf.infolist()[:_AI_ZIP_NAME_LIMIT]]
+            return dict(base, kind="zip", entries=names)
+        except Exception:
+            return dict(base, kind="zip", entries=[], note="压缩包清单读取失败，仅按文件名初审")
+    return dict(base, kind="name_only", note="仅文件名初审，未看内容")
+
+
+def _ai_call_deepseek(prompt):
+    """调 DeepSeek chat 接口；30 秒超时、失败重试一次；密钥和文件正文绝不写日志。"""
+    import requests as _rq
+    base = (_env("DEEPSEEK_API_BASE") or "https://api.deepseek.com").rstrip("/")
+    model = _env("DEEPSEEK_MODEL") or "deepseek-chat"
+    key = _env("DEEPSEEK_API_KEY") or ""
+    system = ("你是文件分享站的初审员。只根据提供的文件名、类型和摘录判断内容是否"
+              "可能违规：色情、暴力血腥、极端主义、毒品、赌博诈骗、恶意软件、明显侵权"
+              "盗版。只输出严格 JSON，形如 {\"verdict\": \"通过|可疑|无法判断\", "
+              "\"reason\": \"一句话理由\", \"confidence\": 0.0到1.0}，不要输出其他文字。")
+    last = None
+    for _ in range(2):
+        try:
+            r = _rq.post(base + "/chat/completions",
+                         headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+                         json={"model": model,
+                               "messages": [{"role": "system", "content": system},
+                                            {"role": "user", "content": prompt}],
+                               "temperature": 0.2},
+                         timeout=30)
+            r.raise_for_status()
+            content = (r.json().get("choices") or [{}])[0].get("message", {}).get("content") or ""
+            start = content.find("{")
+            end = content.rfind("}")
+            if start >= 0 and end > start:
+                content = content[start:end + 1]
+            data = json.loads(content)
+            verdict = data.get("verdict") or "无法判断"
+            if verdict not in ("通过", "可疑", "无法判断"):
+                verdict = "无法判断"
+            return {"verdict": verdict,
+                    "reason": str(data.get("reason") or "未给出理由")[:200],
+                    "confidence": data.get("confidence")}
+        except Exception as e:
+            last = e
+    raise RuntimeError("deepseek failed")
+
+
+def _ai_review_one(file_id):
+    """对一个待审核文件做初审并存结果；任何失败只记“初审失败可重试”。"""
+    if not _ai_configured():
+        return {"verdict": "unconfigured", "reason": "AI 审核未配置"}
+    service = drive_service()
+    if service is None:
+        _ai_set_result(file_id, "failed", "初审失败可重试")
+        return _ai_get_result(file_id)
+    try:
+        meta = _admin_file_or_403(service, file_id)
+    except Exception:
+        meta = None
+    if meta is None:
+        _ai_set_result(file_id, "failed", "该文件不在待审核里")
+        return _ai_get_result(file_id)
+    ev = _ai_collect_evidence(service, meta)
+    parts = ["文件名：" + ev["name"],
+             "大小：" + _fmt_size(ev.get("size")),
+             "类型：" + (ev.get("ext") or "未知")]
+    if ev["kind"] == "text" and ev.get("excerpt"):
+        parts.append("正文摘录（前部）：\n" + ev["excerpt"])
+    elif ev["kind"] == "zip" and ev.get("entries"):
+        parts.append("压缩包内文件清单：\n" + "\n".join(ev["entries"]))
+    try:
+        res = _ai_call_deepseek("\n".join(parts))
+    except Exception:
+        _ai_set_result(file_id, "failed", "初审失败可重试")
+        return _ai_get_result(file_id)
+    note = ev.get("note") or ""
+    if ev["kind"] == "name_only":
+        note = ev.get("note") or "仅文件名初审，未看内容"
+    _ai_set_result(file_id, res["verdict"], res["reason"], res.get("confidence"), note)
+    return _ai_get_result(file_id)
+
+
+@app.route("/admin/ai_review", methods=["POST"])
+def admin_ai_review():
+    token = _env("ADMIN_TOKEN")
+    if not token or not _has_gate(token, "admin_access"):
+        return "请先在首页输入站长口令", 403
+    if _is_relay():
+        return _proxy_post_to_backend("/admin/ai_review")
+    _ai_review_one(request.form.get("file_id", ""))
+    return redirect("/admin")
+
+
+@app.route("/admin/ai_review_all", methods=["POST"])
+def admin_ai_review_all():
+    token = _env("ADMIN_TOKEN")
+    if not token or not _has_gate(token, "admin_access"):
+        return "请先在首页输入站长口令", 403
+    if _is_relay():
+        return _proxy_post_to_backend("/admin/ai_review_all")
+    if "all" in _AI_ALL_RUNNING:
+        return redirect("/admin")
+
+    def _run():
+        try:
+            service = drive_service()
+            files = list_folder(service, PENDING_FOLDER_ID) if service else []
+            for f in files:
+                try:
+                    _ai_review_one(f["id"])
+                except Exception:
+                    pass
+        finally:
+            _AI_ALL_RUNNING.discard("all")
+
+    _AI_ALL_RUNNING.add("all")
+    import threading as _th
+    _th.Thread(target=_run, daemon=True).start()
+    return redirect("/admin")
+
 
 
 
