@@ -155,7 +155,7 @@ def _relay_files():
         r = _rq.get(_relay_backend() + "/api/files", cookies=cookies, timeout=15)
         return r.json()
     except Exception:
-        return {"published": [], "pending": [], "folders": []}
+        return None
 
 
 def _proxy_post_to_backend(path):
@@ -191,25 +191,45 @@ _PUB_CACHE = {'t': 0, 'files': None, 'folders': None}
 
 
 def _cached_published(service):
+    """合并已发布视图（谷歌 + 百度，去重、按优先后端排序），任一后端不通时
+    只显示另一方并给出友好提示，绝不报 500。返回 (files, folders, notice)。"""
     now = time.time()
     if _PUB_CACHE['files'] is not None and now - _PUB_CACHE['t'] < 30:
         _dl_attach(_PUB_CACHE['files'], service)
         _ai_attach_published(_PUB_CACHE['files'])
-        return _PUB_CACHE['files'], _PUB_CACHE['folders'] or []
-    files, folders = _list_published_tree(service)
+        return _PUB_CACHE['files'], _PUB_CACHE['folders'] or [], _PUB_CACHE.get('notice') or ""
+    gfiles, gfolders, google_err = [], [], False
+    if _google_fallback_enabled():
+        try:
+            if service is not None:
+                gfiles, gfolders = _list_published_tree(service)
+        except Exception:
+            gfiles, gfolders, google_err = [], [], True
+    bfiles, bfolders, baidu_err = [], [], False
     if _baidu_enabled():
         try:
-            _bf, _bfo = _baidu_published()
-            files = files + _bf
-            folders = folders + _bfo
+            bfiles, bfolders = _baidu_published()
         except Exception:
-            pass
+            baidu_err = True
+    elif _priority_backend() == "baidu":
+        baidu_err = True
+    files, folders = _merge_mixed(gfiles, gfolders, bfiles, bfolders)
+    notices = []
+    if google_err:
+        notices.append("谷歌区暂时连不上，只显示百度区")
+    if baidu_err:
+        if _priority_backend() == "baidu" and not _baidu_enabled():
+            notices.append("百度后端未配置，只显示谷歌区")
+        elif _baidu_enabled():
+            notices.append("百度区暂时连不上，只显示谷歌区")
+    notice = "；".join(notices)
     _dl_attach(files, service)
     _ai_attach_published(files)
     _PUB_CACHE['files'] = files
     _PUB_CACHE['folders'] = folders
+    _PUB_CACHE['notice'] = notice
     _PUB_CACHE['t'] = now
-    return files, folders
+    return files, folders, notice
 
 
 def _invalidate_pub_cache():
@@ -287,11 +307,19 @@ def _dl_attach(files, service=None):
         _dl_ensure_loaded(service)
     except Exception:
         pass
+    try:
+        _dl_baidu_ensure_loaded()
+    except Exception:
+        pass
     with _DL_LOCK:
         snapshot = dict(_DL_COUNTS)
+        snapshot_baidu = dict(_DL_BAIDU_COUNTS)
     for f in files or []:
         if isinstance(f, dict):
-            f["dl_count"] = snapshot.get(f.get("id"), 0)
+            if (f.get("id") or "").startswith("bd:"):
+                f["dl_count"] = snapshot_baidu.get(f.get("id"), 0)
+            else:
+                f["dl_count"] = snapshot.get(f.get("id"), 0)
 
 
 def _dl_should_count(total):
@@ -366,6 +394,15 @@ def _dl_maybe_flush(service_hint=None):
 
 def _dl_bump(file_id, service=None):
     """一次已校验通过的下载 +1（内存立即生效，写回后台节流进行）。"""
+    if (file_id or "").startswith("bd:"):
+        with _DL_LOCK:
+            _DL_BAIDU_COUNTS[file_id] = _DL_BAIDU_COUNTS.get(file_id, 0) + 1
+            _DL_BAIDU_DELTAS[file_id] = _DL_BAIDU_DELTAS.get(file_id, 0) + 1
+        try:
+            _dl_baidu_maybe_flush()
+        except Exception:
+            pass
+        return
     with _DL_LOCK:
         _DL_COUNTS[file_id] = _DL_COUNTS.get(file_id, 0) + 1
         _DL_DELTAS[file_id] = _DL_DELTAS.get(file_id, 0) + 1
@@ -373,6 +410,89 @@ def _dl_bump(file_id, service=None):
         _dl_maybe_flush(service)
     except Exception:
         pass
+
+
+# ---------- 百度下载量（与谷歌计数文件平行，各后端自带一份） ----------
+_DL_BAIDU_COUNTS = {}
+_DL_BAIDU_DELTAS = {}
+_DL_BAIDU_STATE = {"loaded": False, "last_load_try": 0, "last_flush": 0, "flushing": False}
+
+
+def _dl_baidu_counts():
+    if not _baidu_enabled():
+        return {}, False
+    try:
+        _base, pub, _pend = _baidu_dirs()
+        text = _baidu_read_text(pub + _DL_COUNT_FILE)
+        if text is None:
+            return {}, True
+        data = json.loads(text or "{}")
+        counts = data.get("counts") or {}
+        out = {}
+        for k, v in counts.items():
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)):
+                out[str(k)] = int(v)
+        return out, True
+    except Exception as e:
+        print(f"[dlcount-baidu] load failed: {e}", flush=True)
+        return {}, False
+
+
+def _dl_baidu_ensure_loaded():
+    now = time.time()
+    with _DL_LOCK:
+        if _DL_BAIDU_STATE["loaded"] or now - _DL_BAIDU_STATE["last_load_try"] < 30:
+            return
+        _DL_BAIDU_STATE["last_load_try"] = now
+    counts, ok = _dl_baidu_counts()
+    if not ok:
+        return
+    with _DL_LOCK:
+        for k, v in counts.items():
+            _DL_BAIDU_COUNTS[k] = max(_DL_BAIDU_COUNTS.get(k, 0), v)
+        _DL_BAIDU_STATE["loaded"] = True
+
+
+def _dl_baidu_flush_worker(snapshot):
+    try:
+        counts, _ok = _dl_baidu_counts()
+        for k, v in snapshot.items():
+            counts[k] = counts.get(k, 0) + v
+        body = json.dumps({"counts": counts}, ensure_ascii=False)
+        _base, pub, _pend = _baidu_dirs()
+        if not _baidu_write_text(pub + _DL_COUNT_FILE, body):
+            raise RuntimeError("baidu counts write failed")
+        with _DL_LOCK:
+            for k, v in snapshot.items():
+                left = _DL_BAIDU_DELTAS.get(k, 0) - v
+                if left > 0:
+                    _DL_BAIDU_DELTAS[k] = left
+                else:
+                    _DL_BAIDU_DELTAS.pop(k, None)
+            _DL_BAIDU_STATE["last_flush"] = time.time()
+    except Exception as e:
+        print(f"[dlcount-baidu] flush failed: {e}", flush=True)
+    finally:
+        with _DL_LOCK:
+            _DL_BAIDU_STATE["flushing"] = False
+
+
+def _dl_baidu_maybe_flush():
+    with _DL_LOCK:
+        if _DL_BAIDU_STATE["flushing"]:
+            return
+        pending = sum(_DL_BAIDU_DELTAS.values())
+        if pending <= 0:
+            return
+        now = time.time()
+        if now - _DL_BAIDU_STATE["last_flush"] < 60 and pending < 50:
+            return
+        snapshot = dict(_DL_BAIDU_DELTAS)
+        _DL_BAIDU_STATE["flushing"] = True
+    th = threading.Thread(target=_dl_baidu_flush_worker, args=(snapshot,), daemon=True)
+    th.start()
 
 # ---------- 百度网盘源（第一期：只读并排，默认关闭） ----------
 # 只读：列表 / 预览 / 下载 / 图片缩略图。dlink 现取现用，不缓存、不写日志，
@@ -399,17 +519,154 @@ def _baidu_dirs():
     return base, pub, pend
 
 
-def _baidu_refresh_token():
+def _priority_backend():
+    """优先后端：baidu/google，缺省 baidu；非法值回退 baidu。"""
+    v = (_env("PRIORITY_BACKEND") or "baidu").strip().lower()
+    return v if v in ("baidu", "google") else "baidu"
+
+
+def _google_fallback_enabled():
+    """谷歌后备总开关，缺省开；关掉时合并视图只显示百度区。"""
+    return (_env("GOOGLE_FALLBACK") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _use_baidu_meta():
+    """元数据文件（意见/留言/公告/AI 结论/日志/账号/私人区）是否走百度。
+    百度优先且百度已配置时走百度，否则走谷歌。"""
+    return _priority_backend() == "baidu" and _baidu_enabled()
+
+
+# ---------------- 百度刷新令牌持久化（轮换令牌问题） ----------------
+# 百度刷新一次就可能轮换刷新令牌：响应里带回新的 refresh_token，旧的随即
+# 作废；只靠环境变量里的副本，下次重启/刷新必然再报 sign 不匹配。
+# 所以：刷新成功且响应带新令牌时，立刻把新令牌写回百度应用根目录的令牌
+# 文件（只含 refresh_token 与更新时间，不含任何其他密钥）；本进程优先用已
+# 知的最新值，环境变量只作初始回退。令牌文件在应用根目录，不在已发布/
+# 待审核里，永远不成格子。
+# 已知的边界（诚实写明）：令牌文件本身也要 access_token 才能读；若本进程
+# 的 access_token 缓存已空、且环境变量里的旧令牌又已作废，那就读不出文件、
+# 只能重新授权——这一步没有不经授权的解法。并发刷新被顶掉时，下面的重试
+# 逻辑用还有效的 access_token 重读文件、用最新值再刷一次。
+_BAIDU_TOKEN_FILE_NAME = "交换站百度令牌.txt"
+_BAIDU_REFRESH = {"value": None}
+
+
+def _baidu_token_file_path():
+    base, _pub, _pend = _baidu_dirs()
+    return base + _BAIDU_TOKEN_FILE_NAME
+
+
+def _baidu_current_refresh():
+    return _BAIDU_REFRESH["value"] or _env("BAIDU_REFRESH_TOKEN")
+
+
+def _baidu_refresh_with(value):
     import requests as _rq
     r = _rq.post("https://openapi.baidu.com/oauth/2.0/token", data={
         "grant_type": "refresh_token",
-        "refresh_token": _env("BAIDU_REFRESH_TOKEN"),
+        "refresh_token": value,
         "client_id": _env("BAIDU_CLIENT_ID"),
         "client_secret": _env("BAIDU_CLIENT_SECRET"),
     }, timeout=20)
-    tok = (r.json() or {}).get("access_token") or ""
+    j = r.json() or {}
+    tok = j.get("access_token") or ""
     if not tok:
         raise RuntimeError("baidu token refresh failed")
+    return tok, (j.get("refresh_token") or "").strip()
+
+
+def _baidu_api_with_token(access_token, path, params):
+    import requests as _rq
+    url = "https://pan.baidu.com/rest/2.0/xpan/" + path
+    p = dict(params or {})
+    p["access_token"] = access_token
+    r = _rq.get(url, params=p, timeout=20)
+    j = r.json() or {}
+    if j.get("errno") not in (None, 0):
+        raise RuntimeError("baidu api error")
+    return j
+
+
+def _baidu_read_token_file(access_token):
+    """用已有 access_token 读令牌文件，返回文件里的 refresh_token 或 None。"""
+    try:
+        base, _pub, _pend = _baidu_dirs()
+        j = _baidu_api_with_token(access_token, "file", {
+            "method": "list", "dir": base, "order": "name", "start": 0, "limit": 100})
+        target = None
+        for e in j.get("list") or []:
+            if (e.get("server_filename") or "") == _BAIDU_TOKEN_FILE_NAME and not e.get("isdir"):
+                target = e
+                break
+        if not target:
+            return None
+        meta = _baidu_api_with_token(access_token, "multimedia", {
+            "method": "filemetas", "fsids": json.dumps([int(target["fs_id"])]), "dlink": 1})
+        lst = meta.get("list") or []
+        if not lst or not lst[0].get("dlink"):
+            return None
+        import requests as _rq
+        r = _rq.get(lst[0]["dlink"], params={"access_token": access_token},
+                    headers={"User-Agent": "pan.baidu.com"}, timeout=30)
+        data = json.loads(r.content.decode("utf-8", errors="ignore") or "{}")
+        v = (data.get("refresh_token") or "").strip()
+        return v or None
+    except Exception:
+        return None
+
+
+def _baidu_write_token_file(access_token, refresh_token):
+    """把新 refresh_token 写回令牌文件；失败只记日志，绝不阻塞本次请求。"""
+    try:
+        import requests as _rq
+        body = json.dumps({"refresh_token": refresh_token,
+                           "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")},
+                          ensure_ascii=False)
+        url = "https://pan.baidu.com/rest/2.0/xpan/file"
+        params = {"method": "upload", "path": _baidu_token_file_path(),
+                  "ondup": "overwrite", "access_token": access_token}
+        r = _rq.post(url, params=params,
+                     files={"file": (_BAIDU_TOKEN_FILE_NAME, io.BytesIO(body.encode("utf-8")))},
+                     timeout=30)
+        j = r.json() or {}
+        if j.get("errno") not in (None, 0):
+            print(f"[baidu-token] persist failed: errno {j.get('errno')}", flush=True)
+    except Exception as e:
+        print(f"[baidu-token] persist failed: {e}", flush=True)
+
+
+def _baidu_refresh_token():
+    cur = _baidu_current_refresh()
+    # 刷新前预读：进程已有缓存 access_token 时，先看令牌文件里有没有更新的
+    # refresh_token（另一台服务器刚轮换过），有就优先用它，避免拿旧令牌白跑一次。
+    # 读不到（无缓存 token / token 已过期 / 文件不存在）就照常用当前值刷新。
+    try:
+        _cached = _BAIDU_TOKEN.get("token")
+        if _cached:
+            _stored = _baidu_read_token_file(_cached)
+            if _stored and _stored != cur:
+                cur = _stored
+    except Exception:
+        pass
+    try:
+        tok, new_refresh = _baidu_refresh_with(cur)
+    except Exception:
+        # 并发刷新被顶掉时的恢复：用内存里还有效的 access_token 重读令牌文件，
+        # 拿到最新 refresh_token 再重试一次；仍失败才真正报错，绝不静默用过期令牌。
+        cached = _BAIDU_TOKEN["token"]
+        if cached:
+            latest = _baidu_read_token_file(cached)
+            if latest and latest != cur:
+                tok, new_refresh = _baidu_refresh_with(latest)
+                _BAIDU_REFRESH["value"] = latest
+                cur = latest
+            else:
+                raise
+        else:
+            raise
+    if new_refresh and new_refresh != cur:
+        _BAIDU_REFRESH["value"] = new_refresh
+        _baidu_write_token_file(tok, new_refresh)
     return tok
 
 
@@ -446,6 +703,25 @@ def _baidu_api(path, params, retry=True):
     return j
 
 
+def _baidu_api_post(path, params, data):
+    """百度写接口（filemanager/create/precreate）：POST，令牌过期重试一次。"""
+    import requests as _rq
+    url = "https://pan.baidu.com/rest/2.0/xpan/" + path
+    for attempt in range(2):
+        p = dict(params or {})
+        p["access_token"] = _baidu_token()
+        r = _rq.post(url, params=p, data=data, timeout=30)
+        j = r.json() or {}
+        err = j.get("errno")
+        if err in (111, 110) and attempt == 0:
+            _baidu_invalidate_token()
+            continue
+        if err not in (None, 0):
+            raise RuntimeError("baidu api error")
+        return j
+    raise RuntimeError("baidu api error")
+
+
 def _baidu_list_dir(dir_path):
     out = []
     start = 0
@@ -463,6 +739,8 @@ def _baidu_list_dir(dir_path):
 def _baidu_map_entry(e, folder_id, folder_name):
     name = e.get("server_filename") or ""
     if name.startswith("_preview_"):
+        return None
+    if name == _DL_COUNT_FILE or name == _BAIDU_TOKEN_FILE_NAME:
         return None
     low = name.rsplit(".", 1)[-1].lower() if "." in name else ""
     return {
@@ -514,6 +792,300 @@ def _baidu_published():
                         "source": "baidu"})
         files.extend(sub_files)
     return files, folders
+
+
+def _baidu_find_by_path(path):
+    """按完整路径找百度文件条目，找不到返回 None。"""
+    path = (path or "").rstrip("/") or "/"
+    parent, _, name = path.rpartition("/")
+    parent = (parent + "/") if parent else "/"
+    if not name:
+        return None
+    try:
+        entries = _baidu_list_dir(parent)
+    except Exception:
+        return None
+    for e in entries:
+        if (e.get("server_filename") or "") == name:
+            return e
+    return None
+
+
+def _baidu_mkdir(path):
+    """建百度目录（已存在算成功）；返回 True/False。"""
+    path = (path or "").rstrip("/")
+    if not path:
+        return False
+    try:
+        found = _baidu_find_by_path(path)
+        if found and found.get("isdir"):
+            return True
+        _baidu_api_post("file", {"method": "create", "path": path, "isdir": 1}, {})
+        return True
+    except Exception:
+        try:
+            found = _baidu_find_by_path(path)
+            return bool(found and found.get("isdir"))
+        except Exception:
+            return False
+
+
+def _baidu_ensure_dir(path):
+    """逐级建目录（path 本身是目录路径）。"""
+    path = (path or "").strip("/")
+    if not path:
+        return False
+    cur = ""
+    for part in path.split("/"):
+        cur = cur + "/" + part if cur else "/" + part
+        if not _baidu_mkdir(cur):
+            return False
+    return True
+
+
+def _baidu_filemanager(opera, filelist, extra=None):
+    data = {"async": 0, "filelist": json.dumps(filelist, ensure_ascii=False)}
+    if extra:
+        data.update(extra)
+    return _baidu_api_post("file", {"method": "filemanager", "opera": opera}, data)
+
+
+def _baidu_move_path(src_path, dest_dir, newname=None, ondup="newcopy"):
+    """百度内移动；ondup=newcopy 避免覆盖已发布同名文件（改名后显示）。"""
+    item = {"path": src_path, "dest": dest_dir}
+    if newname:
+        item["newname"] = newname
+    return _baidu_filemanager("move", [item], {"ondup": ondup})
+
+
+def _baidu_delete_path(path):
+    return _baidu_filemanager("delete", [{"path": path}])
+
+
+def _baidu_rename_path(path, newname):
+    return _baidu_filemanager("rename", [{"path": path, "newname": newname}])
+
+
+_BAIDU_UPLOAD_CHUNK = 4 * 1024 * 1024
+
+
+def _baidu_upload_bytes(path, data):
+    """小文件单次上传（百度 PCS upload 接口，参数待实测确认）。"""
+    import requests as _rq
+    tok = _baidu_token()
+    url = "https://pan.baidu.com/rest/2.0/xpan/file"
+    params = {"method": "upload", "path": path, "ondup": "overwrite", "access_token": tok}
+    r = _rq.post(url, params=params,
+                 files={"file": (path.rsplit("/", 1)[-1], io.BytesIO(data))}, timeout=120)
+    j = r.json() or {}
+    if j.get("errno") not in (None, 0):
+        raise RuntimeError("baidu upload failed")
+    return j
+
+
+def _baidu_upload_stream(path, stream):
+    """流式上传：先落临时文件再按大小分流；≤4MB 单次传，更大走
+    precreate → superfile2 → create 三段式（4MB 分片；迁移脚本的检查点续传
+    不在此函数，见设计文档第 3 节）。返回 fs_id（拿不到时返回 None）。"""
+    import hashlib
+    import tempfile
+    tmp = tempfile.TemporaryFile()
+    try:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            tmp.write(chunk)
+        size = tmp.tell()
+        if size == 0:
+            raise RuntimeError("baidu upload empty file")
+        if size <= _BAIDU_UPLOAD_CHUNK:
+            tmp.seek(0)
+            j = _baidu_upload_bytes(path, tmp.read())
+            return j.get("fs_id")
+        tmp.seek(0)
+        block_list = []
+        slices = []
+        while True:
+            data = tmp.read(_BAIDU_UPLOAD_CHUNK)
+            if not data:
+                break
+            block_list.append(hashlib.md5(data).hexdigest())
+            slices.append(len(data))
+        tok = _baidu_token()
+        pre = _baidu_api_post("file", {"method": "precreate", "path": path, "size": size,
+                                       "isdir": 0, "autoinit": 1,
+                                       "block_list": json.dumps(block_list)}, {})
+        if pre.get("return_type") == 1:
+            info = pre.get("info") or {}
+            return info.get("fs_id")
+        uploadid = pre.get("uploadid") or ""
+        if not uploadid:
+            raise RuntimeError("baidu precreate failed")
+        import requests as _rq
+        tmp.seek(0)
+        for idx in range(len(slices)):
+            data = tmp.read(_BAIDU_UPLOAD_CHUNK)
+            url = "https://d.pcs.baidu.com/rest/2.0/pcs/superfile2"
+            params = {"method": "upload", "path": path, "type": "tmpfile",
+                      "uploadid": uploadid, "partseq": idx, "access_token": tok}
+            r = _rq.post(url, params=params,
+                         files={"file": (path.rsplit("/", 1)[-1], io.BytesIO(data))},
+                         timeout=120)
+            jj = r.json() or {}
+            if jj.get("errno") not in (None, 0):
+                raise RuntimeError("baidu superfile upload failed")
+        created = _baidu_api_post("file", {"method": "create", "path": path, "size": size,
+                                           "isdir": 0, "uploadid": uploadid,
+                                           "block_list": json.dumps(block_list)}, {})
+        return created.get("fs_id")
+    finally:
+        try:
+            tmp.close()
+        except Exception:
+            pass
+
+
+def _baidu_pending():
+    """百度待审核列表（根文件，不展开子目录），条目格式与谷歌 list_folder 对齐。"""
+    _base, _pub, pend = _baidu_dirs()
+    out = []
+    for e in _baidu_list_dir(pend):
+        if e.get("isdir"):
+            continue
+        m = _baidu_map_entry(e, pend, "")
+        if m:
+            out.append(m)
+    return out
+
+
+def _baidu_read_text(path):
+    """按路径读百度小文本文件，失败返回 None。"""
+    try:
+        entry = _baidu_find_by_path(path)
+        if not entry or entry.get("isdir"):
+            return None
+        meta = _baidu_api("multimedia", {"method": "filemetas",
+                                         "fsids": json.dumps([int(entry["fs_id"])]), "dlink": 1})
+        lst = meta.get("list") or []
+        if not lst or not lst[0].get("dlink"):
+            return None
+        import requests as _rq
+        tok = _baidu_token()
+        r = _rq.get(lst[0]["dlink"], params={"access_token": tok},
+                    headers={"User-Agent": "pan.baidu.com"}, timeout=30)
+        return r.content.decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+
+def _baidu_write_text(path, text):
+    """按路径覆写百度小文本文件，成功 True。"""
+    try:
+        _baidu_upload_bytes(path, (text or "").encode("utf-8"))
+        return True
+    except Exception as e:
+        print(f"[baidu] write text failed: {e}", flush=True)
+        return False
+
+
+def _baidu_move_pending_to_published(fs_id, name):
+    """百度待审核→已发布：filemanager move；返回 True/False（不抛异常，由调用方记理由）。"""
+    try:
+        meta = _baidu_meta(fs_id)
+        src = meta.get("path") or ""
+        if _baidu_area(src) != "pending":
+            return False
+        _base, pub, _pend = _baidu_dirs()
+        _baidu_move_path(src, pub, name)
+        _invalidate_pub_cache()
+        return True
+    except Exception as e:
+        print(f"[baidu] move pending failed: {e}", flush=True)
+        return False
+
+
+def _baidu_private_base():
+    base, _pub, _pend = _baidu_dirs()
+    return base + "私人区/"
+
+
+def _baidu_private_dir(username):
+    safe = (username or "").replace("/", "").replace("\\", "").strip()
+    return _baidu_private_base() + safe + "/"
+
+
+def _baidu_private_list(username):
+    d = _baidu_private_dir(username)
+    out = []
+    try:
+        for e in _baidu_list_dir(d):
+            if e.get("isdir"):
+                continue
+            m = _baidu_map_entry(e, d, username)
+            if m:
+                out.append(m)
+    except Exception:
+        pass
+    return out
+
+
+def _baidu_private_users():
+    users = []
+    try:
+        for e in _baidu_list_dir(_baidu_private_base()):
+            if not e.get("isdir"):
+                continue
+            name = e.get("server_filename") or ""
+            users.append({"name": name, "files": _baidu_private_list(name)})
+    except Exception:
+        pass
+    return users
+
+
+def _merge_key(f):
+    return (f.get("folder_name") or "", f.get("name") or "", int(f.get("size_bytes") or 0))
+
+
+def _merge_mixed(gfiles, gfolders, bfiles, bfolders):
+    """合并视图：去重键 = 文件夹名 + 文件名 + 大小；百度胜出（设计 2.2 第 3 点，
+    误判边界：同名同大小但内容不同时谷歌项会被隐藏，见设计文档 2.2 第 4 点；
+    迁移对照表优先去重尚未接入——对照表文件由迁移步骤生成，本次先按文件名判重）。
+    顺序按优先后端：优先方在前，另一方在后（去重后）。"""
+    bkeys = {_merge_key(f) for f in bfiles}
+    if _priority_backend() == "baidu":
+        files = list(bfiles) + [f for f in gfiles if _merge_key(f) not in bkeys]
+    else:
+        files = [f for f in gfiles if _merge_key(f) not in bkeys] + list(bfiles)
+    folders = []
+    for fo in list(gfolders) + list(bfolders):
+        f2 = dict(fo)
+        f2["count"] = sum(1 for f in files if (f.get("folder_name") or "") == (fo.get("name") or ""))
+        folders.append(f2)
+    return files, folders
+
+
+def _merged_pending(service):
+    """合并待审核队列（谷歌 + 百度），每项带 source；失败的一方静默为空，绝不 500。"""
+    g = []
+    if _google_fallback_enabled():
+        try:
+            if service is not None:
+                g = list_folder(service, PENDING_FOLDER_ID)
+                for f in g:
+                    f["source"] = "google"
+        except Exception:
+            g = []
+    b = []
+    try:
+        if _baidu_enabled():
+            b = _baidu_pending()
+    except Exception:
+        b = []
+    bkeys = {_merge_key(f) for f in b}
+    if _priority_backend() == "baidu":
+        return list(b) + [f for f in g if _merge_key(f) not in bkeys]
+    return [f for f in g if _merge_key(f) not in bkeys] + list(b)
 
 
 def _baidu_meta(fs_id):
@@ -735,6 +1307,18 @@ def _flush_drive_log():
     global _DRIVE_LOG_BUFFER
     if not _DRIVE_LOG_BUFFER:
         return
+    if _use_baidu_meta():
+        lines = _DRIVE_LOG_BUFFER
+        _DRIVE_LOG_BUFFER = []
+        try:
+            _base, _pub, _pend = _baidu_dirs()
+            old = _baidu_read_text(_base + "交换站访问日志.txt") or ""
+            if not _baidu_write_text(_base + "交换站访问日志.txt", old + "".join(lines)):
+                raise RuntimeError("baidu log write failed")
+        except Exception as e:
+            print(f"[access] baidu log flush failed: {e}", flush=True)
+            _DRIVE_LOG_BUFFER = lines + _DRIVE_LOG_BUFFER
+        return
     try:
         service = drive_service()
         if service is None:
@@ -778,6 +1362,22 @@ ACCOUNTS_FILE_NAME = "交换站账号.txt"
 
 
 def _read_accounts(service):
+    if _use_baidu_meta():
+        try:
+            _base, _pub, _pend = _baidu_dirs()
+            text = _baidu_read_text(_base + ACCOUNTS_FILE_NAME)
+            if text is None:
+                return []
+            out = []
+            for line in text.strip().split("\n"):
+                if not line.strip():
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    out.append({"name": parts[0], "password": parts[1], "created": parts[2], "last": parts[3] if len(parts) > 3 else "", "disabled": parts[4] if len(parts) > 4 else "0"})
+            return out
+        except Exception:
+            return []
     if service is None:
         return []
     try:
@@ -804,6 +1404,14 @@ def _read_accounts(service):
 
 
 def _write_accounts(service, accounts):
+    if _use_baidu_meta():
+        try:
+            _base, _pub, _pend = _baidu_dirs()
+            body = "\n".join(f"{a['name']}\t{a['password']}\t{a['created']}\t{a.get('last','')}\t{a.get('disabled','0')}" for a in accounts)
+            return _baidu_write_text(_base + ACCOUNTS_FILE_NAME, body)
+        except Exception as e:
+            print(f"[accounts] write failed: {e}", flush=True)
+            return False
     from googleapiclient.http import MediaIoBaseUpload
     body = "\n".join(f"{a['name']}\t{a['password']}\t{a['created']}\t{a.get('last','')}\t{a.get('disabled','0')}" for a in accounts)
     media = MediaIoBaseUpload(io.BytesIO(body.encode("utf-8")), mimetype="text/plain", resumable=False)
@@ -892,7 +1500,7 @@ def _private_account_ok(service, username):
     if not username:
         return False
     try:
-        accounts = _read_accounts(service) if service else []
+        accounts = _read_accounts(service) if (service or _use_baidu_meta()) else []
     except Exception:
         return False
     for a in accounts:
@@ -923,6 +1531,23 @@ def _feedback_file_id(service):
 
 def _read_feedback(service):
     """Return list of {id, time, text, status} newest first. Status: open=未解决, done=已解决."""
+    if _use_baidu_meta():
+        try:
+            _base, _pub, _pend = _baidu_dirs()
+            text = _baidu_read_text(_base + FEEDBACK_FILE_NAME)
+            if text is None:
+                return []
+            items = []
+            for line in text.strip().split("\n"):
+                if not line.strip():
+                    continue
+                parts = line.split("\t", 3)
+                if len(parts) >= 4:
+                    items.append({"id": parts[0], "time": parts[1], "status": parts[2], "text": parts[3], "author": parts[4] if len(parts) > 4 else ""})
+            items.reverse()
+            return items
+        except Exception:
+            return []
     if service is None:
         return []
     try:
@@ -950,6 +1575,14 @@ def _read_feedback(service):
 
 def _write_feedback(service, items_oldest_first):
     """Overwrite the Drive feedback file with items in oldest-first order."""
+    if _use_baidu_meta():
+        try:
+            _base, _pub, _pend = _baidu_dirs()
+            body = "\n".join(f"{it['id']}\t{it['time']}\t{it['status']}\t{it['text']}" for it in items_oldest_first)
+            return _baidu_write_text(_base + FEEDBACK_FILE_NAME, body)
+        except Exception as e:
+            print(f"[feedback] write failed: {e}", flush=True)
+            return False
     from googleapiclient.http import MediaIoBaseUpload
     body = "\\n".join(f"{it['id']}\\t{it['time']}\\t{it['status']}\\t{it['text']}" for it in items_oldest_first)
     media = MediaIoBaseUpload(io.BytesIO(body.encode("utf-8")), mimetype="text/plain", resumable=False)
@@ -982,6 +1615,23 @@ def _comment_file_id(service):
 
 
 def _read_comments(service):
+    if _use_baidu_meta():
+        try:
+            _base, _pub, _pend = _baidu_dirs()
+            text = _baidu_read_text(_base + COMMENTS_FILE_NAME)
+            if text is None:
+                return []
+            items = []
+            for line in text.strip().split("\n"):
+                if not line.strip():
+                    continue
+                parts = line.split("\t", 4)
+                if len(parts) >= 5:
+                    items.append({"id": parts[0], "time": parts[1], "file_id": parts[2], "author": parts[3], "text": parts[4]})
+            items.reverse()
+            return items
+        except Exception:
+            return []
     """Return all comments newest first: {id, time, file_id, author, text}.
     存储复用意见区思路：云盘根目录一个 txt，tab 分隔行，磁盘上最旧在前。
     根目录文件绝不会出现在已发布文件夹列表里，所以留言文件本身不成格子。"""
@@ -1012,6 +1662,14 @@ def _read_comments(service):
 
 def _write_comments(service, items_oldest_first):
     """Overwrite the Drive comments file with items in oldest-first order."""
+    if _use_baidu_meta():
+        try:
+            _base, _pub, _pend = _baidu_dirs()
+            body = "\n".join(f"{it['id']}\t{it['time']}\t{it['file_id']}\t{it['author']}\t{it['text']}" for it in items_oldest_first)
+            return _baidu_write_text(_base + COMMENTS_FILE_NAME, body)
+        except Exception as e:
+            print(f"[comments] write failed: {e}", flush=True)
+            return False
     from googleapiclient.http import MediaIoBaseUpload
     body = "\n".join(f"{it['id']}\t{it['time']}\t{it['file_id']}\t{it['author']}\t{it['text']}" for it in items_oldest_first)
     media = MediaIoBaseUpload(io.BytesIO(body.encode("utf-8")), mimetype="text/plain", resumable=False)
@@ -1041,6 +1699,18 @@ def _announcement_file_id(service):
 
 def _read_announcement_raw(service):
     """读云盘公告文件，返回 {"title":..., "body":...}；文件不存在/读不出/JSON 坏了返回 None。"""
+    if _use_baidu_meta():
+        try:
+            _base, _pub, _pend = _baidu_dirs()
+            text = _baidu_read_text(_base + ANNOUNCEMENT_FILE_NAME)
+            if text is None:
+                return None
+            data = json.loads(text)
+            if not isinstance(data, dict):
+                return None
+            return {"title": data.get("title") or "", "body": data.get("body") or ""}
+        except Exception:
+            return None
     if service is None:
         return None
     try:
@@ -1073,6 +1743,14 @@ def _announcement_display(service):
 
 def _write_announcement(service, title, body):
     """把公告 JSON 写回云盘根目录文件（有则覆盖、无则新建），成功返回 True。"""
+    if _use_baidu_meta():
+        try:
+            _base, _pub, _pend = _baidu_dirs()
+            payload = json.dumps({"title": title, "body": body}, ensure_ascii=False)
+            return _baidu_write_text(_base + ANNOUNCEMENT_FILE_NAME, payload)
+        except Exception as e:
+            print(f"[announcement] write failed: {e}", flush=True)
+            return False
     from googleapiclient.http import MediaIoBaseUpload
     payload = json.dumps({"title": title, "body": body}, ensure_ascii=False)
     media = MediaIoBaseUpload(io.BytesIO(payload.encode("utf-8")), mimetype="application/json", resumable=False)
@@ -1625,7 +2303,7 @@ PAGE = (
     "var dropped=0;function addQ(fs){var before=queue.length;Array.from(fs).forEach(function(f){if(queue.length<30){queue.push(f);}else{dropped++;}});syncInput();show();}"
     "i.addEventListener('change',function(){addQ(i.files);});</script>"
     "{% if msg %}<p class=\"note\">{{ msg }}</p>{% endif %}</div></div>"
-    '<div class="tabpanel active" id="tab-published"><div class="pub-toolbar"><input class="search" id="search" type="search" placeholder="搜索文件名…" oninput="onSearch(this.value)"><button class="btn" id="openDrawerBtn" type="button">导航</button><button class="btn" id="selBtn" type="button">选择</button></div><section class="card section"><div class="section-head"><h2>已发布</h2><span class="count">{{ files|length }} 个</span></div>{% if msg %}<p class="note" style="margin-top:10px">{{ msg }}</p>{% endif %}<div class="folderbar" id="folderbar"><button class="tab active" data-folder="all" onclick="showFolder(\'all\',this)">全部（{{ files|length }}）</button>{% for fo in folders %}<button class="tab" data-folder="{{ fo.id }}" onclick="showFolder(\'{{ fo.id }}\',this)">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}<button class="tab" id="newFolderBtn" type="button">+ 新建文件夹</button></div><form id="newFolderForm" method="post" action="/folder/create" style="display:none;gap:8px;margin-top:10px"><input class="textin" name="name" placeholder="新文件夹名字，比如：旅行" required maxlength="50" style="flex:1"><button class="btn primary" type="submit">创建</button><button class="btn" type="button" id="newFolderCancel">取消</button></form><div class="tabs" id="cattabs"><button class="tab active" onclick="showCat(\'全部\',this)">全部（{{ files|length }}）</button>{% for c in cats %}{% if c.count %}<button class="tab" onclick="showCat(\'{{ c.name }}\',this)">{{ c.name }}（{{ c.count }}）</button>{% endif %}{% endfor %}</div><form id="moveForm" method="post" action="/folder/move" style="display:none;margin-top:12px;margin-bottom:4px;gap:8px;flex-wrap:wrap;align-items:center"><span id="selCount" style="font-weight:800"></span><input type="hidden" name="dest_folder_id" id="moveDest"><input type="hidden" name="file_ids" id="moveFileIds"><button class="btn primary" type="button" id="moveBtn">移动</button><button class="btn" type="button" id="dlSelBtn">选择下载</button></form><div class="album-grid" id="albumGrid">{% for f in files %}<div class="tile" data-cat="{{ f.kind }}" data-folder="{{ f.folder_id }}" data-name="{{ f.name|lower }}" data-id="{{ f.id }}" data-dl="/download/{{ f.id }}" data-view="/view/{{ f.id }}" data-isimg="{{ \'1\' if f.is_image else \'0\' }}" data-isvid="{{ \'1\' if f.is_video else \'0\' }}" data-isaud="{{ \'1\' if f.is_audio else \'0\' }}" data-size="{{ f.size_bytes }}"><span class="tile-check"></span>{% if f.is_image or f.is_video %}<img class="tileimg" src="/thumb/{{ f.id }}" data-fb="/thumb/{{ f.id }}" alt="" loading="lazy" onerror="_thumbErr(this)">{% if f.is_video %}<div class="tilefic tile-video" style="display:none">影</div>{% else %}<div class="tilefic tile-img" style="display:none">图</div>{% endif %}{% elif f.is_audio %}<div class="tilefic tile-music">音</div>{% elif f.kind == "文档" %}<div class="tilefic tile-doc">文</div>{% elif f.kind == "压缩包" %}<div class="tilefic tile-zip">压</div>{% elif f.kind == "安装包" %}<div class="tilefic tile-pkg">包</div>{% elif f.kind == "影音" %}<div class="tilefic tile-video">影</div>{% else %}<div class="tilefic tile-other">他</div>{% endif %}<div class="tileinfo"><div class="tile-name" style="display:none">{{ f.name }}</div><div class="tile-meta">{{ f.kind }} · {{ f.size }}{% if f.source == "baidu" %} · 百度{% endif %}{% if f.ai_note %} · {{ f.ai_note }}{% endif %}</div></div><span class="tile-dl">↓ {{ f.dl_count|default(0) }}</span></div>{% endfor %}</div><p class="empty" id="folderEmpty" style="display:none">这个文件夹里还没有文件。</p>{% if not files %}<p class="empty">目前还没有已发布的文件。</p>{% endif %}<p class="note">点图片默认就是预览；点右上角“选择”，再点图片打勾，就可以批量下载或移动到文件夹。</p></section><div id="previewOverlay"><div id="previewCard"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b id="previewTitle" style="word-break:break-all"></b><button class="btn" id="previewClose" type="button">关闭</button></div><div id="previewBody" style="margin-top:12px"></div></div></div><div id="moveOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40;align-items:center;justify-content:center;padding:16px;box-sizing:border-box"><div style="background:var(--surface);border-radius:18px;padding:16px;width:100%;max-width:420px;max-height:90vh;overflow:auto"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b>移到哪里？</b><button class="btn" type="button" id="moveCancel">取消</button></div><p class="note" style="margin-top:8px">点一个文件夹，选中的文件就会移过去。</p><button class="btn" type="button" data-dest="{{ published_id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">已发布根目录</button>{% for fo in folders %}<button class="btn" type="button" data-dest="{{ fo.id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}</div></div><script>var curCat=\'全部\',curFolder=\'all\',curQ=\'\',selectMode=false,selected=new Set();function applyFilter(){var vis=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){var okCat=curCat===\'全部\'||t.dataset.cat===curCat;var okFolder=curFolder===\'all\'||t.dataset.folder===curFolder;var okQ=t.dataset.name.includes(curQ);var show=(okCat&&okFolder&&okQ);var _nm=t.querySelector(\'.tile-name\');if(_nm)_nm.style.display=(show&&curQ)?\'\':\'none\';t.style.display=show?\'\':\'none\';if(show)vis++;});var fe=document.getElementById(\'folderEmpty\');if(fe)fe.style.display=(curFolder!==\'all\'&&vis===0)?\'block\':\'none\';}function showCat(c,el){curCat=c;document.querySelectorAll(\'#cattabs .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function showFolder(fid,el){curFolder=fid;document.querySelectorAll(\'#folderbar .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function onSearch(v){curQ=v.toLowerCase();applyFilter();}function updateSel(){var mf=document.getElementById(\'moveForm\');var sc=document.getElementById(\'selCount\');var ids=document.getElementById(\'moveFileIds\');if(sc)sc.textContent=\'已选 \'+selected.size+\' 个 · 选择模式中，点图片是打勾，点右上角“取消选择”退出后才能查看\';if(ids)ids.value=Array.from(selected).join(\',\');if(mf)mf.style.display=selected.size?\'flex\':\'none\';}function _thumbErr(im){if(!im.dataset.fbDone&&im.dataset.fb){im.dataset.fbDone=\'1\';im.src=im.dataset.fb;return;}im.style.display=\'none\';var nx=im.nextElementSibling;if(nx)nx.style.display=\'grid\';}function openPreview(t){var ov=document.getElementById(\'previewOverlay\');var ti=document.getElementById(\'previewTitle\');var bd=document.getElementById(\'previewBody\');if(!ov||!ti||!bd)return;ti.textContent=t.querySelector(\'.tile-name\').textContent;var view=t.dataset.view,dl=t.dataset.dl;if(t.dataset.isimg===\'1\'){var _th=t.querySelector(\'.tileimg\');var _tu=_th?_th.getAttribute(\'src\'):\'\';bd.innerHTML=\'<img id="pvThumb" src="\'+_tu+\'" style="width:100%;border-radius:12px"><img id="pvOrig" src="\'+view+\'" style="width:100%;border-radius:12px;display:none"><p class="note" id="previewErr" style="display:none">图片预览加载失败，可能是原图太大或网络中断，点下面下载后本地查看。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载原图</a>\';var _im=bd.querySelector(\'img\');if(_im){_im.onerror=function(){_im.style.display=\'none\';var e=document.getElementById(\'previewErr\');if(e)e.style.display=\'block\';};}var _og=bd.querySelector(\'#pvOrig\');var _tb=bd.querySelector(\'#pvThumb\');if(_og){var _ogLoaded=false;var _ogTimer=null;var _ogRetry=null;function _ogShowRetry(){if(_ogRetry){_ogRetry.style.display=\'\';return;}_ogRetry=document.createElement(\'div\');_ogRetry.id=\'pvOrigRetry\';var _rb=document.createElement(\'button\');_rb.className=\'btn primary\';_rb.type=\'button\';_rb.textContent=\'原图加载较慢或加载失败，点我重试原图\';_rb.onclick=function(){_ogLoaded=false;if(_ogRetry)_ogRetry.style.display=\'none\';var _pe=document.getElementById(\'previewErr\');if(_tb&&(!_pe||_pe.style.display!==\'block\'))_tb.style.display=\'\';_og.style.display=\'none\';_ogStartTimer();_og.src=view+(view.indexOf(\'?\')>=0?\'&\':\'?\')+\'retry=\'+(new Date().getTime());};var _bd2=document.getElementById(\'previewBody\');if(_bd2)_bd2.appendChild(_ogRetry);_ogRetry.appendChild(_rb);}function _ogStartTimer(){if(_ogTimer)clearTimeout(_ogTimer);_ogTimer=setTimeout(function(){if(!_ogLoaded)_ogShowRetry();},15000);}_og.onload=function(){_ogLoaded=true;if(_ogTimer)clearTimeout(_ogTimer);if(_ogRetry)_ogRetry.style.display=\'none\';if(_tb)_tb.style.display=\'none\';_og.style.display=\'block\';};_og.onerror=function(){if(_ogTimer)clearTimeout(_ogTimer);_ogShowRetry();};_ogStartTimer();}}else if(t.dataset.isvid===\'1\'){bd.innerHTML=\'<video id="pvVideo" controls preload="metadata" src="\'+view+\'" style="width:100%;border-radius:12px"></video><div style="display:none;gap:8px;margin:10px 0"><button class="btn" id="qLowBtn" type="button">流畅</button><button class="btn" id="qHighBtn" type="button">高清</button></div><div id="qNote" class="note"></div><p class="note">大视频在线播需要先缓冲一会儿；如果一直转圈，点下面下载后本地播放更快。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载视频</a>\';var _vid=bd.querySelector(\'#pvVideo\');var _ql=bd.querySelector(\'#qLowBtn\');var _qh=bd.querySelector(\'#qHighBtn\');var _qn=bd.querySelector(\'#qNote\');var _qrow=_ql?_ql.parentElement:null;function _setQ(mode,play){if(!_vid)return;if(mode===\'low\'){_vid.src=\'/preview/\'+t.dataset.id;}else{_vid.src=view;}_vid.load();if(play){try{_vid.play();}catch(e){}}if(_ql){_ql.style.background=mode===\'low\'?\'var(--green)\':\'\';_ql.style.color=mode===\'low\'?\'#fff\':\'\';}if(_qh){_qh.style.background=mode===\'high\'?\'var(--green)\':\'\';_qh.style.color=mode===\'high\'?\'#fff\':\'\';}try{localStorage.setItem(\'video_quality\',mode);}catch(e){}}if(_ql)_ql.addEventListener(\'click\',function(){_setQ(\'low\',true);});if(_qh)_qh.addEventListener(\'click\',function(){_setQ(\'high\',true);});if(_vid)_vid.addEventListener(\'error\',function(){if(_vid.src.indexOf(\'/preview/\')>=0){_vid.src=view;_vid.load();}});fetch(\'/preview_status/\'+t.dataset.id).then(function(r){return r.json();}).then(function(j){if(j.has_preview){if(_qrow)_qrow.style.display=\'flex\';var saved=null;try{saved=localStorage.getItem(\'video_quality\');}catch(e){}_setQ(saved===\'high\'?\'high\':\'low\',false);if(_qn)_qn.textContent=\'流畅版是低清预览，起播快；点高清切回原片，加载慢自己受着。\';}else{if(_qrow)_qrow.style.display=\'none\';if(_qn)_qn.textContent=\'低清版还没生成，先看原片。\';}}).catch(function(){if(_qrow)_qrow.style.display=\'none\';});}else if(t.dataset.isaud===\'1\'){bd.innerHTML=\'<audio controls src="\'+view+\'" style="width:100%"></audio>\';}else if(t.dataset.cat===\'文档\'){bd.innerHTML=\'<iframe src="\'+view+\'" style="width:100%;height:420px;border:0;border-radius:12px"></iframe><p style="margin-top:10px"><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a></p>\';}else{bd.innerHTML=\'<p class="note">这个类型不能在线预览，请下载后打开。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a>\';}ov.style.display=\'flex\';_loadComments(t.dataset.id);}function _escHtml(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");} function _loadComments(fid){var card=document.getElementById(\'previewCard\');if(!card)return;var cs=document.getElementById(\'commentSection\');if(!cs){cs=document.createElement(\'div\');cs.id=\'commentSection\';card.appendChild(cs);}cs.innerHTML=\'<div style="margin-top:14px;border-top:1px solid var(--line);padding-top:10px"><b>留言</b><div id="commentList" style="margin-top:8px">加载留言中…</div><input id="commentNick" placeholder="昵称（不填就是匿名）" maxlength="50" style="width:100%;margin-top:8px;box-sizing:border-box"><textarea id="commentText" rows="2" placeholder="写下你的留言…" maxlength="500" style="width:100%;margin-top:6px;box-sizing:border-box"></textarea><button class="btn primary" id="commentSend" type="button" style="margin-top:6px">发送留言</button><div id="commentMsg" class="note"></div></div>\';var list=cs.querySelector(\'#commentList\');function render(items){if(!items||!items.length){list.innerHTML=\'<p class="note">还没有留言。</p>\';return;}list.innerHTML=items.map(function(c){return \'<div style="margin-bottom:8px"><div style="font-weight:800;font-size:13px">\'+_escHtml(c.author||\'匿名\')+\' <span style="font-weight:400;color:var(--muted);font-size:11px">\'+_escHtml(c.time||\'\')+\'</span></div><div style="font-size:13px;word-break:break-all">\'+_escHtml(c.text||\'\')+\'</div></div>\';}).join(\'\');}function reload(){fetch(\'/comments/\'+encodeURIComponent(fid)).then(function(r){return r.json();}).then(function(j){render(j.comments);}).catch(function(){list.innerHTML=\'<p class="note">留言加载失败，稍后再试。</p>\';});}reload();var btn=cs.querySelector(\'#commentSend\');if(btn){btn.onclick=function(){var nick=cs.querySelector(\'#commentNick\').value;var txt=cs.querySelector(\'#commentText\').value;var msg=cs.querySelector(\'#commentMsg\');if(!txt.trim()){msg.textContent=\'留言不能为空\';return;}msg.textContent=\'发送中…\';var fd=new FormData();fd.append(\'author\',nick);fd.append(\'text\',txt);fetch(\'/comments/\'+encodeURIComponent(fid),{method:\'POST\',body:fd}).then(function(r){return r.json();}).then(function(j){if(j.ok){cs.querySelector(\'#commentText\').value=\'\';msg.textContent=\'已发送\';reload();}else{msg.textContent=j.error||\'发送失败\';}}).catch(function(){msg.textContent=\'发送失败，请重试\';});};}} function closePreview(){var ov=document.getElementById(\'previewOverlay\');var bd=document.getElementById(\'previewBody\');if(bd){bd.querySelectorAll(\'video,audio\').forEach(function(m){m.pause();m.removeAttribute(\'src\');m.load();});bd.innerHTML=\'\';}if(ov)ov.style.display=\'none\';}function dlTile(t){var url=t.dataset.dl;var name=t.querySelector(\'.tile-name\').textContent;var _st=document.createElement(\'div\');_st.className=\'note dlstatus\';_st.textContent=\'下载准备中…\';t.appendChild(_st);_dlFeed(url,name,_st);}document.getElementById(\'albumGrid\').addEventListener(\'click\',function(e){var t=e.target.closest(\'.tile\');if(!t)return;if(e.target.closest&&e.target.closest(\'.dlstatus\'))return;if(selectMode){var id=t.dataset.id;if(selected.has(id)){selected.delete(id);t.classList.remove(\'selected\');}else{selected.add(id);t.classList.add(\'selected\');}updateSel();}else{openPreview(t);}});document.getElementById(\'previewClose\').addEventListener(\'click\',closePreview);document.getElementById(\'previewOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'previewOverlay\')closePreview();});document.getElementById(\'selBtn\').addEventListener(\'click\',function(){selectMode=!selectMode;var g=document.getElementById(\'albumGrid\');if(selectMode){g.classList.add(\'selecting\');this.textContent=\'取消选择\';}else{selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});g.classList.remove(\'selecting\');this.textContent=\'选择\';}updateSel();});document.getElementById(\'dlSelBtn\').addEventListener(\'click\',function(){var tiles=[];document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(selected.has(t.dataset.id))tiles.push(t);});if(!tiles.length)return;var i=0;function next(){if(i>=tiles.length){alert(\'已开始下载 \'+tiles.length+\' 个文件（浏览器可能逐个询问是否允许多个下载）。\');selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});document.getElementById(\'albumGrid\').classList.remove(\'selecting\');selectMode=false;document.getElementById(\'selBtn\').textContent=\'选择\';updateSel();return;}dlTile(tiles[i]);i++;setTimeout(next,600);}next();});document.getElementById(\'newFolderBtn\').addEventListener(\'click\',function(){var f=document.getElementById(\'newFolderForm\');f.style.display=\'flex\';});document.getElementById(\'newFolderCancel\').addEventListener(\'click\',function(){document.getElementById(\'newFolderForm\').style.display=\'none\';});document.getElementById(\'moveForm\').addEventListener(\'submit\',function(e){if(!selected.size){e.preventDefault();alert(\'请先勾选文件\');}});document.getElementById(\'moveBtn\').addEventListener(\'click\',function(){if(!selected.size){alert(\'请先勾选文件\');return;}var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'flex\';});document.getElementById(\'moveCancel\').addEventListener(\'click\',function(){var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'none\';});document.getElementById(\'moveOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'moveOverlay\'){e.target.style.display=\'none\';}});document.querySelectorAll(\'#moveOverlay [data-dest]\').forEach(function(b){b.addEventListener(\'click\',function(){var d=document.getElementById(\'moveDest\');if(d)d.value=b.dataset.dest;document.getElementById(\'moveForm\').submit();});});function _segDl(url,name,size,progEl,doneCb){var CH=8*1024*1024,PAR=3,TRY=3,total=Math.ceil(size/CH),parts=new Array(total),done=0,failed=false,next=0,inflight=0;function show(){if(progEl)progEl.textContent=\'下载中 \'+Math.round(done/total*100)+\'%（\'+(done*CH>size?size:done*CH)+\' / \'+size+\' 字节）\';}function fetchC(idx,att,cb){var st=idx*CH,en=Math.min(size-1,st+CH-1);var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.setRequestHeader(\'Range\',\'bytes=\'+st+\'-\'+en);x.responseType=\'blob\';x.onload=function(){if(x.status===206||x.status===200){cb(null,x.response);}else if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk failed\'));}};x.onerror=function(){if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk network error\'));}};x.send();}function launch(){while(!failed&&inflight<PAR&&next<total){(function(idx){inflight++;fetchC(idx,0,function(err,blob){inflight--;if(failed)return;if(err){failed=true;if(doneCb)doneCb(err);return;}parts[idx]=blob;done++;show();if(done===total){var a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob(parts));a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);if(doneCb)doneCb(null);}else{launch();}});})(next);next++;}}show();launch();}function _dlFeed(url,name,el){el.textContent=\'下载准备中…\';var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.responseType=\'blob\';x.onprogress=function(e){if(e.lengthComputable&&e.total){el.textContent=\'下载中 \'+Math.round(e.loaded/e.total*100)+\'%\';}else{el.textContent=\'下载中 \'+e.loaded+\' 字节\';}};function _fail(){el.innerHTML=\'\';var b=document.createElement(\'button\');b.className=\'btn\';b.type=\'button\';b.textContent=\'下载失败，点我重试\';b.onclick=function(){_dlFeed(url,name,el);};el.appendChild(b);}x.onload=function(){if(x.status===200){el.textContent=\'下载完成\';var a=document.createElement(\'a\');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);setTimeout(function(){if(el.parentNode)el.parentNode.removeChild(el);},2000);}else{_fail();}};x.onerror=function(){_fail();};x.send();}document.getElementById(\'previewBody\').addEventListener(\'click\',function(e){var a=e.target.closest?e.target.closest(\'.segdl\'):null;if(!a)return;var sz=parseInt(a.dataset.size||\'0\',10);if(sz>=20*1024*1024&&sz<=500*1024*1024){e.preventDefault();var prog=document.getElementById(\'segProg\');if(!prog){prog=document.createElement(\'div\');prog.id=\'segProg\';prog.className=\'note\';var _pb=document.getElementById(\'previewBody\');if(_pb)_pb.appendChild(prog);}_segDl(a.dataset.dl,a.dataset.name||\'download\',sz,prog,function(err){if(err&&prog)prog.textContent=\'下载失败，请重试\';else if(prog)prog.textContent=\'下载完成\';});return;}e.preventDefault();var _st2=document.createElement(\'div\');_st2.className=\'note dlstatus\';var _pb2=document.getElementById(\'previewBody\');if(_pb2)_pb2.appendChild(_st2);var _nm=document.getElementById(\'previewTitle\')?document.getElementById(\'previewTitle\').textContent:\'download\';if(!sz||sz>500*1024*1024){_st2.textContent=\'下载准备中…已开始下载，请留意浏览器下载栏\';var _tmp=document.createElement(\'a\');_tmp.href=a.dataset.dl;_tmp.download=_nm;document.body.appendChild(_tmp);_tmp.click();_tmp.remove();return;}_dlFeed(a.dataset.dl,_nm,_st2);});var _pre={};function _preOrig(t){if(!t||t.dataset.isimg!==\'1\')return;var u=t.dataset.view;if(!u||_pre[u])return;_pre[u]=1;var im=new Image();im.src=u;}document.addEventListener(\'touchstart\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);},{passive:true});document.addEventListener(\'mouseover\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);});function _preVisible(){if(navigator.connection&&navigator.connection.saveData)return;var n=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(n>=6)return;if(t.style.display===\'none\')return;var r=t.getBoundingClientRect();if(r.bottom<0||r.top>window.innerHeight)return;var b=Object.keys(_pre).length;_preOrig(t);if(Object.keys(_pre).length>b)n++;});}if(\'requestIdleCallback\' in window){requestIdleCallback(_preVisible,{timeout:2000});}else{setTimeout(_preVisible,1500);}</script></div>'
+    '<div class="tabpanel active" id="tab-published"><div class="pub-toolbar"><input class="search" id="search" type="search" placeholder="搜索文件名…" oninput="onSearch(this.value)"><button class="btn" id="openDrawerBtn" type="button">导航</button><button class="btn" id="selBtn" type="button">选择</button></div><section class="card section"><div class="section-head"><h2>已发布</h2><span class="count">{{ files|length }} 个</span></div>{% if msg %}<p class="note" style="margin-top:10px">{{ msg }}</p>{% endif %}{% if backend_notice %}<p class=\"note\" style=\"margin-top:10px\">{{ backend_notice }}</p>{% endif %}<div class="folderbar" id="folderbar"><button class="tab active" data-folder="all" onclick="showFolder(\'all\',this)">全部（{{ files|length }}）</button>{% for fo in folders %}<button class="tab" data-folder="{{ fo.id }}" onclick="showFolder(\'{{ fo.id }}\',this)">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}<button class="tab" id="newFolderBtn" type="button">+ 新建文件夹</button></div><form id="newFolderForm" method="post" action="/folder/create" style="display:none;gap:8px;margin-top:10px"><input class="textin" name="name" placeholder="新文件夹名字，比如：旅行" required maxlength="50" style="flex:1"><button class="btn primary" type="submit">创建</button><button class="btn" type="button" id="newFolderCancel">取消</button></form><div class="tabs" id="cattabs"><button class="tab active" onclick="showCat(\'全部\',this)">全部（{{ files|length }}）</button>{% for c in cats %}{% if c.count %}<button class="tab" onclick="showCat(\'{{ c.name }}\',this)">{{ c.name }}（{{ c.count }}）</button>{% endif %}{% endfor %}</div><form id="moveForm" method="post" action="/folder/move" style="display:none;margin-top:12px;margin-bottom:4px;gap:8px;flex-wrap:wrap;align-items:center"><span id="selCount" style="font-weight:800"></span><input type="hidden" name="dest_folder_id" id="moveDest"><input type="hidden" name="file_ids" id="moveFileIds"><button class="btn primary" type="button" id="moveBtn">移动</button><button class="btn" type="button" id="dlSelBtn">选择下载</button></form><div class="album-grid" id="albumGrid">{% for f in files %}<div class="tile" data-cat="{{ f.kind }}" data-folder="{{ f.folder_id }}" data-name="{{ f.name|lower }}" data-id="{{ f.id }}" data-dl="/download/{{ f.id }}" data-view="/view/{{ f.id }}" data-isimg="{{ \'1\' if f.is_image else \'0\' }}" data-isvid="{{ \'1\' if f.is_video else \'0\' }}" data-isaud="{{ \'1\' if f.is_audio else \'0\' }}" data-size="{{ f.size_bytes }}"><span class="tile-check"></span>{% if f.is_image or f.is_video %}<img class="tileimg" src="/thumb/{{ f.id }}" data-fb="/thumb/{{ f.id }}" alt="" loading="lazy" onerror="_thumbErr(this)">{% if f.is_video %}<div class="tilefic tile-video" style="display:none">影</div>{% else %}<div class="tilefic tile-img" style="display:none">图</div>{% endif %}{% elif f.is_audio %}<div class="tilefic tile-music">音</div>{% elif f.kind == "文档" %}<div class="tilefic tile-doc">文</div>{% elif f.kind == "压缩包" %}<div class="tilefic tile-zip">压</div>{% elif f.kind == "安装包" %}<div class="tilefic tile-pkg">包</div>{% elif f.kind == "影音" %}<div class="tilefic tile-video">影</div>{% else %}<div class="tilefic tile-other">他</div>{% endif %}<div class="tileinfo"><div class="tile-name" style="display:none">{{ f.name }}</div><div class="tile-meta">{{ f.kind }} · {{ f.size }}{% if f.source == "baidu" %} · 百度{% endif %}{% if f.ai_note %} · {{ f.ai_note }}{% endif %}</div></div><span class="tile-dl">↓ {{ f.dl_count|default(0) }}</span></div>{% endfor %}</div><p class="empty" id="folderEmpty" style="display:none">这个文件夹里还没有文件。</p>{% if not files %}<p class="empty">目前还没有已发布的文件。</p>{% endif %}<p class="note">点图片默认就是预览；点右上角“选择”，再点图片打勾，就可以批量下载或移动到文件夹。</p></section><div id="previewOverlay"><div id="previewCard"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b id="previewTitle" style="word-break:break-all"></b><button class="btn" id="previewClose" type="button">关闭</button></div><div id="previewBody" style="margin-top:12px"></div></div></div><div id="moveOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40;align-items:center;justify-content:center;padding:16px;box-sizing:border-box"><div style="background:var(--surface);border-radius:18px;padding:16px;width:100%;max-width:420px;max-height:90vh;overflow:auto"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b>移到哪里？</b><button class="btn" type="button" id="moveCancel">取消</button></div><p class="note" style="margin-top:8px">点一个文件夹，选中的文件就会移过去。</p><button class="btn" type="button" data-dest="{{ published_id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">已发布根目录</button>{% for fo in folders %}<button class="btn" type="button" data-dest="{{ fo.id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}</div></div><script>var curCat=\'全部\',curFolder=\'all\',curQ=\'\',selectMode=false,selected=new Set();function applyFilter(){var vis=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){var okCat=curCat===\'全部\'||t.dataset.cat===curCat;var okFolder=curFolder===\'all\'||t.dataset.folder===curFolder;var okQ=t.dataset.name.includes(curQ);var show=(okCat&&okFolder&&okQ);var _nm=t.querySelector(\'.tile-name\');if(_nm)_nm.style.display=(show&&curQ)?\'\':\'none\';t.style.display=show?\'\':\'none\';if(show)vis++;});var fe=document.getElementById(\'folderEmpty\');if(fe)fe.style.display=(curFolder!==\'all\'&&vis===0)?\'block\':\'none\';}function showCat(c,el){curCat=c;document.querySelectorAll(\'#cattabs .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function showFolder(fid,el){curFolder=fid;document.querySelectorAll(\'#folderbar .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function onSearch(v){curQ=v.toLowerCase();applyFilter();}function updateSel(){var mf=document.getElementById(\'moveForm\');var sc=document.getElementById(\'selCount\');var ids=document.getElementById(\'moveFileIds\');if(sc)sc.textContent=\'已选 \'+selected.size+\' 个 · 选择模式中，点图片是打勾，点右上角“取消选择”退出后才能查看\';if(ids)ids.value=Array.from(selected).join(\',\');if(mf)mf.style.display=selected.size?\'flex\':\'none\';}function _thumbErr(im){if(!im.dataset.fbDone&&im.dataset.fb){im.dataset.fbDone=\'1\';im.src=im.dataset.fb;return;}im.style.display=\'none\';var nx=im.nextElementSibling;if(nx)nx.style.display=\'grid\';}function openPreview(t){var ov=document.getElementById(\'previewOverlay\');var ti=document.getElementById(\'previewTitle\');var bd=document.getElementById(\'previewBody\');if(!ov||!ti||!bd)return;ti.textContent=t.querySelector(\'.tile-name\').textContent;var view=t.dataset.view,dl=t.dataset.dl;if(t.dataset.isimg===\'1\'){var _th=t.querySelector(\'.tileimg\');var _tu=_th?_th.getAttribute(\'src\'):\'\';bd.innerHTML=\'<img id="pvThumb" src="\'+_tu+\'" style="width:100%;border-radius:12px"><img id="pvOrig" src="\'+view+\'" style="width:100%;border-radius:12px;display:none"><p class="note" id="previewErr" style="display:none">图片预览加载失败，可能是原图太大或网络中断，点下面下载后本地查看。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载原图</a>\';var _im=bd.querySelector(\'img\');if(_im){_im.onerror=function(){_im.style.display=\'none\';var e=document.getElementById(\'previewErr\');if(e)e.style.display=\'block\';};}var _og=bd.querySelector(\'#pvOrig\');var _tb=bd.querySelector(\'#pvThumb\');if(_og){var _ogLoaded=false;var _ogTimer=null;var _ogRetry=null;function _ogShowRetry(){if(_ogRetry){_ogRetry.style.display=\'\';return;}_ogRetry=document.createElement(\'div\');_ogRetry.id=\'pvOrigRetry\';var _rb=document.createElement(\'button\');_rb.className=\'btn primary\';_rb.type=\'button\';_rb.textContent=\'原图加载较慢或加载失败，点我重试原图\';_rb.onclick=function(){_ogLoaded=false;if(_ogRetry)_ogRetry.style.display=\'none\';var _pe=document.getElementById(\'previewErr\');if(_tb&&(!_pe||_pe.style.display!==\'block\'))_tb.style.display=\'\';_og.style.display=\'none\';_ogStartTimer();_og.src=view+(view.indexOf(\'?\')>=0?\'&\':\'?\')+\'retry=\'+(new Date().getTime());};var _bd2=document.getElementById(\'previewBody\');if(_bd2)_bd2.appendChild(_ogRetry);_ogRetry.appendChild(_rb);}function _ogStartTimer(){if(_ogTimer)clearTimeout(_ogTimer);_ogTimer=setTimeout(function(){if(!_ogLoaded)_ogShowRetry();},15000);}_og.onload=function(){_ogLoaded=true;if(_ogTimer)clearTimeout(_ogTimer);if(_ogRetry)_ogRetry.style.display=\'none\';if(_tb)_tb.style.display=\'none\';_og.style.display=\'block\';};_og.onerror=function(){if(_ogTimer)clearTimeout(_ogTimer);_ogShowRetry();};_ogStartTimer();}}else if(t.dataset.isvid===\'1\'){bd.innerHTML=\'<video id="pvVideo" controls preload="metadata" src="\'+view+\'" style="width:100%;border-radius:12px"></video><div style="display:none;gap:8px;margin:10px 0"><button class="btn" id="qLowBtn" type="button">流畅</button><button class="btn" id="qHighBtn" type="button">高清</button></div><div id="qNote" class="note"></div><p class="note">大视频在线播需要先缓冲一会儿；如果一直转圈，点下面下载后本地播放更快。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载视频</a>\';var _vid=bd.querySelector(\'#pvVideo\');var _ql=bd.querySelector(\'#qLowBtn\');var _qh=bd.querySelector(\'#qHighBtn\');var _qn=bd.querySelector(\'#qNote\');var _qrow=_ql?_ql.parentElement:null;function _setQ(mode,play){if(!_vid)return;if(mode===\'low\'){_vid.src=\'/preview/\'+t.dataset.id;}else{_vid.src=view;}_vid.load();if(play){try{_vid.play();}catch(e){}}if(_ql){_ql.style.background=mode===\'low\'?\'var(--green)\':\'\';_ql.style.color=mode===\'low\'?\'#fff\':\'\';}if(_qh){_qh.style.background=mode===\'high\'?\'var(--green)\':\'\';_qh.style.color=mode===\'high\'?\'#fff\':\'\';}try{localStorage.setItem(\'video_quality\',mode);}catch(e){}}if(_ql)_ql.addEventListener(\'click\',function(){_setQ(\'low\',true);});if(_qh)_qh.addEventListener(\'click\',function(){_setQ(\'high\',true);});if(_vid)_vid.addEventListener(\'error\',function(){if(_vid.src.indexOf(\'/preview/\')>=0){_vid.src=view;_vid.load();}});fetch(\'/preview_status/\'+t.dataset.id).then(function(r){return r.json();}).then(function(j){if(j.has_preview){if(_qrow)_qrow.style.display=\'flex\';var saved=null;try{saved=localStorage.getItem(\'video_quality\');}catch(e){}_setQ(saved===\'high\'?\'high\':\'low\',false);if(_qn)_qn.textContent=\'流畅版是低清预览，起播快；点高清切回原片，加载慢自己受着。\';}else{if(_qrow)_qrow.style.display=\'none\';if(_qn)_qn.textContent=\'低清版还没生成，先看原片。\';}}).catch(function(){if(_qrow)_qrow.style.display=\'none\';});}else if(t.dataset.isaud===\'1\'){bd.innerHTML=\'<audio controls src="\'+view+\'" style="width:100%"></audio>\';}else if(t.dataset.cat===\'文档\'){bd.innerHTML=\'<iframe src="\'+view+\'" style="width:100%;height:420px;border:0;border-radius:12px"></iframe><p style="margin-top:10px"><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a></p>\';}else{bd.innerHTML=\'<p class="note">这个类型不能在线预览，请下载后打开。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a>\';}ov.style.display=\'flex\';_loadComments(t.dataset.id);}function _escHtml(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");} function _loadComments(fid){var card=document.getElementById(\'previewCard\');if(!card)return;var cs=document.getElementById(\'commentSection\');if(!cs){cs=document.createElement(\'div\');cs.id=\'commentSection\';card.appendChild(cs);}cs.innerHTML=\'<div style="margin-top:14px;border-top:1px solid var(--line);padding-top:10px"><b>留言</b><div id="commentList" style="margin-top:8px">加载留言中…</div><input id="commentNick" placeholder="昵称（不填就是匿名）" maxlength="50" style="width:100%;margin-top:8px;box-sizing:border-box"><textarea id="commentText" rows="2" placeholder="写下你的留言…" maxlength="500" style="width:100%;margin-top:6px;box-sizing:border-box"></textarea><button class="btn primary" id="commentSend" type="button" style="margin-top:6px">发送留言</button><div id="commentMsg" class="note"></div></div>\';var list=cs.querySelector(\'#commentList\');function render(items){if(!items||!items.length){list.innerHTML=\'<p class="note">还没有留言。</p>\';return;}list.innerHTML=items.map(function(c){return \'<div style="margin-bottom:8px"><div style="font-weight:800;font-size:13px">\'+_escHtml(c.author||\'匿名\')+\' <span style="font-weight:400;color:var(--muted);font-size:11px">\'+_escHtml(c.time||\'\')+\'</span></div><div style="font-size:13px;word-break:break-all">\'+_escHtml(c.text||\'\')+\'</div></div>\';}).join(\'\');}function reload(){fetch(\'/comments/\'+encodeURIComponent(fid)).then(function(r){return r.json();}).then(function(j){render(j.comments);}).catch(function(){list.innerHTML=\'<p class="note">留言加载失败，稍后再试。</p>\';});}reload();var btn=cs.querySelector(\'#commentSend\');if(btn){btn.onclick=function(){var nick=cs.querySelector(\'#commentNick\').value;var txt=cs.querySelector(\'#commentText\').value;var msg=cs.querySelector(\'#commentMsg\');if(!txt.trim()){msg.textContent=\'留言不能为空\';return;}msg.textContent=\'发送中…\';var fd=new FormData();fd.append(\'author\',nick);fd.append(\'text\',txt);fetch(\'/comments/\'+encodeURIComponent(fid),{method:\'POST\',body:fd}).then(function(r){return r.json();}).then(function(j){if(j.ok){cs.querySelector(\'#commentText\').value=\'\';msg.textContent=\'已发送\';reload();}else{msg.textContent=j.error||\'发送失败\';}}).catch(function(){msg.textContent=\'发送失败，请重试\';});};}} function closePreview(){var ov=document.getElementById(\'previewOverlay\');var bd=document.getElementById(\'previewBody\');if(bd){bd.querySelectorAll(\'video,audio\').forEach(function(m){m.pause();m.removeAttribute(\'src\');m.load();});bd.innerHTML=\'\';}if(ov)ov.style.display=\'none\';}function dlTile(t){var url=t.dataset.dl;var name=t.querySelector(\'.tile-name\').textContent;var _st=document.createElement(\'div\');_st.className=\'note dlstatus\';_st.textContent=\'下载准备中…\';t.appendChild(_st);_dlFeed(url,name,_st);}document.getElementById(\'albumGrid\').addEventListener(\'click\',function(e){var t=e.target.closest(\'.tile\');if(!t)return;if(e.target.closest&&e.target.closest(\'.dlstatus\'))return;if(selectMode){var id=t.dataset.id;if(selected.has(id)){selected.delete(id);t.classList.remove(\'selected\');}else{selected.add(id);t.classList.add(\'selected\');}updateSel();}else{openPreview(t);}});document.getElementById(\'previewClose\').addEventListener(\'click\',closePreview);document.getElementById(\'previewOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'previewOverlay\')closePreview();});document.getElementById(\'selBtn\').addEventListener(\'click\',function(){selectMode=!selectMode;var g=document.getElementById(\'albumGrid\');if(selectMode){g.classList.add(\'selecting\');this.textContent=\'取消选择\';}else{selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});g.classList.remove(\'selecting\');this.textContent=\'选择\';}updateSel();});document.getElementById(\'dlSelBtn\').addEventListener(\'click\',function(){var tiles=[];document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(selected.has(t.dataset.id))tiles.push(t);});if(!tiles.length)return;var i=0;function next(){if(i>=tiles.length){alert(\'已开始下载 \'+tiles.length+\' 个文件（浏览器可能逐个询问是否允许多个下载）。\');selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});document.getElementById(\'albumGrid\').classList.remove(\'selecting\');selectMode=false;document.getElementById(\'selBtn\').textContent=\'选择\';updateSel();return;}dlTile(tiles[i]);i++;setTimeout(next,600);}next();});document.getElementById(\'newFolderBtn\').addEventListener(\'click\',function(){var f=document.getElementById(\'newFolderForm\');f.style.display=\'flex\';});document.getElementById(\'newFolderCancel\').addEventListener(\'click\',function(){document.getElementById(\'newFolderForm\').style.display=\'none\';});document.getElementById(\'moveForm\').addEventListener(\'submit\',function(e){if(!selected.size){e.preventDefault();alert(\'请先勾选文件\');}});document.getElementById(\'moveBtn\').addEventListener(\'click\',function(){if(!selected.size){alert(\'请先勾选文件\');return;}var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'flex\';});document.getElementById(\'moveCancel\').addEventListener(\'click\',function(){var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'none\';});document.getElementById(\'moveOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'moveOverlay\'){e.target.style.display=\'none\';}});document.querySelectorAll(\'#moveOverlay [data-dest]\').forEach(function(b){b.addEventListener(\'click\',function(){var d=document.getElementById(\'moveDest\');if(d)d.value=b.dataset.dest;document.getElementById(\'moveForm\').submit();});});function _segDl(url,name,size,progEl,doneCb){var CH=8*1024*1024,PAR=3,TRY=3,total=Math.ceil(size/CH),parts=new Array(total),done=0,failed=false,next=0,inflight=0;function show(){if(progEl)progEl.textContent=\'下载中 \'+Math.round(done/total*100)+\'%（\'+(done*CH>size?size:done*CH)+\' / \'+size+\' 字节）\';}function fetchC(idx,att,cb){var st=idx*CH,en=Math.min(size-1,st+CH-1);var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.setRequestHeader(\'Range\',\'bytes=\'+st+\'-\'+en);x.responseType=\'blob\';x.onload=function(){if(x.status===206||x.status===200){cb(null,x.response);}else if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk failed\'));}};x.onerror=function(){if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk network error\'));}};x.send();}function launch(){while(!failed&&inflight<PAR&&next<total){(function(idx){inflight++;fetchC(idx,0,function(err,blob){inflight--;if(failed)return;if(err){failed=true;if(doneCb)doneCb(err);return;}parts[idx]=blob;done++;show();if(done===total){var a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob(parts));a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);if(doneCb)doneCb(null);}else{launch();}});})(next);next++;}}show();launch();}function _dlFeed(url,name,el){el.textContent=\'下载准备中…\';var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.responseType=\'blob\';x.onprogress=function(e){if(e.lengthComputable&&e.total){el.textContent=\'下载中 \'+Math.round(e.loaded/e.total*100)+\'%\';}else{el.textContent=\'下载中 \'+e.loaded+\' 字节\';}};function _fail(){el.innerHTML=\'\';var b=document.createElement(\'button\');b.className=\'btn\';b.type=\'button\';b.textContent=\'下载失败，点我重试\';b.onclick=function(){_dlFeed(url,name,el);};el.appendChild(b);}x.onload=function(){if(x.status===200){el.textContent=\'下载完成\';var a=document.createElement(\'a\');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);setTimeout(function(){if(el.parentNode)el.parentNode.removeChild(el);},2000);}else{_fail();}};x.onerror=function(){_fail();};x.send();}document.getElementById(\'previewBody\').addEventListener(\'click\',function(e){var a=e.target.closest?e.target.closest(\'.segdl\'):null;if(!a)return;var sz=parseInt(a.dataset.size||\'0\',10);if(sz>=20*1024*1024&&sz<=500*1024*1024){e.preventDefault();var prog=document.getElementById(\'segProg\');if(!prog){prog=document.createElement(\'div\');prog.id=\'segProg\';prog.className=\'note\';var _pb=document.getElementById(\'previewBody\');if(_pb)_pb.appendChild(prog);}_segDl(a.dataset.dl,a.dataset.name||\'download\',sz,prog,function(err){if(err&&prog)prog.textContent=\'下载失败，请重试\';else if(prog)prog.textContent=\'下载完成\';});return;}e.preventDefault();var _st2=document.createElement(\'div\');_st2.className=\'note dlstatus\';var _pb2=document.getElementById(\'previewBody\');if(_pb2)_pb2.appendChild(_st2);var _nm=document.getElementById(\'previewTitle\')?document.getElementById(\'previewTitle\').textContent:\'download\';if(!sz||sz>500*1024*1024){_st2.textContent=\'下载准备中…已开始下载，请留意浏览器下载栏\';var _tmp=document.createElement(\'a\');_tmp.href=a.dataset.dl;_tmp.download=_nm;document.body.appendChild(_tmp);_tmp.click();_tmp.remove();return;}_dlFeed(a.dataset.dl,_nm,_st2);});var _pre={};function _preOrig(t){if(!t||t.dataset.isimg!==\'1\')return;var u=t.dataset.view;if(!u||_pre[u])return;_pre[u]=1;var im=new Image();im.src=u;}document.addEventListener(\'touchstart\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);},{passive:true});document.addEventListener(\'mouseover\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);});function _preVisible(){if(navigator.connection&&navigator.connection.saveData)return;var n=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(n>=6)return;if(t.style.display===\'none\')return;var r=t.getBoundingClientRect();if(r.bottom<0||r.top>window.innerHeight)return;var b=Object.keys(_pre).length;_preOrig(t);if(Object.keys(_pre).length>b)n++;});}if(\'requestIdleCallback\' in window){requestIdleCallback(_preVisible,{timeout:2000});}else{setTimeout(_preVisible,1500);}</script></div>'
     "{% endif %}"
     "<script>function dlFile(btn){var row=btn.closest('.file');var wrap=row.querySelector('.dlprog');var bar=row.querySelector('.dlbar');var tx=row.querySelector('.dltext');if(!wrap)return;wrap.style.display='block';btn.disabled=true;var url=btn.getAttribute('data-dl');var name=btn.getAttribute('data-name');var x=new XMLHttpRequest();x.open('GET',url,true);x.responseType='blob';x.onprogress=function(ev){if(ev.lengthComputable){var pct=Math.round(ev.loaded/ev.total*100);bar.style.width=pct+'%';tx.textContent='下载中… '+pct+'%（'+(ev.loaded/1048576).toFixed(1)+' / '+(ev.total/1048576).toFixed(1)+' MB）';}else{tx.textContent='下载中… '+(ev.loaded/1048576).toFixed(1)+' MB';}};x.onload=function(){if(x.status===200){bar.style.width='100%';tx.textContent='下载完成';var a=document.createElement('a');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}else{tx.textContent='下载失败，请重试';}btn.disabled=false;};x.onerror=function(){tx.textContent='下载失败，请检查网络后重试';btn.disabled=false;};x.send();}</script>"
         '<div class="tabpanel" id="tab-private"><div class="card section"><h2>私人区</h2>'
@@ -1668,7 +2346,7 @@ ADMIN_PAGE = (
     "{% if not drive_configured %}"
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
     "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
-    "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.size }}</span><span class=\"chip wait\">待审核</span></div></div><div class=\"airow\">{% if f.ai %}<span class=\"chip {% if f.ai.verdict == '可疑' %}bad{% elif f.ai.verdict == '通过' %}{% elif f.ai.verdict == 'failed' %}wait{% else %}sample{% endif %}\">AI：{% if f.ai.verdict == 'failed' %}未能审核{% else %}{{ f.ai.verdict }}{% endif %}</span><span class=\"note\">{{ f.ai.reason }}{% if f.ai.confidence is not none %}（置信度 {{ f.ai.confidence }}）{% endif %}{% if f.ai.note %} · {{ f.ai.note }}{% endif %}</span>{% if f.ai.verdict == 'failed' %}<form method=\"post\" action=\"/admin/ai_review\" style=\"display:inline\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn\">重试初审</button></form>{% endif %}{% elif ai_configured %}<span class=\"note\">尚未 AI 初审</span><form method=\"post\" action=\"/admin/ai_review\" style=\"display:inline\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn\">AI 初审</button></form>{% endif %}</div>"
+    "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.size }}</span><span class=\"chip wait\">待审核</span>{% if f.source == \"baidu\" %}<span class=\"chip\">百度</span>{% elif f.source == \"google\" %}<span class=\"chip\">谷歌</span>{% endif %}</div></div><div class=\"airow\">{% if f.ai %}<span class=\"chip {% if f.ai.verdict == '可疑' %}bad{% elif f.ai.verdict == '通过' %}{% elif f.ai.verdict == 'failed' %}wait{% else %}sample{% endif %}\">AI：{% if f.ai.verdict == 'failed' %}未能审核{% else %}{{ f.ai.verdict }}{% endif %}</span><span class=\"note\">{{ f.ai.reason }}{% if f.ai.confidence is not none %}（置信度 {{ f.ai.confidence }}）{% endif %}{% if f.ai.note %} · {{ f.ai.note }}{% endif %}</span>{% if f.ai.verdict == 'failed' %}<form method=\"post\" action=\"/admin/ai_review\" style=\"display:inline\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn\">重试初审</button></form>{% endif %}{% elif ai_configured %}<span class=\"note\">尚未 AI 初审</span><form method=\"post\" action=\"/admin/ai_review\" style=\"display:inline\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn\">AI 初审</button></form>{% endif %}</div>"
     "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a>"
     "<form class=\"renameform\" method=\"post\" action=\"/rename\" style=\"display:inline-flex\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<input type=\"hidden\" name=\"back\" value=\"/admin\"><input class=\"renametext\" type=\"text\" name=\"new_name\" placeholder=\"改个名字…\" required>"
@@ -1689,7 +2367,7 @@ ADMIN_PAGE = (
     "{% if not drive_configured %}"
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
     "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
-    "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.size }}</span><span class=\"chip wait\">待审核</span></div></div><div class=\"airow\">{% if f.ai %}<span class=\"chip {% if f.ai.verdict == '可疑' %}bad{% elif f.ai.verdict == '通过' %}{% elif f.ai.verdict == 'failed' %}wait{% else %}sample{% endif %}\">AI：{% if f.ai.verdict == 'failed' %}未能审核{% else %}{{ f.ai.verdict }}{% endif %}</span><span class=\"note\">{{ f.ai.reason }}{% if f.ai.confidence is not none %}（置信度 {{ f.ai.confidence }}）{% endif %}{% if f.ai.note %} · {{ f.ai.note }}{% endif %}</span>{% if f.ai.verdict == 'failed' %}<form method=\"post\" action=\"/admin/ai_review\" style=\"display:inline\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn\">重试初审</button></form>{% endif %}{% elif ai_configured %}<span class=\"note\">尚未 AI 初审</span><form method=\"post\" action=\"/admin/ai_review\" style=\"display:inline\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn\">AI 初审</button></form>{% endif %}</div>"
+    "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.size }}</span><span class=\"chip wait\">待审核</span>{% if f.source == \"baidu\" %}<span class=\"chip\">百度</span>{% elif f.source == \"google\" %}<span class=\"chip\">谷歌</span>{% endif %}</div></div><div class=\"airow\">{% if f.ai %}<span class=\"chip {% if f.ai.verdict == '可疑' %}bad{% elif f.ai.verdict == '通过' %}{% elif f.ai.verdict == 'failed' %}wait{% else %}sample{% endif %}\">AI：{% if f.ai.verdict == 'failed' %}未能审核{% else %}{{ f.ai.verdict }}{% endif %}</span><span class=\"note\">{{ f.ai.reason }}{% if f.ai.confidence is not none %}（置信度 {{ f.ai.confidence }}）{% endif %}{% if f.ai.note %} · {{ f.ai.note }}{% endif %}</span>{% if f.ai.verdict == 'failed' %}<form method=\"post\" action=\"/admin/ai_review\" style=\"display:inline\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn\">重试初审</button></form>{% endif %}{% elif ai_configured %}<span class=\"note\">尚未 AI 初审</span><form method=\"post\" action=\"/admin/ai_review\" style=\"display:inline\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn\">AI 初审</button></form>{% endif %}</div>"
     "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a>"
     "<form class=\"renameform\" method=\"post\" action=\"/rename\" style=\"display:inline-flex\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<input type=\"hidden\" name=\"back\" value=\"/admin\"><input class=\"renametext\" type=\"text\" name=\"new_name\" placeholder=\"改个名字…\" required>"
@@ -1729,11 +2407,14 @@ def api_private():
     out = {"files": []}
     if code and _has_gate(code, "exchange_access"):
         fb_user = _account_gate()
-        service = drive_service()
-        if fb_user and service and _private_account_ok(service, fb_user):
-            folder = _private_user_folder_id(service, fb_user, create=False)
-            if folder:
-                out["files"] = list_folder(service, folder)
+        if fb_user and _use_baidu_meta() and _private_account_ok(None, fb_user):
+            out["files"] = _baidu_private_list(fb_user)
+        else:
+            service = drive_service()
+            if fb_user and service and _private_account_ok(service, fb_user):
+                folder = _private_user_folder_id(service, fb_user, create=False)
+                if folder:
+                    out["files"] = list_folder(service, folder)
     return jsonify(out)
 
 
@@ -1741,6 +2422,9 @@ def api_private():
 def api_private_all():
     out = {"users": []}
     if _is_manager():
+        if _use_baidu_meta():
+            out["users"] = _baidu_private_users()
+            return jsonify(out)
         service = drive_service()
         root = _private_root_id(service) if service else None
         if service and root:
@@ -1758,29 +2442,51 @@ def api_private_all():
 @app.route("/api/files")
 def api_files():
     code = _env("EXCHANGE_CODE")
-    out = {"published": [], "pending": [], "folders": []}
+    out = {"published": [], "pending": [], "folders": [], "notice": ""}
     if code and _has_gate(code, "exchange_access"):
         try:
-            _pf, _fo = _list_published_tree(drive_service())
-            out["published"] = _pf
-            out["folders"] = _fo
+            service = drive_service()
         except Exception:
-            out["published"] = []
-            out["folders"] = []
+            service = None
+        gfiles, gfolders, google_err = [], [], False
+        if _google_fallback_enabled():
+            try:
+                if service is not None:
+                    gfiles, gfolders = _list_published_tree(service)
+            except Exception:
+                gfiles, gfolders, google_err = [], [], True
+        bfiles, bfolders, baidu_err = [], [], False
         if _baidu_enabled():
             try:
-                _bf, _bfo = _baidu_published()
-                out["published"] = out["published"] + _bf
-                out["folders"] = out["folders"] + _bfo
+                bfiles, bfolders = _baidu_published()
             except Exception:
-                pass
-        _dl_attach(out["published"], drive_service())
-        _ai_attach_published(out["published"])
+                baidu_err = True
+        elif _priority_backend() == "baidu":
+            baidu_err = True
+        files, folders = _merge_mixed(gfiles, gfolders, bfiles, bfolders)
+        out["published"] = files
+        out["folders"] = folders
+        _dl_attach(files, service)
+        _ai_attach_published(files)
+        notices = []
+        if google_err:
+            notices.append("谷歌区暂时连不上，只显示百度区")
+        if baidu_err:
+            if _priority_backend() == "baidu" and not _baidu_enabled():
+                notices.append("百度后端未配置，只显示谷歌区")
+            elif _baidu_enabled():
+                notices.append("百度区暂时连不上，只显示谷歌区")
+        out["notice"] = "；".join(notices)
     if _is_manager():
         try:
-            out["pending"] = list_folder(drive_service(), PENDING_FOLDER_ID)
-            for f in out["pending"]:
+            try:
+                service = drive_service()
+            except Exception:
+                service = None
+            pending = _merged_pending(service)
+            for f in pending:
                 f["ai"] = _ai_get_result(f["id"])
+            out["pending"] = pending
         except Exception:
             out["pending"] = []
     return jsonify(out)
@@ -1801,6 +2507,7 @@ def index():
     entered = _has_gate(code, "exchange_access")
     files = []
     folders = []
+    backend_notice = ""
     if code and entered:
         if _is_relay():
             try:
@@ -1812,11 +2519,21 @@ def index():
                 _rj = _r.json()
                 files = _rj.get("published", [])
                 folders = _rj.get("folders", [])
+                backend_notice = _rj.get("notice", "") or ""
             except Exception:
-                files = []
-                folders = []
+                # 中继不通时降级：百度直连，只显示百度区，绝不 500（设计 2.3 第 3 点）
+                files, folders = [], []
+                if _baidu_enabled():
+                    try:
+                        bfiles, bfolders = _baidu_published()
+                        files, folders = _merge_mixed([], [], bfiles, bfolders)
+                        backend_notice = "谷歌区（中继）暂时连不上，只显示百度区"
+                    except Exception:
+                        backend_notice = "谷歌区（中继）暂时连不上，百度区也未能加载"
+                else:
+                    backend_notice = "谷歌区（中继）暂时连不上"
         else:
-            files, folders = _cached_published(drive_service())
+            files, folders, backend_notice = _cached_published(drive_service())
     cats = [{"name": c, "count": sum(1 for f in files if f["kind"] == c)} for c in CATS]
     private_files = []
     private_used = 0
@@ -1834,11 +2551,15 @@ def index():
             except Exception:
                 private_files = []
         else:
-            service = drive_service()
-            if service and _private_account_ok(service, fb_user):
-                folder = _private_user_folder_id(service, fb_user, create=False)
-                if folder:
-                    private_files = list_folder(service, folder)
+            if _use_baidu_meta():
+                if _private_account_ok(None, fb_user):
+                    private_files = _baidu_private_list(fb_user)
+            else:
+                service = drive_service()
+                if service and _private_account_ok(service, fb_user):
+                    folder = _private_user_folder_id(service, fb_user, create=False)
+                    if folder:
+                        private_files = list_folder(service, folder)
     private_used = sum(f.get("size_bytes", 0) for f in private_files)
     ann = None
     if entered:
@@ -1879,6 +2600,7 @@ def index():
         secondary_configured=_secondary_configured(),
         msg=request.args.get("msg", ""),
         announcement=ann,
+        backend_notice=backend_notice,
     )
 
 
@@ -1928,6 +2650,58 @@ def upload():
                 return _r.text, _r.status_code
         except Exception as e:
             return jsonify({"ok": False, "msg": f"中转上传失败：{e}"}), 502
+    if _priority_backend() == "baidu":
+        if not _baidu_enabled():
+            if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+                return jsonify({"ok": False, "msg": "百度暂未连接，上传暂不可用，请联系站长"}), 503
+            return redirect("/?msg=百度暂未连接，上传暂不可用，请联系站长")
+        _base, _pub, _pend = _baidu_dirs()
+        uploads = request.files.getlist("file")
+        uploads = [u for u in uploads if u and u.filename]
+        if not uploads:
+            if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+                return jsonify({"ok": False, "msg": "没有可上传的文件"})
+            return redirect("/?msg=没有可上传的文件")
+        count = 0
+        for up in uploads:
+            name = _safe_filename(up.filename)
+            if not name:
+                continue
+            try:
+                up.stream.seek(0)
+            except Exception:
+                pass
+            # 大小守卫：记下上传时应有的字节数，审核/AI 自动发布时核对云盘实际大小，
+            # 不一致（没传完）一律不通过——百度分支也不能绕过这道关。
+            _up_size = 0
+            try:
+                up.stream.seek(0, 2)
+                _up_size = up.stream.tell()
+                up.stream.seek(0)
+            except Exception:
+                _up_size = 0
+            try:
+                fs_id = _baidu_upload_stream(_pend + name, up.stream)
+                if not fs_id:
+                    entry = _baidu_find_by_path(_pend + name)
+                    fs_id = (entry or {}).get("fs_id")
+            except Exception as e:
+                print(f"[baidu-upload] failed: {e}", flush=True)
+                continue
+            count += 1
+            if fs_id:
+                if _up_size:
+                    EXPECTED_SIZES["bd:" + str(fs_id)] = _up_size
+                _auto_ai_trigger("bd:" + str(fs_id))
+        if count == 0:
+            if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+                return jsonify({"ok": False, "msg": "百度上传失败，请重试"})
+            return redirect("/?msg=百度上传失败，请重试")
+        _log("上传", f"{count} 个文件")
+        msg = f"已上传 {count} 个文件到待审核，站长通过后才会出现在已发布列表"
+        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            return jsonify({"ok": True, "msg": msg})
+        return redirect(f"/?msg={msg}")
     service = drive_service()
     if service is None:
         return redirect("/?msg=云盘暂未连接，上传暂不可用，请联系站长")
@@ -1994,6 +2768,9 @@ def direct_session():
             return jsonify(_r.json()), _r.status_code
         except Exception as e:
             return jsonify({"ok": False, "msg": f"中转直传会话失败：{e}"}), 502
+    if _priority_backend() == "baidu":
+        # 百度优先模式下直传暂缓（设计第 1 节第 4 项）：前端收到失败后自动改走本站中转上传。
+        return jsonify({"ok": False, "msg": "百度优先模式下请用中转上传"}), 503
     data = request.get_json(silent=True) or {}
     name = _safe_filename(data.get("name", ""))
     try:
@@ -2290,6 +3067,44 @@ def private_upload():
             return redirect("/#private")
         except Exception as e:
             return redirect(f"/?msg=中转私人上传失败：{e}#private")
+    if _use_baidu_meta():
+        if not _private_account_ok(None, fb_user):
+            return redirect("/?msg=这个账号已被禁用或不存在#private")
+        _bdir = _baidu_private_dir(fb_user)
+        _baidu_ensure_dir(_bdir.rstrip("/"))
+        PRIVATE_QUOTA = 20 * 1024 * 1024 * 1024
+        used = sum(f.get("size_bytes", 0) for f in _baidu_private_list(fb_user))
+        _uploads = [u for u in request.files.getlist("file") if u and u.filename]
+        _new_total = 0
+        for _u in _uploads:
+            try:
+                _u.stream.seek(0, 2)
+                _new_total += _u.stream.tell()
+                _u.stream.seek(0)
+            except Exception:
+                pass
+        if used + _new_total > PRIVATE_QUOTA:
+            return redirect("/?msg=私人空间已满：每人上限 20 GB，这次传完会超，请先删掉一些私人文件再传#private")
+        count = 0
+        for up in _uploads:
+            if not up or not up.filename:
+                continue
+            name = _safe_filename(up.filename)
+            if not name:
+                continue
+            try:
+                up.stream.seek(0)
+            except Exception:
+                pass
+            try:
+                _baidu_upload_stream(_bdir + name, up.stream)
+                count += 1
+            except Exception:
+                continue
+        if count == 0:
+            return redirect("/?msg=没有可上传的文件#private")
+        _log("私人上传", f"{fb_user} {count} 个文件")
+        return redirect(f"/?msg=已上传 {count} 个文件到私人区，只有你和站长能看见#private")
     service = drive_service()
     if service is None:
         return redirect("/?msg=云盘暂未连接，私人上传暂不可用#private")
@@ -2347,6 +3162,27 @@ def private_delete():
     file_id = request.form.get("file_id", "")
     if not file_id:
         return redirect("/#private")
+    if (file_id or "").startswith("bd:"):
+        if not _baidu_enabled():
+            return redirect("/#private")
+        try:
+            meta = _baidu_meta(file_id[3:])
+        except Exception:
+            return redirect("/?msg=文件不存在或无权访问#private")
+        path = meta.get("path") or ""
+        owner = None
+        _pb = _baidu_private_base()
+        if path.startswith(_pb):
+            rest = path[len(_pb):].strip("/")
+            owner = rest.split("/")[0] if rest else None
+        if owner is None or (owner != fb_user and not _private_is_admin()):
+            return redirect("/?msg=这不是你的私人文件#private")
+        try:
+            _baidu_delete_path(path)
+        except Exception:
+            return redirect("/?msg=删除失败，请重试#private")
+        _log("私人删除", meta.get("server_filename", file_id))
+        return redirect("/#private")
     try:
         meta = get_file(service, file_id)
     except Exception:
@@ -2375,6 +3211,8 @@ def admin_private():
             users = _r.json().get("users", [])
         except Exception:
             users = []
+    elif _use_baidu_meta():
+        users = _baidu_private_users()
     else:
         service = drive_service()
         users = []
@@ -2471,7 +3309,7 @@ def register():
     if not name or not pw or len(name) > 20 or len(pw) > 50:
         return redirect("/?msg=账号名和密码不能为空#feedback")
     service = drive_service()
-    if service is None:
+    if service is None and not _use_baidu_meta():
         return redirect("/?msg=云盘暂未连接，注册暂不可用#feedback")
     accounts = _read_accounts(service)
     if any(a["name"] == name for a in accounts):
@@ -2677,9 +3515,15 @@ def admin():
             return "站长口令还没配置，请联系站长在 Render 环境变量中设置 ADMIN_TOKEN", 503
         return "请先在首页输入站长口令", 403
     if _is_relay():
-        files = _relay_files().get("pending", [])
+        _rf = _relay_files()
+        if _rf is None:
+            files = _merged_pending(None)
+            for f in files:
+                f["ai"] = _ai_get_result(f["id"])
+        else:
+            files = _rf.get("pending", [])
     else:
-        files = list_folder(drive_service(), PENDING_FOLDER_ID)
+        files = _merged_pending(drive_service())
         for f in files:
             f["ai"] = _ai_get_result(f["id"])
     return render_template_string(
@@ -2742,6 +3586,28 @@ def _ai_file_id(service):
 
 def _ai_read_shared(service):
     """返回 {file_id: result}；无文件返回 {}；读不到/读坏/无服务返回 None。"""
+    if _use_baidu_meta():
+        try:
+            _base, _pub, _pend = _baidu_dirs()
+            text = _baidu_read_text(_base + _AI_FILE_NAME)
+            if text is None:
+                return {}
+            out = {}
+            for line in text.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                key = row.get("file_id")
+                if key:
+                    out[str(key)] = {"verdict": row.get("verdict"), "reason": row.get("reason") or "", "confidence": row.get("confidence"), "note": row.get("note") or "", "time": row.get("time") or ""}
+            return out
+        except Exception as e:
+            print(f"[ai-shared] read failed: {e}", flush=True)
+            return None
     if service is None:
         return None
     try:
@@ -2805,7 +3671,7 @@ def _ai_shared_snapshot(service=None):
         old = dict(_AI_SHARED_CACHE["data"]) if _AI_SHARED_CACHE["data"] is not None else None
     try:
         svc = service if service is not None else _ai_shared_service()
-        if svc is None:
+        if svc is None and not _use_baidu_meta():
             return old
         data = _ai_get_shared(svc)
         return data if data is not None else old
@@ -2823,6 +3689,14 @@ def _ai_shared_service():
 
 def _ai_write_shared(service, data):
     """整文件覆写共享结论；成功 True，失败 False，绝不抛异常。"""
+    if _use_baidu_meta():
+        try:
+            _base, _pub, _pend = _baidu_dirs()
+            body = "\n".join(json.dumps({"file_id": k, "time": v.get("time") or "", "verdict": v.get("verdict"), "reason": v.get("reason") or "", "confidence": v.get("confidence"), "note": v.get("note") or ""}, ensure_ascii=False) for k, v in data.items())
+            return _baidu_write_text(_base + _AI_FILE_NAME, body)
+        except Exception as e:
+            print(f"[ai-shared] write failed: {e}", flush=True)
+            return False
     if service is None:
         return False
     from googleapiclient.http import MediaIoBaseUpload
@@ -2925,6 +3799,30 @@ def _auto_ai_process(file_id):
             # 失败/未配置统一记为“AI 未能审核”，绝不自动发布、绝不自动驳回
             if verdict in ("failed", "unconfigured"):
                 _ai_set_result(file_id, "failed", "AI 未能审核")
+            return
+        if (file_id or "").startswith("bd:"):
+            meta = _ai_pending_meta(file_id)
+            if meta is None:
+                return
+            name = meta.get("name") or file_id
+            expected = EXPECTED_SIZES.get(file_id)
+            if expected:
+                try:
+                    actual = int(meta.get("size") or 0)
+                except Exception:
+                    actual = 0
+                if actual != expected:
+                    _ai_set_result(file_id, "通过", res.get("reason") or "内容初审通过",
+                                   res.get("confidence"),
+                                   f"大小未对齐暂未自动发布：云盘里只有 {_fmt_size(actual)}，上传时应为 {_fmt_size(expected)}，请等上传完成后再人工通过")
+                    return
+            with _AI_LOCK:
+                _AI_PUBLISHED[file_id] = dict(_AI_RESULTS.get(file_id) or {})
+            if not _baidu_move_pending_to_published(file_id[3:], name):
+                _ai_set_result(file_id, "通过", res.get("reason") or "内容初审通过",
+                               res.get("confidence"), "自动发布失败（移动失败），请人工通过")
+                return
+            _auto_log("AI 自动发布", name)
             return
         service = drive_service()
         if service is None:
@@ -3031,7 +3929,7 @@ def _ai_set_result(file_id, verdict, reason, confidence=None, note=""):
             _AI_SHARED_CACHE["at"] = time.time()
     try:
         svc = _ai_shared_service()
-        if svc is not None:
+        if svc is not None or _use_baidu_meta():
             base = _ai_read_shared(svc)
             if base is None:
                 with _AI_SHARED_LOCK:
@@ -3166,7 +4064,10 @@ def _ai_collect_evidence(service, meta):
     base = {"name": name, "size": meta.get("size"), "ext": ext}
     if ext in _AI_TEXT_EXTS:
         try:
-            raw = _ai_fetch_head(service, meta["id"], _AI_TEXT_LIMIT + 1024)
+            if meta.get("source") == "baidu":
+                raw = _ai_fetch_baidu_head(meta["id"][3:], _AI_TEXT_LIMIT + 1024)
+            else:
+                raw = _ai_fetch_head(service, meta["id"], _AI_TEXT_LIMIT + 1024)
             text = raw.decode("utf-8", errors="ignore")[:_AI_TEXT_LIMIT]
             return dict(base, kind="text", excerpt=text)
         except Exception:
@@ -3180,7 +4081,10 @@ def _ai_collect_evidence(service, meta):
             return dict(base, kind="name_only", note="压缩包过大未列清单，仅文件名初审，未看内容")
         try:
             import zipfile
-            raw = _ai_fetch_head(service, meta["id"], _AI_ZIP_MAX_BYTES)
+            if meta.get("source") == "baidu":
+                raw = _ai_fetch_baidu_head(meta["id"][3:], _AI_ZIP_MAX_BYTES)
+            else:
+                raw = _ai_fetch_head(service, meta["id"], _AI_ZIP_MAX_BYTES)
             zf = zipfile.ZipFile(io.BytesIO(raw))
             names = [i.filename for i in zf.infolist()[:_AI_ZIP_NAME_LIMIT]]
             return dict(base, kind="zip", entries=names)
@@ -3682,10 +4586,29 @@ def approve():
         return "请先在首页输入站长口令", 403
     if _is_relay():
         return _proxy_post_to_backend("/admin/approve")
+    file_id = request.form.get("file_id", "")
+    if (file_id or "").startswith("bd:"):
+        if not _baidu_enabled():
+            return "百度源暂未连接", 503
+        meta = _ai_pending_meta(file_id)
+        if meta is None:
+            return "该文件不在待审核里，无法通过", 403
+        _name = meta.get("name", file_id)
+        _expected = EXPECTED_SIZES.get(file_id)
+        if _expected:
+            try:
+                _actual = int(meta.get("size") or 0)
+            except Exception:
+                _actual = 0
+            if _actual != _expected:
+                return f"该文件还没传完，不能通过：云盘里只有 {_fmt_size(_actual)}，上传时应为 {_fmt_size(_expected)}，请等上传完成后再通过", 409
+        if not _baidu_move_pending_to_published(file_id[3:], _name):
+            return "移动到已发布失败，请重试", 503
+        _log("审核通过", _name)
+        return redirect("/admin")
     service = drive_service()
     if service is None:
         return "云盘暂未连接", 503
-    file_id = request.form.get("file_id", "")
     if not file_id or _admin_file_or_403(service, file_id) is None:
         return "该文件不在待审核里，无法通过", 403
     _info = get_file(service, file_id) or {}
@@ -3709,10 +4632,23 @@ def reject():
         return "请先在首页输入站长口令", 403
     if _is_relay():
         return _proxy_post_to_backend("/admin/reject")
+    file_id = request.form.get("file_id", "")
+    if (file_id or "").startswith("bd:"):
+        if not _baidu_enabled():
+            return "百度源暂未连接", 503
+        meta = _ai_pending_meta(file_id)
+        if meta is None:
+            return "该文件不在待审核里，无法处理", 403
+        try:
+            _raw = _baidu_meta(file_id[3:])
+            _baidu_delete_path(_raw.get("path") or "")
+        except Exception:
+            return "删除失败，请重试", 503
+        _log("审核不通过", meta.get("name", file_id))
+        return redirect("/admin")
     service = drive_service()
     if service is None:
         return "云盘暂未连接", 503
-    file_id = request.form.get("file_id", "")
     if not file_id or _admin_file_or_403(service, file_id) is None:
         return "该文件不在待审核里，无法处理", 403
     _name = (get_file(service, file_id) or {}).get("name", file_id)
@@ -3726,9 +4662,17 @@ def admin_published():
     if not _is_manager():
         return "请先在首页输入站长口令", 403
     if _is_relay():
-        files = _relay_files().get("published", [])
+        _rf = _relay_files()
+        if _rf is None:
+            try:
+                _bf, _bfo = _baidu_published()
+                files, _folders = _merge_mixed([], [], _bf, _bfo)
+            except Exception:
+                files = []
+        else:
+            files = _rf.get("published", [])
     else:
-        files, _fo = _list_published_tree(drive_service())
+        files, _fo, _notice = _cached_published(drive_service())
     return render_template_string(
         ADMIN_PUBLISHED_PAGE, files=files, drive_configured=True, is_secondary=_is_secondary()
     )
@@ -3746,6 +4690,22 @@ def admin_delete():
     file_id = request.form.get("file_id", "")
     if not file_id:
         return "没有文件", 403
+    if (file_id or "").startswith("bd:"):
+        if not _baidu_enabled():
+            return "百度源暂未连接", 503
+        try:
+            _meta = _baidu_meta(file_id[3:])
+        except Exception:
+            return "文件不存在或无权访问", 404
+        if _baidu_area(_meta.get("path") or "") != "published":
+            return "该文件不在已发布里，无法删除", 403
+        try:
+            _baidu_delete_path(_meta.get("path") or "")
+        except Exception:
+            return "删除失败，请重试", 503
+        _invalidate_pub_cache()
+        _log("删除已发布", _meta.get("server_filename", file_id))
+        return redirect("/admin/published")
     try:
         meta = get_file(service, file_id)
     except Exception:
@@ -3987,6 +4947,28 @@ def rename():
     new_name = _safe_filename(new_name)
     if not new_name:
         return "名字无效", 400
+    if (file_id or "").startswith("bd:"):
+        if not _is_manager():
+            return "只有站长区能改名，请先在站长区登录", 403
+        if not _baidu_enabled():
+            return "百度源暂未连接", 503
+        try:
+            _meta = _baidu_meta(file_id[3:])
+        except Exception:
+            return "文件不存在或无权访问", 404
+        _area = _baidu_area(_meta.get("path") or "")
+        if _area not in ("published", "pending"):
+            return "文件不存在或无权访问", 404
+        old_name = _meta.get("server_filename", "")
+        if "." not in new_name and "." in old_name:
+            new_name = new_name + "." + old_name.rsplit(".", 1)[-1]
+        try:
+            _baidu_rename_path(_meta.get("path") or "", new_name)
+        except Exception:
+            return "改名失败，请重试", 503
+        _invalidate_pub_cache()
+        _log("改名", f"{old_name} -> {new_name}")
+        return redirect(request.form.get("back", "/") or "/")
     try:
         meta = get_file(service, file_id)
     except Exception:
@@ -4021,6 +5003,21 @@ def folder_create():
     name = _safe_filename(request.form.get("name", ""))
     if not name or name == "全部" or len(name) > 50:
         return redirect("/?msg=文件夹名字无效#published")
+    if _priority_backend() == "baidu":
+        if not _baidu_enabled():
+            return redirect("/?msg=百度暂未连接，无法新建文件夹#published")
+        _base, _pub, _pend = _baidu_dirs()
+        try:
+            _existing = [e.get("server_filename") for e in _baidu_list_dir(_pub) if e.get("isdir")]
+        except Exception:
+            _existing = []
+        if name.lower() in [x.lower() for x in _existing]:
+            return redirect("/?msg=已有同名文件夹#published")
+        if not _baidu_mkdir(_pub + name):
+            return redirect("/?msg=新建文件夹失败，请重试#published")
+        _invalidate_pub_cache()
+        _log("新建文件夹", name)
+        return redirect(f"/?msg=已新建文件夹 {name}#published")
     for fo in _published_subfolders(service):
         if fo["name"].lower() == name.lower():
             return redirect("/?msg=已有同名文件夹#published")
@@ -4059,6 +5056,31 @@ def folder_move():
         dest_name = dm.get("name", dest_id)
     moved = 0
     for fid in file_ids:
+        if (fid or "").startswith("bd:"):
+            if not _baidu_enabled():
+                continue
+            try:
+                _meta = _baidu_meta(fid[3:])
+            except Exception:
+                continue
+            if _baidu_area(_meta.get("path") or "") != "published":
+                continue
+            _base, _pub, _pend = _baidu_dirs()
+            if dest_id == PUBLISHED_FOLDER_ID:
+                _dest_dir = _pub
+            elif (dest_id or "").startswith(_pub):
+                _dest_dir = dest_id if dest_id.endswith("/") else dest_id + "/"
+            else:
+                continue  # 不允许跨后端移动（设计第 1 节第 10 项）
+            _src_dir = (_meta.get("path") or "").rsplit("/", 1)[0] + "/"
+            if _src_dir == _dest_dir:
+                continue
+            try:
+                _baidu_move_path(_meta.get("path") or "", _dest_dir, _meta.get("server_filename") or "")
+                moved += 1
+            except Exception:
+                continue
+            continue
         try:
             meta = get_file(service, fid)
         except Exception:
