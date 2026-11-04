@@ -27,6 +27,7 @@
   GOOGLE_OAUTH_REFRESH_TOKEN：用户本人 OAuth 授权（推荐方式，文件记在
   用户自己的云盘空间里）。三项齐全时优先用 OAuth，否则回落到服务账号。
 - ADMIN_TOKEN：站长审核口令
+- SECONDARY_ADMIN_TOKEN：二级管理员口令（独立于站长口令；未配置时二级入口关闭；与站长口令相同时直接失效）
 - EXCHANGE_CODE：熟人进入网站的访问口令；未配置时首页会说明“口令由站长提供”
 - MAX_UPLOAD_MB：单文件上限（兆字节），默认 200，Render 免费版只有 512MB 内存
 """
@@ -81,6 +82,30 @@ def _has_gate(secret, cookie_name):
     return bool(value) and hmac.compare_digest(value, _gate_value(secret))
 
 
+def _is_admin():
+    token = _env("ADMIN_TOKEN")
+    return bool(token) and _has_gate(token, "admin_access")
+
+
+def _secondary_configured():
+    return bool(_env("SECONDARY_ADMIN_TOKEN"))
+
+
+def _is_secondary():
+    """二级管理员：独立口令、独立 cookie；与站长口令相同时直接失效，防止误配提权。"""
+    token = _env("SECONDARY_ADMIN_TOKEN")
+    if not token:
+        return False
+    if token == _env("ADMIN_TOKEN"):
+        return False
+    return _has_gate(token, "secondary_access")
+
+
+def _is_manager():
+    """站长或二级管理员。权限类写操作（账号改密码/禁用）不用它，另走 _is_admin。"""
+    return _is_admin() or _is_secondary()
+
+
 def _relay_backend():
     return (_env("RELAY_BACKEND") or "").rstrip("/")
 
@@ -95,7 +120,7 @@ def _proxy_to_backend(path):
     url = _relay_backend() + path
     # Forward only the gate cookies, never any other header
     cookies = {}
-    for _k in ("exchange_access", "admin_access", "feedback_user"):
+    for _k in ("exchange_access", "admin_access", "feedback_user", "secondary_access"):
         if _k in request.cookies:
             cookies[_k] = request.cookies[_k]
     try:
@@ -113,7 +138,7 @@ def _relay_files():
     """In relay mode, fetch published+pending lists from the backend (Render)."""
     import requests as _rq
     cookies = {}
-    for _k in ("exchange_access", "admin_access", "feedback_user"):
+    for _k in ("exchange_access", "admin_access", "feedback_user", "secondary_access"):
         if _k in request.cookies:
             cookies[_k] = request.cookies[_k]
     try:
@@ -127,7 +152,7 @@ def _proxy_post_to_backend(path):
     """Forward an admin POST form to the backend and return its result."""
     import requests as _rq
     cookies = {}
-    for _k in ("exchange_access", "admin_access", "feedback_user"):
+    for _k in ("exchange_access", "admin_access", "feedback_user", "secondary_access"):
         if _k in request.cookies:
             cookies[_k] = request.cookies[_k]
     try:
@@ -513,8 +538,7 @@ def _baidu_gate(meta):
         code = _env("EXCHANGE_CODE")
         return "published" if _has_gate(code, "exchange_access") else "need_gate"
     if area == "pending":
-        token = _env("ADMIN_TOKEN")
-        if token and _has_gate(token, "admin_access"):
+        if _is_manager():
             return "pending"
         return "need_admin"
     return None
@@ -866,8 +890,8 @@ def _private_account_ok(service, username):
 
 
 def _private_is_admin():
-    token = _env("ADMIN_TOKEN")
-    return bool(token) and _has_gate(token, "admin_access")
+    # 站长与二级管理员都能管理私人文件；账号密码与权限变更另有硬拦截。
+    return _is_manager()
 
 
 FEEDBACK_FILE_NAME = "交换站意见.txt"
@@ -930,6 +954,83 @@ def _write_feedback(service, items_oldest_first):
         return False
 
 
+
+COMMENTS_FILE_NAME = "交换站留言.txt"
+
+
+def _comment_file_id(service):
+    if _env("COMMENTS_DRIVE_FILE_ID"):
+        return _env("COMMENTS_DRIVE_FILE_ID")
+    try:
+        res = service.files().list(q=f"name = '{COMMENTS_FILE_NAME}' and trashed = false", fields="files(id)", pageSize=5).execute()
+        fl = res.get("files") or []
+        return fl[0]["id"] if fl else None
+    except Exception:
+        return None
+
+
+def _read_comments(service):
+    """Return all comments newest first: {id, time, file_id, author, text}.
+    存储复用意见区思路：云盘根目录一个 txt，tab 分隔行，磁盘上最旧在前。
+    根目录文件绝不会出现在已发布文件夹列表里，所以留言文件本身不成格子。"""
+    if service is None:
+        return []
+    try:
+        fid = _comment_file_id(service)
+        if not fid:
+            return []
+        from googleapiclient.http import MediaIoBaseDownload
+        buf = io.BytesIO()
+        dl = MediaIoBaseDownload(buf, service.files().get_media(fileId=fid))
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        items = []
+        for line in buf.getvalue().decode("utf-8", errors="ignore").strip().split("\n"):
+            if not line.strip():
+                continue
+            parts = line.split("\t", 4)
+            if len(parts) >= 5:
+                items.append({"id": parts[0], "time": parts[1], "file_id": parts[2], "author": parts[3], "text": parts[4]})
+        items.reverse()
+        return items
+    except Exception:
+        return []
+
+
+def _write_comments(service, items_oldest_first):
+    """Overwrite the Drive comments file with items in oldest-first order."""
+    from googleapiclient.http import MediaIoBaseUpload
+    body = "\n".join(f"{it['id']}\t{it['time']}\t{it['file_id']}\t{it['author']}\t{it['text']}" for it in items_oldest_first)
+    media = MediaIoBaseUpload(io.BytesIO(body.encode("utf-8")), mimetype="text/plain", resumable=False)
+    try:
+        fid = _comment_file_id(service)
+        if fid:
+            service.files().update(fileId=fid, media_body=media).execute()
+        else:
+            meta = {"name": COMMENTS_FILE_NAME, "mimeType": "text/plain"}
+            service.files().create(body=meta, media_body=media, fields="id").execute()
+        return True
+    except Exception as e:
+        print(f"[comments] write failed: {e}", flush=True)
+        return False
+
+
+def _comments_for(service, file_id):
+    """Comments for one file, oldest first (display order)."""
+    return [c for c in reversed(_read_comments(service)) if c["file_id"] == file_id]
+
+
+def _published_file_exists(service, file_id):
+    """True if file_id is in the published tree (Google or Baidu).
+    文件被删除后它就不在这里，留言随之失效/隐藏，不报错。"""
+    try:
+        files, _folders = _cached_published(service)
+        return any(f.get("id") == file_id for f in files)
+    except Exception:
+        return False
+
+
 def _log(action, detail=""):
     """访问日志：只记时间、IP、动作、文件名，不记任何口令、密钥、完整 UA。
     内存里留近期 500 条供站长区查看，同时每 20 条或每次站长操作后缓冲写进
@@ -938,12 +1039,14 @@ def _log(action, detail=""):
     ua = request.headers.get("User-Agent", "")
     device = "手机" if ("Mobile" in ua or "Android" in ua or "iPhone" in ua) else "电脑"
     now = datetime.now(timezone.utc) + timedelta(hours=8)
+    if _is_secondary() and not _is_admin():
+        action = action + "（二级管理员）"
     entry = {"time": now.strftime("%Y-%m-%d %H:%M"), "ip": ip, "loc": "", "device": device, "action": action, "detail": detail}
     ACCESS_LOG.appendleft(entry)
     line = f"{entry['time']} {ip} {entry['loc']} {device} {action} {detail}\n"
     print(f"[access] {line.strip()}", flush=True)
     _DRIVE_LOG_BUFFER.append(line)
-    if len(_DRIVE_LOG_BUFFER) >= 20 or action in ("审核通过", "审核不通过", "删除已发布", "改名"):
+    if len(_DRIVE_LOG_BUFFER) >= 20 or any(action.startswith(a) for a in ("审核通过", "审核不通过", "删除已发布", "改名")):
         _flush_drive_log()
 
 
@@ -1408,7 +1511,7 @@ PAGE = (
     "var dropped=0;function addQ(fs){var before=queue.length;Array.from(fs).forEach(function(f){if(queue.length<30){queue.push(f);}else{dropped++;}});syncInput();show();}"
     "i.addEventListener('change',function(){addQ(i.files);});</script>"
     "{% if msg %}<p class=\"note\">{{ msg }}</p>{% endif %}</div></div>"
-    '<div class="tabpanel active" id="tab-published"><div class="pub-toolbar"><input class="search" id="search" type="search" placeholder="搜索文件名…" oninput="onSearch(this.value)"><button class="btn" id="openDrawerBtn" type="button">导航</button><button class="btn" id="selBtn" type="button">选择</button></div><section class="card section"><div class="section-head"><h2>已发布</h2><span class="count">{{ files|length }} 个</span></div>{% if msg %}<p class="note" style="margin-top:10px">{{ msg }}</p>{% endif %}<div class="folderbar" id="folderbar"><button class="tab active" data-folder="all" onclick="showFolder(\'all\',this)">全部（{{ files|length }}）</button>{% for fo in folders %}<button class="tab" data-folder="{{ fo.id }}" onclick="showFolder(\'{{ fo.id }}\',this)">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}<button class="tab" id="newFolderBtn" type="button">+ 新建文件夹</button></div><form id="newFolderForm" method="post" action="/folder/create" style="display:none;gap:8px;margin-top:10px"><input class="textin" name="name" placeholder="新文件夹名字，比如：旅行" required maxlength="50" style="flex:1"><button class="btn primary" type="submit">创建</button><button class="btn" type="button" id="newFolderCancel">取消</button></form><div class="tabs" id="cattabs"><button class="tab active" onclick="showCat(\'全部\',this)">全部（{{ files|length }}）</button>{% for c in cats %}{% if c.count %}<button class="tab" onclick="showCat(\'{{ c.name }}\',this)">{{ c.name }}（{{ c.count }}）</button>{% endif %}{% endfor %}</div><form id="moveForm" method="post" action="/folder/move" style="display:none;margin-top:12px;margin-bottom:4px;gap:8px;flex-wrap:wrap;align-items:center"><span id="selCount" style="font-weight:800"></span><input type="hidden" name="dest_folder_id" id="moveDest"><input type="hidden" name="file_ids" id="moveFileIds"><button class="btn primary" type="button" id="moveBtn">移动</button><button class="btn" type="button" id="dlSelBtn">选择下载</button></form><div class="album-grid" id="albumGrid">{% for f in files %}<div class="tile" data-cat="{{ f.kind }}" data-folder="{{ f.folder_id }}" data-name="{{ f.name|lower }}" data-id="{{ f.id }}" data-dl="/download/{{ f.id }}" data-view="/view/{{ f.id }}" data-isimg="{{ \'1\' if f.is_image else \'0\' }}" data-isvid="{{ \'1\' if f.is_video else \'0\' }}" data-isaud="{{ \'1\' if f.is_audio else \'0\' }}" data-size="{{ f.size_bytes }}"><span class="tile-check"></span>{% if f.is_image or f.is_video %}<img class="tileimg" src="/thumb/{{ f.id }}" data-fb="/thumb/{{ f.id }}" alt="" loading="lazy" onerror="_thumbErr(this)"><div class="tilefic" style="display:none"></div>{% else %}<div class="tilefic"></div>{% endif %}<div class="tileinfo"><div class="tile-name" style="display:none">{{ f.name }}</div><div class="tile-meta">{{ f.kind }} · {{ f.size }}{% if f.source == "baidu" %} · 百度{% endif %}</div></div><span class="tile-dl">↓ {{ f.dl_count|default(0) }}</span></div>{% endfor %}</div><p class="empty" id="folderEmpty" style="display:none">这个文件夹里还没有文件。</p>{% if not files %}<p class="empty">目前还没有已发布的文件。</p>{% endif %}<p class="note">点图片默认就是预览；点右上角“选择”，再点图片打勾，就可以批量下载或移动到文件夹。</p></section><div id="previewOverlay"><div id="previewCard"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b id="previewTitle" style="word-break:break-all"></b><button class="btn" id="previewClose" type="button">关闭</button></div><div id="previewBody" style="margin-top:12px"></div></div></div><div id="moveOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40;align-items:center;justify-content:center;padding:16px;box-sizing:border-box"><div style="background:var(--surface);border-radius:18px;padding:16px;width:100%;max-width:420px;max-height:90vh;overflow:auto"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b>移到哪里？</b><button class="btn" type="button" id="moveCancel">取消</button></div><p class="note" style="margin-top:8px">点一个文件夹，选中的文件就会移过去。</p><button class="btn" type="button" data-dest="{{ published_id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">已发布根目录</button>{% for fo in folders %}<button class="btn" type="button" data-dest="{{ fo.id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}</div></div><script>var curCat=\'全部\',curFolder=\'all\',curQ=\'\',selectMode=false,selected=new Set();function applyFilter(){var vis=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){var okCat=curCat===\'全部\'||t.dataset.cat===curCat;var okFolder=curFolder===\'all\'||t.dataset.folder===curFolder;var okQ=t.dataset.name.includes(curQ);var show=(okCat&&okFolder&&okQ);var _nm=t.querySelector(\'.tile-name\');if(_nm)_nm.style.display=(show&&curQ)?\'\':\'none\';t.style.display=show?\'\':\'none\';if(show)vis++;});var fe=document.getElementById(\'folderEmpty\');if(fe)fe.style.display=(curFolder!==\'all\'&&vis===0)?\'block\':\'none\';}function showCat(c,el){curCat=c;document.querySelectorAll(\'#cattabs .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function showFolder(fid,el){curFolder=fid;document.querySelectorAll(\'#folderbar .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function onSearch(v){curQ=v.toLowerCase();applyFilter();}function updateSel(){var mf=document.getElementById(\'moveForm\');var sc=document.getElementById(\'selCount\');var ids=document.getElementById(\'moveFileIds\');if(sc)sc.textContent=\'已选 \'+selected.size+\' 个 · 选择模式中，点图片是打勾，点右上角“取消选择”退出后才能查看\';if(ids)ids.value=Array.from(selected).join(\',\');if(mf)mf.style.display=selected.size?\'flex\':\'none\';}function _thumbErr(im){if(!im.dataset.fbDone&&im.dataset.fb){im.dataset.fbDone=\'1\';im.src=im.dataset.fb;return;}im.style.display=\'none\';var nx=im.nextElementSibling;if(nx)nx.style.display=\'grid\';}function openPreview(t){var ov=document.getElementById(\'previewOverlay\');var ti=document.getElementById(\'previewTitle\');var bd=document.getElementById(\'previewBody\');if(!ov||!ti||!bd)return;ti.textContent=t.querySelector(\'.tile-name\').textContent;var view=t.dataset.view,dl=t.dataset.dl;if(t.dataset.isimg===\'1\'){var _th=t.querySelector(\'.tileimg\');var _tu=_th?_th.getAttribute(\'src\'):\'\';bd.innerHTML=\'<img id="pvThumb" src="\'+_tu+\'" style="width:100%;border-radius:12px"><img id="pvOrig" src="\'+view+\'" style="width:100%;border-radius:12px;display:none"><p class="note" id="previewErr" style="display:none">图片预览加载失败，可能是原图太大或网络中断，点下面下载后本地查看。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载原图</a>\';var _im=bd.querySelector(\'img\');if(_im){_im.onerror=function(){_im.style.display=\'none\';var e=document.getElementById(\'previewErr\');if(e)e.style.display=\'block\';};}var _og=bd.querySelector(\'#pvOrig\');var _tb=bd.querySelector(\'#pvThumb\');if(_og){_og.onload=function(){if(_tb)_tb.style.display=\'none\';_og.style.display=\'block\';};}}else if(t.dataset.isvid===\'1\'){bd.innerHTML=\'<video id="pvVideo" controls preload="metadata" src="\'+view+\'" style="width:100%;border-radius:12px"></video><div style="display:none;gap:8px;margin:10px 0"><button class="btn" id="qLowBtn" type="button">流畅</button><button class="btn" id="qHighBtn" type="button">高清</button></div><div id="qNote" class="note"></div><p class="note">大视频在线播需要先缓冲一会儿；如果一直转圈，点下面下载后本地播放更快。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载视频</a>\';var _vid=bd.querySelector(\'#pvVideo\');var _ql=bd.querySelector(\'#qLowBtn\');var _qh=bd.querySelector(\'#qHighBtn\');var _qn=bd.querySelector(\'#qNote\');var _qrow=_ql?_ql.parentElement:null;function _setQ(mode,play){if(!_vid)return;if(mode===\'low\'){_vid.src=\'/preview/\'+t.dataset.id;}else{_vid.src=view;}_vid.load();if(play){try{_vid.play();}catch(e){}}if(_ql){_ql.style.background=mode===\'low\'?\'var(--green)\':\'\';_ql.style.color=mode===\'low\'?\'#fff\':\'\';}if(_qh){_qh.style.background=mode===\'high\'?\'var(--green)\':\'\';_qh.style.color=mode===\'high\'?\'#fff\':\'\';}try{localStorage.setItem(\'video_quality\',mode);}catch(e){}}if(_ql)_ql.addEventListener(\'click\',function(){_setQ(\'low\',true);});if(_qh)_qh.addEventListener(\'click\',function(){_setQ(\'high\',true);});if(_vid)_vid.addEventListener(\'error\',function(){if(_vid.src.indexOf(\'/preview/\')>=0){_vid.src=view;_vid.load();}});fetch(\'/preview_status/\'+t.dataset.id).then(function(r){return r.json();}).then(function(j){if(j.has_preview){if(_qrow)_qrow.style.display=\'flex\';var saved=null;try{saved=localStorage.getItem(\'video_quality\');}catch(e){}_setQ(saved===\'high\'?\'high\':\'low\',false);if(_qn)_qn.textContent=\'流畅版是低清预览，起播快；点高清切回原片，加载慢自己受着。\';}else{if(_qrow)_qrow.style.display=\'none\';if(_qn)_qn.textContent=\'低清版还没生成，先看原片。\';}}).catch(function(){if(_qrow)_qrow.style.display=\'none\';});}else if(t.dataset.isaud===\'1\'){bd.innerHTML=\'<audio controls src="\'+view+\'" style="width:100%"></audio>\';}else if(t.dataset.cat===\'文档\'){bd.innerHTML=\'<iframe src="\'+view+\'" style="width:100%;height:420px;border:0;border-radius:12px"></iframe><p style="margin-top:10px"><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a></p>\';}else{bd.innerHTML=\'<p class="note">这个类型不能在线预览，请下载后打开。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a>\';}ov.style.display=\'flex\';}function closePreview(){var ov=document.getElementById(\'previewOverlay\');var bd=document.getElementById(\'previewBody\');if(bd){bd.querySelectorAll(\'video,audio\').forEach(function(m){m.pause();m.removeAttribute(\'src\');m.load();});bd.innerHTML=\'\';}if(ov)ov.style.display=\'none\';}function dlTile(t){var url=t.dataset.dl;var name=t.querySelector(\'.tile-name\').textContent;var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.responseType=\'blob\';x.onload=function(){if(x.status===200){var a=document.createElement(\'a\');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}else{alert(\'下载失败，请重试\');}};x.onerror=function(){alert(\'下载失败，请检查网络后重试\');};x.send();}document.getElementById(\'albumGrid\').addEventListener(\'click\',function(e){var t=e.target.closest(\'.tile\');if(!t)return;if(selectMode){var id=t.dataset.id;if(selected.has(id)){selected.delete(id);t.classList.remove(\'selected\');}else{selected.add(id);t.classList.add(\'selected\');}updateSel();}else{openPreview(t);}});document.getElementById(\'previewClose\').addEventListener(\'click\',closePreview);document.getElementById(\'previewOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'previewOverlay\')closePreview();});document.getElementById(\'selBtn\').addEventListener(\'click\',function(){selectMode=!selectMode;var g=document.getElementById(\'albumGrid\');if(selectMode){g.classList.add(\'selecting\');this.textContent=\'取消选择\';}else{selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});g.classList.remove(\'selecting\');this.textContent=\'选择\';}updateSel();});document.getElementById(\'dlSelBtn\').addEventListener(\'click\',function(){var tiles=[];document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(selected.has(t.dataset.id))tiles.push(t);});if(!tiles.length)return;var i=0;function next(){if(i>=tiles.length){alert(\'已开始下载 \'+tiles.length+\' 个文件（浏览器可能逐个询问是否允许多个下载）。\');selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});document.getElementById(\'albumGrid\').classList.remove(\'selecting\');selectMode=false;document.getElementById(\'selBtn\').textContent=\'选择\';updateSel();return;}dlTile(tiles[i]);i++;setTimeout(next,600);}next();});document.getElementById(\'newFolderBtn\').addEventListener(\'click\',function(){var f=document.getElementById(\'newFolderForm\');f.style.display=\'flex\';});document.getElementById(\'newFolderCancel\').addEventListener(\'click\',function(){document.getElementById(\'newFolderForm\').style.display=\'none\';});document.getElementById(\'moveForm\').addEventListener(\'submit\',function(e){if(!selected.size){e.preventDefault();alert(\'请先勾选文件\');}});document.getElementById(\'moveBtn\').addEventListener(\'click\',function(){if(!selected.size){alert(\'请先勾选文件\');return;}var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'flex\';});document.getElementById(\'moveCancel\').addEventListener(\'click\',function(){var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'none\';});document.getElementById(\'moveOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'moveOverlay\'){e.target.style.display=\'none\';}});document.querySelectorAll(\'#moveOverlay [data-dest]\').forEach(function(b){b.addEventListener(\'click\',function(){var d=document.getElementById(\'moveDest\');if(d)d.value=b.dataset.dest;document.getElementById(\'moveForm\').submit();});});function _segDl(url,name,size,progEl,doneCb){var CH=8*1024*1024,PAR=3,TRY=3,total=Math.ceil(size/CH),parts=new Array(total),done=0,failed=false,next=0,inflight=0;function show(){if(progEl)progEl.textContent=\'下载中 \'+Math.round(done/total*100)+\'%（\'+(done*CH>size?size:done*CH)+\' / \'+size+\' 字节）\';}function fetchC(idx,att,cb){var st=idx*CH,en=Math.min(size-1,st+CH-1);var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.setRequestHeader(\'Range\',\'bytes=\'+st+\'-\'+en);x.responseType=\'blob\';x.onload=function(){if(x.status===206||x.status===200){cb(null,x.response);}else if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk failed\'));}};x.onerror=function(){if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk network error\'));}};x.send();}function launch(){while(!failed&&inflight<PAR&&next<total){(function(idx){inflight++;fetchC(idx,0,function(err,blob){inflight--;if(failed)return;if(err){failed=true;if(doneCb)doneCb(err);return;}parts[idx]=blob;done++;show();if(done===total){var a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob(parts));a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);if(doneCb)doneCb(null);}else{launch();}});})(next);next++;}}show();launch();}document.getElementById(\'previewBody\').addEventListener(\'click\',function(e){var a=e.target.closest?e.target.closest(\'.segdl\'):null;if(!a)return;var sz=parseInt(a.dataset.size||\'0\',10);if(!sz||sz<20*1024*1024||sz>500*1024*1024)return;e.preventDefault();var prog=document.getElementById(\'segProg\');if(!prog){prog=document.createElement(\'div\');prog.id=\'segProg\';prog.className=\'note\';var _pb=document.getElementById(\'previewBody\');if(_pb)_pb.appendChild(prog);}_segDl(a.dataset.dl,a.dataset.name||\'download\',sz,prog,function(err){if(err&&prog)prog.textContent=\'下载失败，请重试\';else if(prog)prog.textContent=\'下载完成\';});});var _pre={};function _preOrig(t){if(!t||t.dataset.isimg!==\'1\')return;var u=t.dataset.view;if(!u||_pre[u])return;_pre[u]=1;var im=new Image();im.src=u;}document.addEventListener(\'touchstart\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);},{passive:true});document.addEventListener(\'mouseover\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);});function _preVisible(){if(navigator.connection&&navigator.connection.saveData)return;var n=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(n>=6)return;if(t.style.display===\'none\')return;var r=t.getBoundingClientRect();if(r.bottom<0||r.top>window.innerHeight)return;var b=Object.keys(_pre).length;_preOrig(t);if(Object.keys(_pre).length>b)n++;});}if(\'requestIdleCallback\' in window){requestIdleCallback(_preVisible,{timeout:2000});}else{setTimeout(_preVisible,1500);}</script></div>'
+    '<div class="tabpanel active" id="tab-published"><div class="pub-toolbar"><input class="search" id="search" type="search" placeholder="搜索文件名…" oninput="onSearch(this.value)"><button class="btn" id="openDrawerBtn" type="button">导航</button><button class="btn" id="selBtn" type="button">选择</button></div><section class="card section"><div class="section-head"><h2>已发布</h2><span class="count">{{ files|length }} 个</span></div>{% if msg %}<p class="note" style="margin-top:10px">{{ msg }}</p>{% endif %}<div class="folderbar" id="folderbar"><button class="tab active" data-folder="all" onclick="showFolder(\'all\',this)">全部（{{ files|length }}）</button>{% for fo in folders %}<button class="tab" data-folder="{{ fo.id }}" onclick="showFolder(\'{{ fo.id }}\',this)">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}<button class="tab" id="newFolderBtn" type="button">+ 新建文件夹</button></div><form id="newFolderForm" method="post" action="/folder/create" style="display:none;gap:8px;margin-top:10px"><input class="textin" name="name" placeholder="新文件夹名字，比如：旅行" required maxlength="50" style="flex:1"><button class="btn primary" type="submit">创建</button><button class="btn" type="button" id="newFolderCancel">取消</button></form><div class="tabs" id="cattabs"><button class="tab active" onclick="showCat(\'全部\',this)">全部（{{ files|length }}）</button>{% for c in cats %}{% if c.count %}<button class="tab" onclick="showCat(\'{{ c.name }}\',this)">{{ c.name }}（{{ c.count }}）</button>{% endif %}{% endfor %}</div><form id="moveForm" method="post" action="/folder/move" style="display:none;margin-top:12px;margin-bottom:4px;gap:8px;flex-wrap:wrap;align-items:center"><span id="selCount" style="font-weight:800"></span><input type="hidden" name="dest_folder_id" id="moveDest"><input type="hidden" name="file_ids" id="moveFileIds"><button class="btn primary" type="button" id="moveBtn">移动</button><button class="btn" type="button" id="dlSelBtn">选择下载</button></form><div class="album-grid" id="albumGrid">{% for f in files %}<div class="tile" data-cat="{{ f.kind }}" data-folder="{{ f.folder_id }}" data-name="{{ f.name|lower }}" data-id="{{ f.id }}" data-dl="/download/{{ f.id }}" data-view="/view/{{ f.id }}" data-isimg="{{ \'1\' if f.is_image else \'0\' }}" data-isvid="{{ \'1\' if f.is_video else \'0\' }}" data-isaud="{{ \'1\' if f.is_audio else \'0\' }}" data-size="{{ f.size_bytes }}"><span class="tile-check"></span>{% if f.is_image or f.is_video %}<img class="tileimg" src="/thumb/{{ f.id }}" data-fb="/thumb/{{ f.id }}" alt="" loading="lazy" onerror="_thumbErr(this)"><div class="tilefic" style="display:none"></div>{% else %}<div class="tilefic"></div>{% endif %}<div class="tileinfo"><div class="tile-name" style="display:none">{{ f.name }}</div><div class="tile-meta">{{ f.kind }} · {{ f.size }}{% if f.source == "baidu" %} · 百度{% endif %}</div></div><span class="tile-dl">↓ {{ f.dl_count|default(0) }}</span></div>{% endfor %}</div><p class="empty" id="folderEmpty" style="display:none">这个文件夹里还没有文件。</p>{% if not files %}<p class="empty">目前还没有已发布的文件。</p>{% endif %}<p class="note">点图片默认就是预览；点右上角“选择”，再点图片打勾，就可以批量下载或移动到文件夹。</p></section><div id="previewOverlay"><div id="previewCard"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b id="previewTitle" style="word-break:break-all"></b><button class="btn" id="previewClose" type="button">关闭</button></div><div id="previewBody" style="margin-top:12px"></div></div></div><div id="moveOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40;align-items:center;justify-content:center;padding:16px;box-sizing:border-box"><div style="background:var(--surface);border-radius:18px;padding:16px;width:100%;max-width:420px;max-height:90vh;overflow:auto"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b>移到哪里？</b><button class="btn" type="button" id="moveCancel">取消</button></div><p class="note" style="margin-top:8px">点一个文件夹，选中的文件就会移过去。</p><button class="btn" type="button" data-dest="{{ published_id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">已发布根目录</button>{% for fo in folders %}<button class="btn" type="button" data-dest="{{ fo.id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}</div></div><script>var curCat=\'全部\',curFolder=\'all\',curQ=\'\',selectMode=false,selected=new Set();function applyFilter(){var vis=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){var okCat=curCat===\'全部\'||t.dataset.cat===curCat;var okFolder=curFolder===\'all\'||t.dataset.folder===curFolder;var okQ=t.dataset.name.includes(curQ);var show=(okCat&&okFolder&&okQ);var _nm=t.querySelector(\'.tile-name\');if(_nm)_nm.style.display=(show&&curQ)?\'\':\'none\';t.style.display=show?\'\':\'none\';if(show)vis++;});var fe=document.getElementById(\'folderEmpty\');if(fe)fe.style.display=(curFolder!==\'all\'&&vis===0)?\'block\':\'none\';}function showCat(c,el){curCat=c;document.querySelectorAll(\'#cattabs .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function showFolder(fid,el){curFolder=fid;document.querySelectorAll(\'#folderbar .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function onSearch(v){curQ=v.toLowerCase();applyFilter();}function updateSel(){var mf=document.getElementById(\'moveForm\');var sc=document.getElementById(\'selCount\');var ids=document.getElementById(\'moveFileIds\');if(sc)sc.textContent=\'已选 \'+selected.size+\' 个 · 选择模式中，点图片是打勾，点右上角“取消选择”退出后才能查看\';if(ids)ids.value=Array.from(selected).join(\',\');if(mf)mf.style.display=selected.size?\'flex\':\'none\';}function _thumbErr(im){if(!im.dataset.fbDone&&im.dataset.fb){im.dataset.fbDone=\'1\';im.src=im.dataset.fb;return;}im.style.display=\'none\';var nx=im.nextElementSibling;if(nx)nx.style.display=\'grid\';}function openPreview(t){var ov=document.getElementById(\'previewOverlay\');var ti=document.getElementById(\'previewTitle\');var bd=document.getElementById(\'previewBody\');if(!ov||!ti||!bd)return;ti.textContent=t.querySelector(\'.tile-name\').textContent;var view=t.dataset.view,dl=t.dataset.dl;if(t.dataset.isimg===\'1\'){var _th=t.querySelector(\'.tileimg\');var _tu=_th?_th.getAttribute(\'src\'):\'\';bd.innerHTML=\'<img id="pvThumb" src="\'+_tu+\'" style="width:100%;border-radius:12px"><img id="pvOrig" src="\'+view+\'" style="width:100%;border-radius:12px;display:none"><p class="note" id="previewErr" style="display:none">图片预览加载失败，可能是原图太大或网络中断，点下面下载后本地查看。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载原图</a>\';var _im=bd.querySelector(\'img\');if(_im){_im.onerror=function(){_im.style.display=\'none\';var e=document.getElementById(\'previewErr\');if(e)e.style.display=\'block\';};}var _og=bd.querySelector(\'#pvOrig\');var _tb=bd.querySelector(\'#pvThumb\');if(_og){_og.onload=function(){if(_tb)_tb.style.display=\'none\';_og.style.display=\'block\';};}}else if(t.dataset.isvid===\'1\'){bd.innerHTML=\'<video id="pvVideo" controls preload="metadata" src="\'+view+\'" style="width:100%;border-radius:12px"></video><div style="display:none;gap:8px;margin:10px 0"><button class="btn" id="qLowBtn" type="button">流畅</button><button class="btn" id="qHighBtn" type="button">高清</button></div><div id="qNote" class="note"></div><p class="note">大视频在线播需要先缓冲一会儿；如果一直转圈，点下面下载后本地播放更快。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载视频</a>\';var _vid=bd.querySelector(\'#pvVideo\');var _ql=bd.querySelector(\'#qLowBtn\');var _qh=bd.querySelector(\'#qHighBtn\');var _qn=bd.querySelector(\'#qNote\');var _qrow=_ql?_ql.parentElement:null;function _setQ(mode,play){if(!_vid)return;if(mode===\'low\'){_vid.src=\'/preview/\'+t.dataset.id;}else{_vid.src=view;}_vid.load();if(play){try{_vid.play();}catch(e){}}if(_ql){_ql.style.background=mode===\'low\'?\'var(--green)\':\'\';_ql.style.color=mode===\'low\'?\'#fff\':\'\';}if(_qh){_qh.style.background=mode===\'high\'?\'var(--green)\':\'\';_qh.style.color=mode===\'high\'?\'#fff\':\'\';}try{localStorage.setItem(\'video_quality\',mode);}catch(e){}}if(_ql)_ql.addEventListener(\'click\',function(){_setQ(\'low\',true);});if(_qh)_qh.addEventListener(\'click\',function(){_setQ(\'high\',true);});if(_vid)_vid.addEventListener(\'error\',function(){if(_vid.src.indexOf(\'/preview/\')>=0){_vid.src=view;_vid.load();}});fetch(\'/preview_status/\'+t.dataset.id).then(function(r){return r.json();}).then(function(j){if(j.has_preview){if(_qrow)_qrow.style.display=\'flex\';var saved=null;try{saved=localStorage.getItem(\'video_quality\');}catch(e){}_setQ(saved===\'high\'?\'high\':\'low\',false);if(_qn)_qn.textContent=\'流畅版是低清预览，起播快；点高清切回原片，加载慢自己受着。\';}else{if(_qrow)_qrow.style.display=\'none\';if(_qn)_qn.textContent=\'低清版还没生成，先看原片。\';}}).catch(function(){if(_qrow)_qrow.style.display=\'none\';});}else if(t.dataset.isaud===\'1\'){bd.innerHTML=\'<audio controls src="\'+view+\'" style="width:100%"></audio>\';}else if(t.dataset.cat===\'文档\'){bd.innerHTML=\'<iframe src="\'+view+\'" style="width:100%;height:420px;border:0;border-radius:12px"></iframe><p style="margin-top:10px"><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a></p>\';}else{bd.innerHTML=\'<p class="note">这个类型不能在线预览，请下载后打开。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a>\';}ov.style.display=\'flex\';_loadComments(t.dataset.id);}function _escHtml(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");} function _loadComments(fid){var card=document.getElementById(\'previewCard\');if(!card)return;var cs=document.getElementById(\'commentSection\');if(!cs){cs=document.createElement(\'div\');cs.id=\'commentSection\';card.appendChild(cs);}cs.innerHTML=\'<div style="margin-top:14px;border-top:1px solid var(--line);padding-top:10px"><b>留言</b><div id="commentList" style="margin-top:8px">加载留言中…</div><input id="commentNick" placeholder="昵称（不填就是匿名）" maxlength="50" style="width:100%;margin-top:8px;box-sizing:border-box"><textarea id="commentText" rows="2" placeholder="写下你的留言…" maxlength="500" style="width:100%;margin-top:6px;box-sizing:border-box"></textarea><button class="btn primary" id="commentSend" type="button" style="margin-top:6px">发送留言</button><div id="commentMsg" class="note"></div></div>\';var list=cs.querySelector(\'#commentList\');function render(items){if(!items||!items.length){list.innerHTML=\'<p class="note">还没有留言。</p>\';return;}list.innerHTML=items.map(function(c){return \'<div style="margin-bottom:8px"><div style="font-weight:800;font-size:13px">\'+_escHtml(c.author||\'匿名\')+\' <span style="font-weight:400;color:var(--muted);font-size:11px">\'+_escHtml(c.time||\'\')+\'</span></div><div style="font-size:13px;word-break:break-all">\'+_escHtml(c.text||\'\')+\'</div></div>\';}).join(\'\');}function reload(){fetch(\'/comments/\'+encodeURIComponent(fid)).then(function(r){return r.json();}).then(function(j){render(j.comments);}).catch(function(){list.innerHTML=\'<p class="note">留言加载失败，稍后再试。</p>\';});}reload();var btn=cs.querySelector(\'#commentSend\');if(btn){btn.onclick=function(){var nick=cs.querySelector(\'#commentNick\').value;var txt=cs.querySelector(\'#commentText\').value;var msg=cs.querySelector(\'#commentMsg\');if(!txt.trim()){msg.textContent=\'留言不能为空\';return;}msg.textContent=\'发送中…\';var fd=new FormData();fd.append(\'author\',nick);fd.append(\'text\',txt);fetch(\'/comments/\'+encodeURIComponent(fid),{method:\'POST\',body:fd}).then(function(r){return r.json();}).then(function(j){if(j.ok){cs.querySelector(\'#commentText\').value=\'\';msg.textContent=\'已发送\';reload();}else{msg.textContent=j.error||\'发送失败\';}}).catch(function(){msg.textContent=\'发送失败，请重试\';});};}} function closePreview(){var ov=document.getElementById(\'previewOverlay\');var bd=document.getElementById(\'previewBody\');if(bd){bd.querySelectorAll(\'video,audio\').forEach(function(m){m.pause();m.removeAttribute(\'src\');m.load();});bd.innerHTML=\'\';}if(ov)ov.style.display=\'none\';}function dlTile(t){var url=t.dataset.dl;var name=t.querySelector(\'.tile-name\').textContent;var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.responseType=\'blob\';x.onload=function(){if(x.status===200){var a=document.createElement(\'a\');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}else{alert(\'下载失败，请重试\');}};x.onerror=function(){alert(\'下载失败，请检查网络后重试\');};x.send();}document.getElementById(\'albumGrid\').addEventListener(\'click\',function(e){var t=e.target.closest(\'.tile\');if(!t)return;if(selectMode){var id=t.dataset.id;if(selected.has(id)){selected.delete(id);t.classList.remove(\'selected\');}else{selected.add(id);t.classList.add(\'selected\');}updateSel();}else{openPreview(t);}});document.getElementById(\'previewClose\').addEventListener(\'click\',closePreview);document.getElementById(\'previewOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'previewOverlay\')closePreview();});document.getElementById(\'selBtn\').addEventListener(\'click\',function(){selectMode=!selectMode;var g=document.getElementById(\'albumGrid\');if(selectMode){g.classList.add(\'selecting\');this.textContent=\'取消选择\';}else{selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});g.classList.remove(\'selecting\');this.textContent=\'选择\';}updateSel();});document.getElementById(\'dlSelBtn\').addEventListener(\'click\',function(){var tiles=[];document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(selected.has(t.dataset.id))tiles.push(t);});if(!tiles.length)return;var i=0;function next(){if(i>=tiles.length){alert(\'已开始下载 \'+tiles.length+\' 个文件（浏览器可能逐个询问是否允许多个下载）。\');selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});document.getElementById(\'albumGrid\').classList.remove(\'selecting\');selectMode=false;document.getElementById(\'selBtn\').textContent=\'选择\';updateSel();return;}dlTile(tiles[i]);i++;setTimeout(next,600);}next();});document.getElementById(\'newFolderBtn\').addEventListener(\'click\',function(){var f=document.getElementById(\'newFolderForm\');f.style.display=\'flex\';});document.getElementById(\'newFolderCancel\').addEventListener(\'click\',function(){document.getElementById(\'newFolderForm\').style.display=\'none\';});document.getElementById(\'moveForm\').addEventListener(\'submit\',function(e){if(!selected.size){e.preventDefault();alert(\'请先勾选文件\');}});document.getElementById(\'moveBtn\').addEventListener(\'click\',function(){if(!selected.size){alert(\'请先勾选文件\');return;}var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'flex\';});document.getElementById(\'moveCancel\').addEventListener(\'click\',function(){var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'none\';});document.getElementById(\'moveOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'moveOverlay\'){e.target.style.display=\'none\';}});document.querySelectorAll(\'#moveOverlay [data-dest]\').forEach(function(b){b.addEventListener(\'click\',function(){var d=document.getElementById(\'moveDest\');if(d)d.value=b.dataset.dest;document.getElementById(\'moveForm\').submit();});});function _segDl(url,name,size,progEl,doneCb){var CH=8*1024*1024,PAR=3,TRY=3,total=Math.ceil(size/CH),parts=new Array(total),done=0,failed=false,next=0,inflight=0;function show(){if(progEl)progEl.textContent=\'下载中 \'+Math.round(done/total*100)+\'%（\'+(done*CH>size?size:done*CH)+\' / \'+size+\' 字节）\';}function fetchC(idx,att,cb){var st=idx*CH,en=Math.min(size-1,st+CH-1);var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.setRequestHeader(\'Range\',\'bytes=\'+st+\'-\'+en);x.responseType=\'blob\';x.onload=function(){if(x.status===206||x.status===200){cb(null,x.response);}else if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk failed\'));}};x.onerror=function(){if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk network error\'));}};x.send();}function launch(){while(!failed&&inflight<PAR&&next<total){(function(idx){inflight++;fetchC(idx,0,function(err,blob){inflight--;if(failed)return;if(err){failed=true;if(doneCb)doneCb(err);return;}parts[idx]=blob;done++;show();if(done===total){var a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob(parts));a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);if(doneCb)doneCb(null);}else{launch();}});})(next);next++;}}show();launch();}document.getElementById(\'previewBody\').addEventListener(\'click\',function(e){var a=e.target.closest?e.target.closest(\'.segdl\'):null;if(!a)return;var sz=parseInt(a.dataset.size||\'0\',10);if(!sz||sz<20*1024*1024||sz>500*1024*1024)return;e.preventDefault();var prog=document.getElementById(\'segProg\');if(!prog){prog=document.createElement(\'div\');prog.id=\'segProg\';prog.className=\'note\';var _pb=document.getElementById(\'previewBody\');if(_pb)_pb.appendChild(prog);}_segDl(a.dataset.dl,a.dataset.name||\'download\',sz,prog,function(err){if(err&&prog)prog.textContent=\'下载失败，请重试\';else if(prog)prog.textContent=\'下载完成\';});});var _pre={};function _preOrig(t){if(!t||t.dataset.isimg!==\'1\')return;var u=t.dataset.view;if(!u||_pre[u])return;_pre[u]=1;var im=new Image();im.src=u;}document.addEventListener(\'touchstart\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);},{passive:true});document.addEventListener(\'mouseover\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);});function _preVisible(){if(navigator.connection&&navigator.connection.saveData)return;var n=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(n>=6)return;if(t.style.display===\'none\')return;var r=t.getBoundingClientRect();if(r.bottom<0||r.top>window.innerHeight)return;var b=Object.keys(_pre).length;_preOrig(t);if(Object.keys(_pre).length>b)n++;});}if(\'requestIdleCallback\' in window){requestIdleCallback(_preVisible,{timeout:2000});}else{setTimeout(_preVisible,1500);}</script></div>'
     "{% endif %}"
     "<script>function dlFile(btn){var row=btn.closest('.file');var wrap=row.querySelector('.dlprog');var bar=row.querySelector('.dlbar');var tx=row.querySelector('.dltext');if(!wrap)return;wrap.style.display='block';btn.disabled=true;var url=btn.getAttribute('data-dl');var name=btn.getAttribute('data-name');var x=new XMLHttpRequest();x.open('GET',url,true);x.responseType='blob';x.onprogress=function(ev){if(ev.lengthComputable){var pct=Math.round(ev.loaded/ev.total*100);bar.style.width=pct+'%';tx.textContent='下载中… '+pct+'%（'+(ev.loaded/1048576).toFixed(1)+' / '+(ev.total/1048576).toFixed(1)+' MB）';}else{tx.textContent='下载中… '+(ev.loaded/1048576).toFixed(1)+' MB';}};x.onload=function(){if(x.status===200){bar.style.width='100%';tx.textContent='下载完成';var a=document.createElement('a');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}else{tx.textContent='下载失败，请重试';}btn.disabled=false;};x.onerror=function(){tx.textContent='下载失败，请检查网络后重试';btn.disabled=false;};x.send();}</script>"
         '<div class="tabpanel" id="tab-private"><div class="card section"><h2>私人区</h2>'
@@ -1436,7 +1539,9 @@ PAGE = (
     "<p class=\"note\">站长入口与熟人入口分开，站长口令只在审核页使用。</p>"
     "<form method=\"post\" action=\"/admin/login\">"
     "<input class=\"textin\" type=\"password\" name=\"token\" placeholder=\"站长口令\" required> "
-    "<button class=\"btn primary\" type=\"submit\">进入审核</button></form></div>"
+    "<button class=\"btn primary\" type=\"submit\">进入审核</button></form>{% if secondary_configured %}<form method=\"post\" action=\"/admin/secondary_login\" style=\"margin-top:8px\">"
+    "<input class=\"textin\" type=\"password\" name=\"token\" placeholder=\"二级管理员口令\" required> "
+    "<button class=\"btn\" type=\"submit\">二级管理员进入</button></form>{% endif %}</div>"
     "</div><script>var TAB_NAMES={'principle':'原理区','publish':'发布区','published':'已发布区','feedback':'意见区','private':'私人区','admin':'站长区'};function openDrawer(){var d=document.getElementById('drawer');var b=document.getElementById('drawerBackdrop');if(!d||!b)return;d.style.display='flex';b.style.display='block';requestAnimationFrame(function(){requestAnimationFrame(function(){d.classList.add('open');b.classList.add('open');});});}function closeDrawer(){var d=document.getElementById('drawer');var b=document.getElementById('drawerBackdrop');if(!d||!b||d.style.display==='none')return;d.classList.remove('open');b.classList.remove('open');setTimeout(function(){if(!d.classList.contains('open')){d.style.display='none';b.style.display='none';}},340);}function showTab(name){if(window.__uploading&&name==='admin'&&!confirm('正在上传，点站长区进入审核页会中断上传。确定要中断吗？')){return;}document.querySelectorAll('.tabpanel').forEach(function(el){el.classList.toggle('active',el.id==='tab-'+name);});document.querySelectorAll('#drawernav .drawer-navbtn').forEach(function(b){b.classList.toggle('active',b.dataset.tab===name);});var ct=document.getElementById('curtab');if(ct)ct.textContent='/ '+(TAB_NAMES[name]||name);closeDrawer();}document.getElementById('drawerBtn').addEventListener('click',function(){var d=document.getElementById('drawer');if(d.classList.contains('open')){closeDrawer();}else{openDrawer();}});document.getElementById('drawerBackdrop').addEventListener('click',closeDrawer);document.querySelectorAll('#drawernav .drawer-navbtn').forEach(function(b){b.addEventListener('click',function(e){e.preventDefault();location.hash=b.dataset.tab;showTab(b.dataset.tab);});});document.querySelectorAll('#drawerCats .drawer-navbtn').forEach(function(b){b.addEventListener('click',function(){location.hash='published';showTab('published');curCat=b.dataset.cat;document.querySelectorAll('#cattabs .tab').forEach(function(t){t.classList.toggle('active',t.textContent.indexOf(b.dataset.cat)===0);});applyFilter();});});var _odb=document.getElementById('openDrawerBtn');if(_odb)_odb.addEventListener('click',openDrawer);var h=(location.hash||'#published').replace('#','');if(['principle','publish','published','feedback','private','admin'].indexOf(h)<0){h='published';}showTab(h);</script>"
     "<script>(function(){function applyTheme(t){var b=document.getElementById('themeBtn');if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');if(b)b.textContent='\u2600\ufe0f \u767d\u5929\u6a21\u5f0f';}else{document.documentElement.removeAttribute('data-theme');if(b)b.textContent='🌙 \u6df1\u8272\u6a21\u5f0f';}try{localStorage.setItem('theme',t);}catch(e){}}var _b=document.getElementById('themeBtn');if(_b){_b.addEventListener('click',function(){var cur=document.documentElement.getAttribute('data-theme');applyTheme(cur==='dark'?'light':'dark');});}try{var saved=localStorage.getItem('theme');if(saved==='dark'){applyTheme('dark');}else if(saved==='light'){applyTheme('light');}}catch(e){}})();</script></div></body></html>"
 )
@@ -1446,7 +1551,7 @@ ADMIN_PAGE = (
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>审核 - 交换站</title><style>"
     + BASE_CSS
-    + "</style></head><body><div class=\"wrap\"><h1>待审核文件</h1>{% if ai_configured %}<div class=\"card section\"><form method=\"post\" action=\"/admin/ai_review_all\" style=\"display:inline\"><button class=\"btn primary\">一键 AI 初审全部</button></form><span class=\"note\"> AI 只给初步结论，不会自动发布；最终仍由站长亲手通过。</span></div>{% else %}<div class=\"card section warn\">AI 审核未配置（需配置 DEEPSEEK_API_KEY 后可用），原有审核流程不受影响。</div>{% endif %}"
+    + "</style></head><body><div class=\"wrap\"><h1>待审核文件</h1>{% if is_secondary %}<p class=\"note\">当前身份：二级管理员（不能查看账号密码、不能改动任何权限）</p>{% endif %}{% if ai_configured %}<div class=\"card section\"><form method=\"post\" action=\"/admin/ai_review_all\" style=\"display:inline\"><button class=\"btn primary\">一键 AI 初审全部</button></form><span class=\"note\"> AI 只给初步结论，不会自动发布；最终仍由站长亲手通过。</span></div>{% else %}<div class=\"card section warn\">AI 审核未配置（需配置 DEEPSEEK_API_KEY 后可用），原有审核流程不受影响。</div>{% endif %}"
     "{% if not drive_configured %}"
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
     "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
@@ -1460,14 +1565,14 @@ ADMIN_PAGE = (
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<button class=\"btn danger\">不通过（移到回收站）</button></form></div></div>{% endfor %}</div>"
     "{% else %}<p class=\"empty\">目前没有待审核的文件。</p>{% endif %}"
-    "<p><a href=\"/admin/accounts\">账号管理</a> · <a href=\"/admin/private\">私人区管理</a> · <a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    "<p><a href=\"/admin/accounts\">账号管理</a> · <a href=\"/admin/private\">私人区管理</a> · <a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/comments\">留言管理</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
 )
 ADMIN_PAGE = (
     "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>审核 - 交换站</title><style>"
     + BASE_CSS
-    + "</style></head><body><div class=\"wrap\"><h1>待审核文件</h1>{% if ai_configured %}<div class=\"card section\"><form method=\"post\" action=\"/admin/ai_review_all\" style=\"display:inline\"><button class=\"btn primary\">一键 AI 初审全部</button></form><span class=\"note\"> AI 只给初步结论，不会自动发布；最终仍由站长亲手通过。</span></div>{% else %}<div class=\"card section warn\">AI 审核未配置（需配置 DEEPSEEK_API_KEY 后可用），原有审核流程不受影响。</div>{% endif %}"
+    + "</style></head><body><div class=\"wrap\"><h1>待审核文件</h1>{% if is_secondary %}<p class=\"note\">当前身份：二级管理员（不能查看账号密码、不能改动任何权限）</p>{% endif %}{% if ai_configured %}<div class=\"card section\"><form method=\"post\" action=\"/admin/ai_review_all\" style=\"display:inline\"><button class=\"btn primary\">一键 AI 初审全部</button></form><span class=\"note\"> AI 只给初步结论，不会自动发布；最终仍由站长亲手通过。</span></div>{% else %}<div class=\"card section warn\">AI 审核未配置（需配置 DEEPSEEK_API_KEY 后可用），原有审核流程不受影响。</div>{% endif %}"
     "{% if not drive_configured %}"
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
     "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
@@ -1481,7 +1586,7 @@ ADMIN_PAGE = (
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<button class=\"btn danger\">不通过（移到回收站）</button></form></div></div>{% endfor %}</div>"
     "{% else %}<p class=\"empty\">目前没有待审核的文件。</p>{% endif %}"
-    "<p><a href=\"/admin/accounts\">账号管理</a> · <a href=\"/admin/private\">私人区管理</a> · <a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    "<p><a href=\"/admin/accounts\">账号管理</a> · <a href=\"/admin/private\">私人区管理</a> · <a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/comments\">留言管理</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
 )
 
 ADMIN_PUBLISHED_PAGE = (
@@ -1521,9 +1626,8 @@ def api_private():
 
 @app.route("/api/private_all")
 def api_private_all():
-    token = _env("ADMIN_TOKEN")
     out = {"users": []}
-    if token and _has_gate(token, "admin_access"):
+    if _is_manager():
         service = drive_service()
         root = _private_root_id(service) if service else None
         if service and root:
@@ -1558,8 +1662,7 @@ def api_files():
             except Exception:
                 pass
         _dl_attach(out["published"], drive_service())
-    token = _env("ADMIN_TOKEN")
-    if token and _has_gate(token, "admin_access"):
+    if _is_manager():
         try:
             out["pending"] = list_folder(drive_service(), PENDING_FOLDER_ID)
             for f in out["pending"]:
@@ -1600,7 +1703,7 @@ def index():
             try:
                 import requests as _rq
                 _cookies = {}
-                for _k in ("exchange_access", "feedback_user"):
+                for _k in ("exchange_access", "feedback_user", "secondary_access"):
                     if _k in request.cookies:
                         _cookies[_k] = request.cookies[_k]
                 _r = _rq.get(_relay_backend() + "/api/private", cookies=_cookies, timeout=15)
@@ -1632,6 +1735,7 @@ def index():
         private_used_text=_fmt_size(private_used),
         max_mb=MAX_UPLOAD_MB,
         is_relay=_is_relay(),
+        secondary_configured=_secondary_configured(),
         msg=request.args.get("msg", ""),
     )
 
@@ -1657,6 +1761,7 @@ def logout():
     resp = redirect("/")
     resp.delete_cookie("exchange_access")
     resp.delete_cookie("admin_access")
+    resp.delete_cookie("secondary_access")
     return resp
 
 
@@ -1669,7 +1774,7 @@ def upload():
         try:
             import requests as _rq
             _cookies = {}
-            for _k in ("exchange_access", "admin_access"):
+            for _k in ("exchange_access", "admin_access", "secondary_access"):
                 if _k in request.cookies:
                     _cookies[_k] = request.cookies[_k]
             _files = [("file", (u.filename, u.stream, u.mimetype)) for u in request.files.getlist("file") if u and u.filename]
@@ -1856,8 +1961,7 @@ def view(file_id):
         if not _has_gate(code, "exchange_access"):
             return redirect("/?msg=请先输入访问口令")
     elif is_pending:
-        token = _env("ADMIN_TOKEN")
-        if not token or not _has_gate(token, "admin_access"):
+        if not _is_manager():
             return "该文件尚未发布", 403
     else:
         owner = _private_owner(service, meta)
@@ -2026,7 +2130,7 @@ def private_upload():
         try:
             import requests as _rq
             _cookies = {}
-            for _k in ("exchange_access", "feedback_user"):
+            for _k in ("exchange_access", "feedback_user", "secondary_access"):
                 if _k in request.cookies:
                     _cookies[_k] = request.cookies[_k]
             _files = [("file", (u.filename, u.stream, u.mimetype)) for u in request.files.getlist("file") if u and u.filename]
@@ -2108,8 +2212,7 @@ def private_delete():
 
 @app.route("/admin/private")
 def admin_private():
-    token = _env("ADMIN_TOKEN")
-    if not token or not _has_gate(token, "admin_access"):
+    if not _is_manager():
         return "请先在首页输入站长口令", 403
     if _is_relay():
         try:
@@ -2117,6 +2220,8 @@ def admin_private():
             _cookies = {}
             if "admin_access" in request.cookies:
                 _cookies["admin_access"] = request.cookies["admin_access"]
+            if "secondary_access" in request.cookies:
+                _cookies["secondary_access"] = request.cookies["secondary_access"]
             _r = _rq.get(_relay_backend() + "/api/private_all", cookies=_cookies, timeout=15)
             users = _r.json().get("users", [])
         except Exception:
@@ -2189,8 +2294,7 @@ def feedback_submit():
 
 @app.route("/feedback/resolve", methods=["POST"])
 def feedback_resolve():
-    token = _env("ADMIN_TOKEN")
-    if not token or not _has_gate(token, "admin_access"):
+    if not _is_manager():
         return "只有站长能改状态", 403
     if _is_relay():
         return _proxy_post_to_backend("/feedback/resolve")
@@ -2232,6 +2336,58 @@ def register():
     return redirect("/?msg=注册失败，请重试#feedback")
 
 
+
+@app.route("/comments/<file_id>")
+def comments_list(file_id):
+    """留言列表：过了熟人门才能看；文件已删除时返回空列表，不报错。"""
+    if _is_relay():
+        return _proxy_to_backend(f"/comments/{file_id}")
+    code = _env("EXCHANGE_CODE")
+    if not _has_gate(code, "exchange_access"):
+        return {"error": "请先输入访问口令"}, 403
+    service = drive_service()
+    if service is None:
+        return {"error": "云盘暂未连接"}, 503
+    if not _published_file_exists(service, file_id):
+        return {"comments": []}
+    return {"comments": _comments_for(service, file_id)}
+
+
+@app.route("/comments/<file_id>", methods=["POST"])
+def comments_post(file_id):
+    """发留言：过了熟人门就能发，不用私人区账号；昵称不填就是匿名；正文限 500 字。"""
+    if _is_relay():
+        return _proxy_post_to_backend(f"/comments/{file_id}")
+    code = _env("EXCHANGE_CODE")
+    if not _has_gate(code, "exchange_access"):
+        return {"error": "请先输入访问口令"}, 403
+    service = drive_service()
+    if service is None:
+        return {"error": "云盘暂未连接"}, 503
+    if not _published_file_exists(service, file_id):
+        return {"error": "文件不存在或已删除"}, 404
+    text = (request.form.get("text") or "").strip()
+    if not text:
+        return {"error": "留言不能为空"}, 400
+    if len(text) > 500:
+        text = text[:500]
+    text = text.replace("\n", " ").replace("\t", " ")
+    author = (request.form.get("author") or "").strip().replace("\n", " ").replace("\t", " ")
+    if not author:
+        author = "匿名"
+    if len(author) > 50:
+        author = author[:50]
+    items = _read_comments(service)
+    import time as _t, random as _r
+    now = datetime.now(timezone.utc) + timedelta(hours=8)
+    cid = now.strftime("%Y%m%d%H%M%S") + str(_r.randint(100, 999))
+    item = {"id": cid, "time": now.strftime("%Y-%m-%d %H:%M"), "file_id": file_id, "author": author, "text": text}
+    items.insert(0, item)
+    if _write_comments(service, list(reversed(items))):
+        return {"ok": True, "comment": item}
+    return {"error": "留言保存失败，请重试"}, 500
+
+
 @app.route("/login_feedback", methods=["POST"])
 def login_feedback():
     code = _env("EXCHANGE_CODE")
@@ -2262,23 +2418,33 @@ def logout_feedback():
 
 @app.route("/admin/accounts")
 def admin_accounts():
-    token = _env("ADMIN_TOKEN")
-    if not token or not _has_gate(token, "admin_access"):
+    if not _is_manager():
         return "请先在首页输入站长口令", 403
     service = drive_service()
     accounts = _read_accounts(service) if service else []
-    rows = "".join(
-        f"<div class=\"logrow\"><div class=\"fname\">{a['name']}</div><div class=\"fmeta\"><span>密码：{a['password']}</span><span>·</span><span>注册：{a['created']}</span><span>·</span><span>最后登录：{a.get('last','')}</span><span>·</span><span>{'已禁用' if a.get('disabled')=='1' else '正常'}</span></div>"
-        f"<form method=\"post\" action=\"/admin/accounts/change\" style=\"margin-top:6px\"><input type=\"hidden\" name=\"name\" value=\"{a['name']}\">"
-        f"<input class=\"textin\" type=\"text\" name=\"new_password\" placeholder=\"新密码\" required> <button class=\"btn\">改密码</button> "
-        f"<button class=\"btn\" formaction=\"/admin/accounts/toggle\">{'解封' if a.get('disabled')=='1' else '禁用'}</button></form></div>"
-        for a in accounts
-    ) or "<p class=\"empty\">目前还没有注册账号。</p>"
+    _sec = _is_secondary()
+    rows = ""
+    for a in accounts:
+        _pw = "••••••" if _sec else a["password"]
+        _row = (
+            f"<div class=\"logrow\"><div class=\"fname\">{a['name']}</div><div class=\"fmeta\"><span>密码：{_pw}</span><span>·</span><span>注册：{a['created']}</span><span>·</span><span>最后登录：{a.get('last','')}</span><span>·</span><span>{'已禁用' if a.get('disabled')=='1' else '正常'}</span></div>"
+        )
+        if not _sec:
+            _row += (
+                f"<form method=\"post\" action=\"/admin/accounts/change\" style=\"margin-top:6px\"><input type=\"hidden\" name=\"name\" value=\"{a['name']}\">"
+                f"<input class=\"textin\" type=\"text\" name=\"new_password\" placeholder=\"新密码\" required> <button class=\"btn\">改密码</button> "
+                f"<button class=\"btn\" formaction=\"/admin/accounts/toggle\">{'解封' if a.get('disabled')=='1' else '禁用'}</button></form>"
+            )
+        _row += "</div>"
+        rows += _row
+    if not rows:
+        rows = "<p class=\"empty\">目前还没有注册账号。</p>"
+    _note_html = '<p class="note">二级管理员只能看见账号名和状态，看不见密码，也不能改密码、禁用 / 解封。</p>' if _sec else '<p class="note">站长能看见账号和密码，也能改密码、禁用 / 解封。请提醒用户不要用重要密码注册。</p>'
     return render_template_string(
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         "<title>账号管理 - 交换站</title><style>" + BASE_CSS + "</style></head><body><div class=\"wrap\">"
-        "<h1>账号管理</h1><p class=\"note\">站长能看见账号和密码，也能改密码、禁用 / 解封。请提醒用户不要用重要密码注册。</p>"
+        "<h1>账号管理</h1>" + _note_html +
         "<div class=\"card section\">" + rows + "</div>"
         "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
     )
@@ -2286,8 +2452,7 @@ def admin_accounts():
 
 @app.route("/admin/accounts/change", methods=["POST"])
 def admin_accounts_change():
-    token = _env("ADMIN_TOKEN")
-    if not token or not _has_gate(token, "admin_access"):
+    if not _is_admin():
         return "只有站长能改", 403
     if _is_relay():
         return _proxy_post_to_backend("/admin/accounts/change")
@@ -2304,8 +2469,7 @@ def admin_accounts_change():
 
 @app.route("/admin/accounts/toggle", methods=["POST"])
 def admin_accounts_toggle():
-    token = _env("ADMIN_TOKEN")
-    if not token or not _has_gate(token, "admin_access"):
+    if not _is_admin():
         return "只有站长能改", 403
     if _is_relay():
         return _proxy_post_to_backend("/admin/accounts/toggle")
@@ -2335,12 +2499,25 @@ def admin_login():
     return resp
 
 
+@app.route("/admin/secondary_login", methods=["POST"])
+def secondary_login():
+    token = _env("SECONDARY_ADMIN_TOKEN")
+    if not token or token == _env("ADMIN_TOKEN"):
+        return "二级管理员入口未配置", 503
+    if request.form.get("token", "") != token:
+        _log("二级管理员进审核失败", "口令不对")
+        return "口令不对", 403
+    resp = redirect("/admin")
+    _log("二级管理员登录", "")
+    resp.set_cookie("secondary_access", _gate_value(token), httponly=True, samesite="Lax")
+    return resp
+
+
 @app.route("/admin")
 def admin():
-    token = _env("ADMIN_TOKEN")
-    if not token:
-        return "站长口令还没配置，请联系站长在 Render 环境变量中设置 ADMIN_TOKEN", 503
-    if not _has_gate(token, "admin_access"):
+    if not _is_manager():
+        if not _env("ADMIN_TOKEN") and not _secondary_configured():
+            return "站长口令还没配置，请联系站长在 Render 环境变量中设置 ADMIN_TOKEN", 503
         return "请先在首页输入站长口令", 403
     if _is_relay():
         files = _relay_files().get("pending", [])
@@ -2349,7 +2526,7 @@ def admin():
         for f in files:
             f["ai"] = _ai_get_result(f["id"])
     return render_template_string(
-        ADMIN_PAGE, files=files, drive_configured=True, ai_configured=_ai_configured()
+        ADMIN_PAGE, files=files, drive_configured=True, ai_configured=_ai_configured(), is_secondary=_is_secondary()
     )
 
 
@@ -2505,8 +2682,7 @@ def _ai_review_one(file_id):
 
 @app.route("/admin/ai_review", methods=["POST"])
 def admin_ai_review():
-    token = _env("ADMIN_TOKEN")
-    if not token or not _has_gate(token, "admin_access"):
+    if not _is_manager():
         return "请先在首页输入站长口令", 403
     if _is_relay():
         return _proxy_post_to_backend("/admin/ai_review")
@@ -2516,8 +2692,7 @@ def admin_ai_review():
 
 @app.route("/admin/ai_review_all", methods=["POST"])
 def admin_ai_review_all():
-    token = _env("ADMIN_TOKEN")
-    if not token or not _has_gate(token, "admin_access"):
+    if not _is_manager():
         return "请先在首页输入站长口令", 403
     if _is_relay():
         return _proxy_post_to_backend("/admin/ai_review_all")
@@ -2820,8 +2995,7 @@ def _faststart_job(file_id):
 
 @app.route("/admin/approve", methods=["POST"])
 def approve():
-    token = _env("ADMIN_TOKEN")
-    if not token or not _has_gate(token, "admin_access"):
+    if not _is_manager():
         return "请先在首页输入站长口令", 403
     if _is_relay():
         return _proxy_post_to_backend("/admin/approve")
@@ -2863,8 +3037,7 @@ def approve():
 
 @app.route("/admin/reject", methods=["POST"])
 def reject():
-    token = _env("ADMIN_TOKEN")
-    if not token or not _has_gate(token, "admin_access"):
+    if not _is_manager():
         return "请先在首页输入站长口令", 403
     if _is_relay():
         return _proxy_post_to_backend("/admin/reject")
@@ -2882,8 +3055,7 @@ def reject():
 
 @app.route("/admin/published")
 def admin_published():
-    token = _env("ADMIN_TOKEN")
-    if not token or not _has_gate(token, "admin_access"):
+    if not _is_manager():
         return "请先在首页输入站长口令", 403
     if _is_relay():
         files = _relay_files().get("published", [])
@@ -2896,8 +3068,7 @@ def admin_published():
 
 @app.route("/admin/delete", methods=["POST"])
 def admin_delete():
-    token = _env("ADMIN_TOKEN")
-    if not token or not _has_gate(token, "admin_access"):
+    if not _is_manager():
         return "请先在首页输入站长口令", 403
     if _is_relay():
         return _proxy_post_to_backend("/admin/delete")
@@ -2921,10 +3092,62 @@ def admin_delete():
 
 
 
+
+@app.route("/admin/comments")
+def admin_comments():
+    if not _is_manager():
+        return "请先在首页输入站长口令", 403
+    import html as _html
+    service = drive_service()
+    items = _read_comments(service) if service else []
+    names = {}
+    try:
+        files, _folders = _cached_published(service) if service else ([], [])
+        names = {f.get("id"): f.get("name") for f in files}
+    except Exception:
+        names = {}
+    rows = ""
+    for it in items:
+        fname = names.get(it["file_id"], "（文件已删除）")
+        rows += (
+            f"<div class=\"logrow\"><div class=\"fname\">{_html.escape(it['text'])}</div>"
+            f"<div class=\"fmeta\"><span>{_html.escape(it['author'])}</span><span>·</span>"
+            f"<span>{_html.escape(fname)}</span><span>·</span><span>{it['time']}</span></div>"
+            f"<form method=\"post\" action=\"/admin/comments/delete\" style=\"margin-top:6px\">"
+            f"<input type=\"hidden\" name=\"id\" value=\"{it['id']}\">"
+            f"<button class=\"btn danger\">删除这条留言</button></form></div>"
+        )
+    if not rows:
+        rows = "<p class=\"empty\">目前还没有留言。</p>"
+    return render_template_string(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>留言管理 - 交换站</title><style>" + BASE_CSS + "</style></head><body><div class=\"wrap\">"
+        "<h1>留言管理</h1><p class=\"note\">留言由过了熟人门的访客所发，昵称不填就是匿名；站长删了就不再显示。文件已删除的留言会标出来，删了也不报错。</p>"
+        "<div class=\"card section\">" + rows + "</div>"
+        "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    )
+
+
+@app.route("/admin/comments/delete", methods=["POST"])
+def admin_comments_delete():
+    if not _is_manager():
+        return "请先在首页输入站长口令", 403
+    if _is_relay():
+        return _proxy_post_to_backend("/admin/comments/delete")
+    service = drive_service()
+    if service is None:
+        return redirect("/admin/comments")
+    cid = request.form.get("id") or ""
+    items = _read_comments(service)
+    items = [it for it in items if it["id"] != cid]
+    _write_comments(service, list(reversed(items)))
+    return redirect("/admin/comments")
+
+
 @app.route("/admin/feedback")
 def admin_feedback():
-    token = _env("ADMIN_TOKEN")
-    if not token or not _has_gate(token, "admin_access"):
+    if not _is_manager():
         return "请先在首页输入站长口令", 403
     service = drive_service()
     items = _read_feedback(service) if service else []
@@ -2938,7 +3161,7 @@ def admin_feedback():
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         "<title>意见管理 - 交换站</title><style>" + BASE_CSS + "</style></head><body><div class=\"wrap\">"
-        "<h1>意见管理</h1><p class=\"note\">只有站长能改状态，改完后意见区里大家都能看见已解决 / 未解决。</p>"
+        "<h1>意见管理</h1><p class=\"note\">站长和二级管理员能改状态，改完后意见区里大家都能看见已解决 / 未解决。</p>"
         "<div class=\"card section\">" + rows + "</div>"
         "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
     )
@@ -2946,8 +3169,7 @@ def admin_feedback():
 
 @app.route("/admin/logs")
 def admin_logs():
-    token = _env("ADMIN_TOKEN")
-    if not token or not _has_gate(token, "admin_access"):
+    if not _is_manager():
         return "请先在首页输入站长口令", 403
     # 打开日志页时先把缓冲写进云盘，再从云盘读回最近的记录，和内存里的合并去重。
     _flush_drive_log()
@@ -3026,8 +3248,7 @@ def thumb(file_id):
         if not _has_gate(code, "exchange_access"):
             return "请先输入访问口令", 403
     elif is_pending:
-        token = _env("ADMIN_TOKEN")
-        if not token or not _has_gate(token, "admin_access"):
+        if not _is_manager():
             return "该文件尚未发布", 403
     else:
         owner = _private_owner(service, meta)
@@ -3105,10 +3326,9 @@ def rename():
     parents = meta.get("parents") or []
     is_published = _is_published_parent(service, parents)
     is_pending = PENDING_FOLDER_ID in parents
-    token = _env("ADMIN_TOKEN")
-    is_admin = bool(token) and _has_gate(token, "admin_access")
+    is_admin = _is_manager()
     if not is_admin:
-        return "只有站长能改名，请先在站长区输入站长口令", 403
+        return "只有站长或二级管理员能改名，请先在站长区登录", 403
     if not is_published and not is_pending:
         return "文件不存在或无权访问", 404
     old_name = meta.get("name", "")
