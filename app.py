@@ -64,6 +64,16 @@ except ValueError:
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
 
+# ---------------- 进站公告（站长在站长区“公告管理”里改，不用改代码） ----------------
+# 公告存在云盘根目录的 交换站公告.txt 里，JSON 存 {"title": ..., "body": ...}，和留言/
+# AI 结论文件同一个做法。读取规则：文件不存在/读不出/JSON 坏了 → 用默认文案弹；
+# 正文被清空（空字符串）→ 不弹公告（等于站长把公告关了）。读取不走 30 秒已发布
+# 列表缓存，每次进站现读，保存后下一次进站立即生效。
+ANNOUNCEMENT_FILE_NAME = "交换站公告.txt"
+ANNOUNCEMENT_DEFAULT_TITLE = "交换站公告"
+ANNOUNCEMENT_DEFAULT_BODY = "这是一个大家共用的免费云盘，大家可以在上面上传自己喜欢的 OC 和文件，分享给朋友们。上传的文件会先经过审核，通过后才会公开显示，请不要上传违规内容。"
+
+
 def _env(name):
     return os.environ.get(name, "").strip()
 
@@ -1018,6 +1028,67 @@ def _write_comments(service, items_oldest_first):
         return False
 
 
+def _announcement_file_id(service):
+    if _env("ANNOUNCEMENT_DRIVE_FILE_ID"):
+        return _env("ANNOUNCEMENT_DRIVE_FILE_ID")
+    try:
+        res = service.files().list(q=f"name = '{ANNOUNCEMENT_FILE_NAME}' and trashed = false", fields="files(id)", pageSize=5).execute()
+        fl = res.get("files") or []
+        return fl[0]["id"] if fl else None
+    except Exception:
+        return None
+
+
+def _read_announcement_raw(service):
+    """读云盘公告文件，返回 {"title":..., "body":...}；文件不存在/读不出/JSON 坏了返回 None。"""
+    if service is None:
+        return None
+    try:
+        fid = _announcement_file_id(service)
+        if not fid:
+            return None
+        from googleapiclient.http import MediaIoBaseDownload
+        buf = io.BytesIO()
+        dl = MediaIoBaseDownload(buf, service.files().get_media(fileId=fid))
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        data = json.loads(buf.getvalue().decode("utf-8", errors="ignore"))
+        if not isinstance(data, dict):
+            return None
+        return {"title": data.get("title") or "", "body": data.get("body") or ""}
+    except Exception:
+        return None
+
+
+def _announcement_display(service):
+    """进站要弹的公告：文件缺失/坏了 → 默认文案；正文为空 → None（不弹，等于关掉）。"""
+    raw = _read_announcement_raw(service)
+    if raw is None:
+        return {"title": ANNOUNCEMENT_DEFAULT_TITLE, "body": ANNOUNCEMENT_DEFAULT_BODY}
+    if not raw["body"].strip():
+        return None
+    return {"title": raw["title"].strip() or ANNOUNCEMENT_DEFAULT_TITLE, "body": raw["body"]}
+
+
+def _write_announcement(service, title, body):
+    """把公告 JSON 写回云盘根目录文件（有则覆盖、无则新建），成功返回 True。"""
+    from googleapiclient.http import MediaIoBaseUpload
+    payload = json.dumps({"title": title, "body": body}, ensure_ascii=False)
+    media = MediaIoBaseUpload(io.BytesIO(payload.encode("utf-8")), mimetype="application/json", resumable=False)
+    try:
+        fid = _announcement_file_id(service)
+        if fid:
+            service.files().update(fileId=fid, media_body=media).execute()
+        else:
+            meta = {"name": ANNOUNCEMENT_FILE_NAME, "mimeType": "application/json"}
+            service.files().create(body=meta, media_body=media, fields="id").execute()
+        return True
+    except Exception as e:
+        print(f"[announcement] write failed: {e}", flush=True)
+        return False
+
+
 def _comments_for(service, file_id):
     """Comments for one file, oldest first (display order)."""
     return [c for c in reversed(_read_comments(service)) if c["file_id"] == file_id]
@@ -1041,8 +1112,6 @@ def _log(action, detail=""):
     ua = request.headers.get("User-Agent", "")
     device = "手机" if ("Mobile" in ua or "Android" in ua or "iPhone" in ua) else "电脑"
     now = datetime.now(timezone.utc) + timedelta(hours=8)
-    if _is_secondary() and not _is_admin():
-        action = action + "（二级管理员）"
     entry = {"time": now.strftime("%Y-%m-%d %H:%M"), "ip": ip, "loc": "", "device": device, "action": action, "detail": detail}
     ACCESS_LOG.appendleft(entry)
     line = f"{entry['time']} {ip} {entry['loc']} {device} {action} {detail}\n"
@@ -1452,14 +1521,33 @@ BASE_CSS = """
     .upload form .btn{width:100%}
     .upload .drop{width:100%}
   }
+  /* 站长区 PJAX 淡入淡出 + 公告弹窗动画（只用 transition，无外部库） */
+  #admin-main{transition:opacity .22s ease}
+  #admin-main.pjax-out{opacity:0}
+  #admin-main.pjax-in{animation:pjaxFadeIn .25s ease}
+  @keyframes pjaxFadeIn{from{opacity:0}to{opacity:1}}
+  .ann-overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:50;display:flex;align-items:center;justify-content:center;padding:20px;box-sizing:border-box;opacity:0;transition:opacity .25s ease}
+  .ann-overlay.ann-show{opacity:1}
+  .ann-card{background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:18px;padding:20px;width:100%;max-width:420px;max-height:85vh;overflow:auto;box-shadow:var(--shadow);opacity:0;transform:scale(.96);transition:opacity .25s ease,transform .25s ease}
+  .ann-overlay.ann-show .ann-card{opacity:1;transform:scale(1)}
+  .ann-card h2{margin:0 0 10px;font-size:18px;word-break:break-all}
+  .ann-card p{white-space:pre-wrap;word-break:break-all;line-height:1.7;margin:0 0 16px}
+  @media (prefers-reduced-motion:reduce){ #admin-main{transition:none} #admin-main.pjax-in{animation:none} .ann-overlay,.ann-card{transition:none} }
  """
+
+# 站长区 PJAX：拦截站长区内部链接（/admin 与 /admin/*，退出与回首页除外），
+# fetch 取页、只换 #admin-main 内容并推 history；前进/后退同样换内容不刷新。
+# 表单提交一律走整页跳转；取页失败、目标无容器时回退整页跳转。
+# 换内容带淡入淡出（先淡出约 160ms 再换内容淡入 250ms，不闪白屏）；
+# prefers-reduced-motion 时直接换内容、无动画。
+ADMIN_PJAX_SCRIPT = """<script>(function(){var main=document.getElementById('admin-main');if(!main)return;var reduced=!!(window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);function isAdminLink(a){if(!a||!a.href||a.target==='_blank')return false;var u;try{u=new URL(a.href,location.href);}catch(e){return false;}if(u.origin!==location.origin)return false;if(u.pathname==='/logout'||u.pathname==='/')return false;return u.pathname==='/admin'||u.pathname.indexOf('/admin/')===0;}function load(url,push){var t0=Date.now();function swap(html){var doc=new DOMParser().parseFromString(html,'text/html');var nm=doc.getElementById('admin-main');if(!nm){location.href=url;return;}function doSwap(){main.innerHTML=nm.innerHTML;if(doc.title)document.title=doc.title;window.scrollTo(0,0);main.classList.remove('pjax-out');if(!reduced){main.classList.add('pjax-in');setTimeout(function(){main.classList.remove('pjax-in');},300);}}if(reduced){doSwap();return;}main.classList.add('pjax-out');setTimeout(doSwap,Math.max(0,160-(Date.now()-t0)));}fetch(url,{credentials:'same-origin',headers:{'X-Requested-With':'XMLHttpRequest'}}).then(function(r){if(!r.ok)throw new Error('bad');return r.text();}).then(function(html){if(push){try{history.pushState(null,'',url);}catch(e){}}swap(html);}).catch(function(){location.href=url;});}document.addEventListener('click',function(e){if(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey||e.button!==0)return;var a=e.target.closest?e.target.closest('a'):null;if(!a||!isAdminLink(a))return;e.preventDefault();load(a.href,true);});window.addEventListener('popstate',function(){load(location.href,false);});})();</script>"""
 
 PAGE = (
     "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>交换站</title><style>"
     + BASE_CSS
-    + "</style><script>try{var _t=localStorage.getItem('theme');if(_t==='dark'){document.documentElement.setAttribute('data-theme','dark');}}catch(e){}</script><style>" + '\n.shellhead{position:sticky;top:0;z-index:30;background:var(--bg);height:56px;display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--line)}\n.jiabtn{width:44px;height:44px;border-radius:12px;background:var(--green);color:#fff;font-weight:900;font-size:20px;border:0;cursor:pointer;flex-shrink:0}\n.headtitle{flex:1;min-width:0;display:flex;align-items:baseline;gap:8px;white-space:nowrap;overflow:hidden}\n.headtitle h1{font-size:24px}\n#curtab{color:var(--muted);font-size:13px;font-weight:700}\n.drawer-backdrop{position:fixed;top:56px;bottom:0;left:0;right:0;background:rgba(0,0,0,.35);z-index:15;opacity:0;transition:opacity .32s ease}.drawer-backdrop.open{opacity:1}\n.drawer{position:fixed;top:56px;bottom:0;left:0;width:260px;max-width:84vw;background:var(--surface);border-right:1px solid var(--line);z-index:20;display:flex;flex-direction:column;padding:10px 14px 12px;box-sizing:border-box;overflow:hidden;transform:translateX(-105%);transition:transform .32s cubic-bezier(.2,.8,.2,1);will-change:transform}.drawer.open{transform:translateX(0)}\n.drawer-scroll{flex:1;min-height:0;overflow-y:auto}\n.drawer-label{font-size:11px;font-weight:800;color:var(--muted);letter-spacing:.06em;padding:6px 8px}\n.drawer-navbtn{display:block;width:100%;text-align:left;border:0;border-radius:10px;padding:9px 12px;font-weight:800;font-size:14px;cursor:pointer;margin-bottom:3px;background:transparent;color:var(--ink)}\n.drawer-navbtn.active{background:var(--green);color:#fff}\n.drawer-quota{flex-shrink:0;padding-top:10px;border-top:1px solid var(--line);margin-top:8px}\n.quota-bar{background:var(--surface-2);border-radius:999px;overflow:hidden;height:8px;margin-top:8px}\n.quota-fill{height:100%;background:var(--green)}\n.pub-toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}\n.folderbar{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}\n.album-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}\n.tile{position:relative;aspect-ratio:1/1;border-radius:14px;overflow:hidden;cursor:pointer;background:var(--surface-2);border:1px solid var(--line)}\n.tileimg{width:100%;height:100%;object-fit:cover;display:block}\n.tilefic{width:100%;height:100%;display:grid;place-items:center;font-weight:900;color:var(--green-ink);font-size:20px}\n.tileinfo{position:absolute;left:0;right:0;bottom:0;padding:24px 46px 7px 8px;background:linear-gradient(transparent,rgba(0,0,0,.65));color:#fff}\n.tile-name{font-size:12px;font-weight:800;word-break:break-all;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}\n.tile-meta{font-size:11px;opacity:.85}\n.tile-check{position:absolute;top:6px;right:6px;width:22px;height:22px;border-radius:50%;border:2px solid #fff;background:rgba(0,0,0,.35);display:none;place-items:center;color:#fff;font-size:14px;z-index:2}\n.tile-dl{position:absolute;right:6px;bottom:6px;z-index:3;pointer-events:none;font-size:10px;font-weight:800;color:#fff;background:rgba(0,0,0,.55);border-radius:999px;padding:2px 7px;white-space:nowrap}\n.album-grid.selecting .tile-check{display:grid}\n.tile.selected .tile-check{background:var(--green)}\n.tile.selected .tile-check::after{content:"\\2713"}\n#previewOverlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40;display:none;align-items:center;justify-content:center;padding:16px;box-sizing:border-box}\n#previewCard{background:var(--surface);border-radius:18px;padding:16px;width:100%;max-width:480px;max-height:90vh;overflow:auto}\n' + "</style></head><body><div class=\"wrap\">"
+    + "</style><script>try{var _t=localStorage.getItem('theme');if(_t==='dark'){document.documentElement.setAttribute('data-theme','dark');}}catch(e){}</script><style>" + '\n.shellhead{position:sticky;top:0;z-index:30;background:var(--bg);height:56px;display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--line)}\n.jiabtn{width:44px;height:44px;border-radius:12px;background:var(--green);color:#fff;font-weight:900;font-size:20px;border:0;cursor:pointer;flex-shrink:0}\n.headtitle{flex:1;min-width:0;display:flex;align-items:baseline;gap:8px;white-space:nowrap;overflow:hidden}\n.headtitle h1{font-size:24px}\n#curtab{color:var(--muted);font-size:13px;font-weight:700}\n.drawer-backdrop{position:fixed;top:56px;bottom:0;left:0;right:0;background:rgba(0,0,0,.35);z-index:15;opacity:0;transition:opacity .32s ease}.drawer-backdrop.open{opacity:1}\n.drawer{position:fixed;top:56px;bottom:0;left:0;width:260px;max-width:84vw;background:var(--surface);border-right:1px solid var(--line);z-index:20;display:flex;flex-direction:column;padding:10px 14px 12px;box-sizing:border-box;overflow:hidden;transform:translateX(-105%);transition:transform .32s cubic-bezier(.2,.8,.2,1);will-change:transform}.drawer.open{transform:translateX(0)}\n.drawer-scroll{flex:1;min-height:0;overflow-y:auto}\n.drawer-label{font-size:11px;font-weight:800;color:var(--muted);letter-spacing:.06em;padding:6px 8px}\n.drawer-navbtn{display:block;width:100%;text-align:left;border:0;border-radius:10px;padding:9px 12px;font-weight:800;font-size:14px;cursor:pointer;margin-bottom:3px;background:transparent;color:var(--ink)}\n.drawer-navbtn.active{background:var(--green);color:#fff}\n.drawer-quota{flex-shrink:0;padding-top:10px;border-top:1px solid var(--line);margin-top:8px}\n.quota-bar{background:var(--surface-2);border-radius:999px;overflow:hidden;height:8px;margin-top:8px}\n.quota-fill{height:100%;background:var(--green)}\n.pub-toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}\n.folderbar{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}\n.album-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}\n.tile{position:relative;aspect-ratio:1/1;border-radius:14px;overflow:hidden;cursor:pointer;background:var(--surface-2);border:1px solid var(--line)}\n.tileimg{width:100%;height:100%;object-fit:cover;display:block}\n.tilefic{width:100%;height:100%;display:grid;place-items:center;font-weight:900;color:var(--green-ink);font-size:20px}\n.tilefic{font-size:44px}\n.tile-doc{background:#fdf0c8;color:#7a5b00}\n.tile-music{background:#dcefe6;color:#0f4a33}\n.tile-pkg{background:#e4e0f5;color:#3d348b}\n.tile-video{background:#dbeafe;color:#1e40af}\n.tile-zip{background:#ffe4d6;color:#7c2d12}\n.tile-other{background:#e7ebee;color:#334155}\n.tile-img{background:#e7ebee;color:#334155}\n[data-theme="dark"] .tile-doc{background:#4a3d12;color:#f5d97e}\n[data-theme="dark"] .tile-music{background:#1e332a;color:#7ed6ae}\n[data-theme="dark"] .tile-pkg{background:#2e2a4d;color:#c4b5fd}\n[data-theme="dark"] .tile-video{background:#1e3a5f;color:#93c5fd}\n[data-theme="dark"] .tile-zip{background:#4a2a1a;color:#fdba74}\n[data-theme="dark"] .tile-other,[data-theme="dark"] .tile-img{background:#232e27;color:#cbd5ce}\n.tileinfo{position:absolute;left:0;right:0;bottom:0;padding:24px 46px 7px 8px;background:linear-gradient(transparent,rgba(0,0,0,.65));color:#fff}\n.tile-name{font-size:12px;font-weight:800;word-break:break-all;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}\n.tile-meta{font-size:11px;opacity:.85}\n.tile-check{position:absolute;top:6px;right:6px;width:22px;height:22px;border-radius:50%;border:2px solid #fff;background:rgba(0,0,0,.35);display:none;place-items:center;color:#fff;font-size:14px;z-index:2}\n.tile-dl{position:absolute;right:6px;bottom:6px;z-index:3;pointer-events:none;font-size:10px;font-weight:800;color:#fff;background:rgba(0,0,0,.55);border-radius:999px;padding:2px 7px;white-space:nowrap}\n.album-grid.selecting .tile-check{display:grid}\n.tile.selected .tile-check{background:var(--green)}\n.tile.selected .tile-check::after{content:"\\2713"}\n#previewOverlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40;display:none;align-items:center;justify-content:center;padding:16px;box-sizing:border-box}\n#previewCard{background:var(--surface);border-radius:18px;padding:16px;width:100%;max-width:480px;max-height:90vh;overflow:auto}\n' + "</style></head><body><div class=\"wrap\">"
     '<header class="shellhead"><button id="drawerBtn" class="jiabtn" type="button">交</button><div class="headtitle"><h1>交换站</h1><span id="curtab">/ 已发布区</span></div><div class="badge-live"><span class="dot"></span> 仅熟人使用 · 需审核</div></header><div id="drawerBackdrop" class="drawer-backdrop" style="display:none"></div><aside id="drawer" class="drawer" style="display:none"><div class="drawer-scroll"><div class="drawer-label">导航</div><nav id="drawernav"><button class="drawer-navbtn" data-tab="principle">原理区</button><button class="drawer-navbtn" data-tab="publish">发布区</button><button class="drawer-navbtn active" data-tab="published">已发布区</button><button class="drawer-navbtn" data-tab="feedback">意见区</button><button class="drawer-navbtn" data-tab="private">私人区</button><button class="drawer-navbtn" data-tab="admin">站长区</button></nav><div class="drawer-label">分类</div><div id="drawerCats">{% for c in cats %}{% if c.count %}<button class="drawer-navbtn" data-cat="{{ c.name }}">{{ c.name }}（{{ c.count }}）</button>{% endif %}{% endfor %}</div><div class="drawer-label">外观</div><button id="themeBtn" class="drawer-navbtn" type="button">🌙 深色模式</button></div><div class="drawer-quota"><div style="font-weight:800;font-size:13px">私人空间</div>{% if fb_user %}<div class="quota-bar"><div class="quota-fill" style="width:{{ private_used_pct }}%"></div></div><div style="font-size:12px;color:var(--muted);margin-top:6px">{{ private_used_text }} / 20 GB · 还剩 {{ private_remaining_text }}</div>{% else %}<div style="font-size:12px;color:var(--muted);margin-top:6px">登录私人区账号后，这里显示你的用量（每人上限 20 GB）。</div>{% endif %}</div></aside>'
     "<div id=\"progwrap\" style=\"display:none;margin:0 0 14px;padding:12px 14px;border:1px solid var(--line);border-radius:14px;background:var(--surface)\"><div style=\"font-weight:800;margin-bottom:8px\">上传进度</div><div style=\"background:var(--surface-2);border-radius:999px;overflow:hidden;height:14px\"><div id=\"progbar\" style=\"height:100%;width:0%;background:var(--green);transition:width .3s\"></div></div><p class=\"note\" id=\"progtext\" style=\"margin-top:8px\">正在上传… 0%</p></div>"
     "<div class=\"tabpanel\" id=\"tab-principle\">"
@@ -1513,7 +1601,7 @@ PAGE = (
     "var dropped=0;function addQ(fs){var before=queue.length;Array.from(fs).forEach(function(f){if(queue.length<30){queue.push(f);}else{dropped++;}});syncInput();show();}"
     "i.addEventListener('change',function(){addQ(i.files);});</script>"
     "{% if msg %}<p class=\"note\">{{ msg }}</p>{% endif %}</div></div>"
-    '<div class="tabpanel active" id="tab-published"><div class="pub-toolbar"><input class="search" id="search" type="search" placeholder="搜索文件名…" oninput="onSearch(this.value)"><button class="btn" id="openDrawerBtn" type="button">导航</button><button class="btn" id="selBtn" type="button">选择</button></div><section class="card section"><div class="section-head"><h2>已发布</h2><span class="count">{{ files|length }} 个</span></div>{% if msg %}<p class="note" style="margin-top:10px">{{ msg }}</p>{% endif %}<div class="folderbar" id="folderbar"><button class="tab active" data-folder="all" onclick="showFolder(\'all\',this)">全部（{{ files|length }}）</button>{% for fo in folders %}<button class="tab" data-folder="{{ fo.id }}" onclick="showFolder(\'{{ fo.id }}\',this)">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}<button class="tab" id="newFolderBtn" type="button">+ 新建文件夹</button></div><form id="newFolderForm" method="post" action="/folder/create" style="display:none;gap:8px;margin-top:10px"><input class="textin" name="name" placeholder="新文件夹名字，比如：旅行" required maxlength="50" style="flex:1"><button class="btn primary" type="submit">创建</button><button class="btn" type="button" id="newFolderCancel">取消</button></form><div class="tabs" id="cattabs"><button class="tab active" onclick="showCat(\'全部\',this)">全部（{{ files|length }}）</button>{% for c in cats %}{% if c.count %}<button class="tab" onclick="showCat(\'{{ c.name }}\',this)">{{ c.name }}（{{ c.count }}）</button>{% endif %}{% endfor %}</div><form id="moveForm" method="post" action="/folder/move" style="display:none;margin-top:12px;margin-bottom:4px;gap:8px;flex-wrap:wrap;align-items:center"><span id="selCount" style="font-weight:800"></span><input type="hidden" name="dest_folder_id" id="moveDest"><input type="hidden" name="file_ids" id="moveFileIds"><button class="btn primary" type="button" id="moveBtn">移动</button><button class="btn" type="button" id="dlSelBtn">选择下载</button></form><div class="album-grid" id="albumGrid">{% for f in files %}<div class="tile" data-cat="{{ f.kind }}" data-folder="{{ f.folder_id }}" data-name="{{ f.name|lower }}" data-id="{{ f.id }}" data-dl="/download/{{ f.id }}" data-view="/view/{{ f.id }}" data-isimg="{{ \'1\' if f.is_image else \'0\' }}" data-isvid="{{ \'1\' if f.is_video else \'0\' }}" data-isaud="{{ \'1\' if f.is_audio else \'0\' }}" data-size="{{ f.size_bytes }}"><span class="tile-check"></span>{% if f.is_image or f.is_video %}<img class="tileimg" src="/thumb/{{ f.id }}" data-fb="/thumb/{{ f.id }}" alt="" loading="lazy" onerror="_thumbErr(this)"><div class="tilefic" style="display:none"></div>{% else %}<div class="tilefic"></div>{% endif %}<div class="tileinfo"><div class="tile-name" style="display:none">{{ f.name }}</div><div class="tile-meta">{{ f.kind }} · {{ f.size }}{% if f.source == "baidu" %} · 百度{% endif %}{% if f.ai_note %} · {{ f.ai_note }}{% endif %}</div></div><span class="tile-dl">↓ {{ f.dl_count|default(0) }}</span></div>{% endfor %}</div><p class="empty" id="folderEmpty" style="display:none">这个文件夹里还没有文件。</p>{% if not files %}<p class="empty">目前还没有已发布的文件。</p>{% endif %}<p class="note">点图片默认就是预览；点右上角“选择”，再点图片打勾，就可以批量下载或移动到文件夹。</p></section><div id="previewOverlay"><div id="previewCard"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b id="previewTitle" style="word-break:break-all"></b><button class="btn" id="previewClose" type="button">关闭</button></div><div id="previewBody" style="margin-top:12px"></div></div></div><div id="moveOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40;align-items:center;justify-content:center;padding:16px;box-sizing:border-box"><div style="background:var(--surface);border-radius:18px;padding:16px;width:100%;max-width:420px;max-height:90vh;overflow:auto"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b>移到哪里？</b><button class="btn" type="button" id="moveCancel">取消</button></div><p class="note" style="margin-top:8px">点一个文件夹，选中的文件就会移过去。</p><button class="btn" type="button" data-dest="{{ published_id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">已发布根目录</button>{% for fo in folders %}<button class="btn" type="button" data-dest="{{ fo.id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}</div></div><script>var curCat=\'全部\',curFolder=\'all\',curQ=\'\',selectMode=false,selected=new Set();function applyFilter(){var vis=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){var okCat=curCat===\'全部\'||t.dataset.cat===curCat;var okFolder=curFolder===\'all\'||t.dataset.folder===curFolder;var okQ=t.dataset.name.includes(curQ);var show=(okCat&&okFolder&&okQ);var _nm=t.querySelector(\'.tile-name\');if(_nm)_nm.style.display=(show&&curQ)?\'\':\'none\';t.style.display=show?\'\':\'none\';if(show)vis++;});var fe=document.getElementById(\'folderEmpty\');if(fe)fe.style.display=(curFolder!==\'all\'&&vis===0)?\'block\':\'none\';}function showCat(c,el){curCat=c;document.querySelectorAll(\'#cattabs .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function showFolder(fid,el){curFolder=fid;document.querySelectorAll(\'#folderbar .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function onSearch(v){curQ=v.toLowerCase();applyFilter();}function updateSel(){var mf=document.getElementById(\'moveForm\');var sc=document.getElementById(\'selCount\');var ids=document.getElementById(\'moveFileIds\');if(sc)sc.textContent=\'已选 \'+selected.size+\' 个 · 选择模式中，点图片是打勾，点右上角“取消选择”退出后才能查看\';if(ids)ids.value=Array.from(selected).join(\',\');if(mf)mf.style.display=selected.size?\'flex\':\'none\';}function _thumbErr(im){if(!im.dataset.fbDone&&im.dataset.fb){im.dataset.fbDone=\'1\';im.src=im.dataset.fb;return;}im.style.display=\'none\';var nx=im.nextElementSibling;if(nx)nx.style.display=\'grid\';}function openPreview(t){var ov=document.getElementById(\'previewOverlay\');var ti=document.getElementById(\'previewTitle\');var bd=document.getElementById(\'previewBody\');if(!ov||!ti||!bd)return;ti.textContent=t.querySelector(\'.tile-name\').textContent;var view=t.dataset.view,dl=t.dataset.dl;if(t.dataset.isimg===\'1\'){var _th=t.querySelector(\'.tileimg\');var _tu=_th?_th.getAttribute(\'src\'):\'\';bd.innerHTML=\'<img id="pvThumb" src="\'+_tu+\'" style="width:100%;border-radius:12px"><img id="pvOrig" src="\'+view+\'" style="width:100%;border-radius:12px;display:none"><p class="note" id="previewErr" style="display:none">图片预览加载失败，可能是原图太大或网络中断，点下面下载后本地查看。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载原图</a>\';var _im=bd.querySelector(\'img\');if(_im){_im.onerror=function(){_im.style.display=\'none\';var e=document.getElementById(\'previewErr\');if(e)e.style.display=\'block\';};}var _og=bd.querySelector(\'#pvOrig\');var _tb=bd.querySelector(\'#pvThumb\');if(_og){var _ogLoaded=false;var _ogTimer=null;var _ogRetry=null;function _ogShowRetry(){if(_ogRetry){_ogRetry.style.display=\'\';return;}_ogRetry=document.createElement(\'div\');_ogRetry.id=\'pvOrigRetry\';var _rb=document.createElement(\'button\');_rb.className=\'btn primary\';_rb.type=\'button\';_rb.textContent=\'原图加载较慢或加载失败，点我重试原图\';_rb.onclick=function(){_ogLoaded=false;if(_ogRetry)_ogRetry.style.display=\'none\';var _pe=document.getElementById(\'previewErr\');if(_tb&&(!_pe||_pe.style.display!==\'block\'))_tb.style.display=\'\';_og.style.display=\'none\';_ogStartTimer();_og.src=view+(view.indexOf(\'?\')>=0?\'&\':\'?\')+\'retry=\'+(new Date().getTime());};var _bd2=document.getElementById(\'previewBody\');if(_bd2)_bd2.appendChild(_ogRetry);_ogRetry.appendChild(_rb);}function _ogStartTimer(){if(_ogTimer)clearTimeout(_ogTimer);_ogTimer=setTimeout(function(){if(!_ogLoaded)_ogShowRetry();},15000);}_og.onload=function(){_ogLoaded=true;if(_ogTimer)clearTimeout(_ogTimer);if(_ogRetry)_ogRetry.style.display=\'none\';if(_tb)_tb.style.display=\'none\';_og.style.display=\'block\';};_og.onerror=function(){if(_ogTimer)clearTimeout(_ogTimer);_ogShowRetry();};_ogStartTimer();}}else if(t.dataset.isvid===\'1\'){bd.innerHTML=\'<video id="pvVideo" controls preload="metadata" src="\'+view+\'" style="width:100%;border-radius:12px"></video><div style="display:none;gap:8px;margin:10px 0"><button class="btn" id="qLowBtn" type="button">流畅</button><button class="btn" id="qHighBtn" type="button">高清</button></div><div id="qNote" class="note"></div><p class="note">大视频在线播需要先缓冲一会儿；如果一直转圈，点下面下载后本地播放更快。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载视频</a>\';var _vid=bd.querySelector(\'#pvVideo\');var _ql=bd.querySelector(\'#qLowBtn\');var _qh=bd.querySelector(\'#qHighBtn\');var _qn=bd.querySelector(\'#qNote\');var _qrow=_ql?_ql.parentElement:null;function _setQ(mode,play){if(!_vid)return;if(mode===\'low\'){_vid.src=\'/preview/\'+t.dataset.id;}else{_vid.src=view;}_vid.load();if(play){try{_vid.play();}catch(e){}}if(_ql){_ql.style.background=mode===\'low\'?\'var(--green)\':\'\';_ql.style.color=mode===\'low\'?\'#fff\':\'\';}if(_qh){_qh.style.background=mode===\'high\'?\'var(--green)\':\'\';_qh.style.color=mode===\'high\'?\'#fff\':\'\';}try{localStorage.setItem(\'video_quality\',mode);}catch(e){}}if(_ql)_ql.addEventListener(\'click\',function(){_setQ(\'low\',true);});if(_qh)_qh.addEventListener(\'click\',function(){_setQ(\'high\',true);});if(_vid)_vid.addEventListener(\'error\',function(){if(_vid.src.indexOf(\'/preview/\')>=0){_vid.src=view;_vid.load();}});fetch(\'/preview_status/\'+t.dataset.id).then(function(r){return r.json();}).then(function(j){if(j.has_preview){if(_qrow)_qrow.style.display=\'flex\';var saved=null;try{saved=localStorage.getItem(\'video_quality\');}catch(e){}_setQ(saved===\'high\'?\'high\':\'low\',false);if(_qn)_qn.textContent=\'流畅版是低清预览，起播快；点高清切回原片，加载慢自己受着。\';}else{if(_qrow)_qrow.style.display=\'none\';if(_qn)_qn.textContent=\'低清版还没生成，先看原片。\';}}).catch(function(){if(_qrow)_qrow.style.display=\'none\';});}else if(t.dataset.isaud===\'1\'){bd.innerHTML=\'<audio controls src="\'+view+\'" style="width:100%"></audio>\';}else if(t.dataset.cat===\'文档\'){bd.innerHTML=\'<iframe src="\'+view+\'" style="width:100%;height:420px;border:0;border-radius:12px"></iframe><p style="margin-top:10px"><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a></p>\';}else{bd.innerHTML=\'<p class="note">这个类型不能在线预览，请下载后打开。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a>\';}ov.style.display=\'flex\';_loadComments(t.dataset.id);}function _escHtml(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");} function _loadComments(fid){var card=document.getElementById(\'previewCard\');if(!card)return;var cs=document.getElementById(\'commentSection\');if(!cs){cs=document.createElement(\'div\');cs.id=\'commentSection\';card.appendChild(cs);}cs.innerHTML=\'<div style="margin-top:14px;border-top:1px solid var(--line);padding-top:10px"><b>留言</b><div id="commentList" style="margin-top:8px">加载留言中…</div><input id="commentNick" placeholder="昵称（不填就是匿名）" maxlength="50" style="width:100%;margin-top:8px;box-sizing:border-box"><textarea id="commentText" rows="2" placeholder="写下你的留言…" maxlength="500" style="width:100%;margin-top:6px;box-sizing:border-box"></textarea><button class="btn primary" id="commentSend" type="button" style="margin-top:6px">发送留言</button><div id="commentMsg" class="note"></div></div>\';var list=cs.querySelector(\'#commentList\');function render(items){if(!items||!items.length){list.innerHTML=\'<p class="note">还没有留言。</p>\';return;}list.innerHTML=items.map(function(c){return \'<div style="margin-bottom:8px"><div style="font-weight:800;font-size:13px">\'+_escHtml(c.author||\'匿名\')+\' <span style="font-weight:400;color:var(--muted);font-size:11px">\'+_escHtml(c.time||\'\')+\'</span></div><div style="font-size:13px;word-break:break-all">\'+_escHtml(c.text||\'\')+\'</div></div>\';}).join(\'\');}function reload(){fetch(\'/comments/\'+encodeURIComponent(fid)).then(function(r){return r.json();}).then(function(j){render(j.comments);}).catch(function(){list.innerHTML=\'<p class="note">留言加载失败，稍后再试。</p>\';});}reload();var btn=cs.querySelector(\'#commentSend\');if(btn){btn.onclick=function(){var nick=cs.querySelector(\'#commentNick\').value;var txt=cs.querySelector(\'#commentText\').value;var msg=cs.querySelector(\'#commentMsg\');if(!txt.trim()){msg.textContent=\'留言不能为空\';return;}msg.textContent=\'发送中…\';var fd=new FormData();fd.append(\'author\',nick);fd.append(\'text\',txt);fetch(\'/comments/\'+encodeURIComponent(fid),{method:\'POST\',body:fd}).then(function(r){return r.json();}).then(function(j){if(j.ok){cs.querySelector(\'#commentText\').value=\'\';msg.textContent=\'已发送\';reload();}else{msg.textContent=j.error||\'发送失败\';}}).catch(function(){msg.textContent=\'发送失败，请重试\';});};}} function closePreview(){var ov=document.getElementById(\'previewOverlay\');var bd=document.getElementById(\'previewBody\');if(bd){bd.querySelectorAll(\'video,audio\').forEach(function(m){m.pause();m.removeAttribute(\'src\');m.load();});bd.innerHTML=\'\';}if(ov)ov.style.display=\'none\';}function dlTile(t){var url=t.dataset.dl;var name=t.querySelector(\'.tile-name\').textContent;var _st=document.createElement(\'div\');_st.className=\'note dlstatus\';_st.textContent=\'下载准备中…\';t.appendChild(_st);_dlFeed(url,name,_st);}document.getElementById(\'albumGrid\').addEventListener(\'click\',function(e){var t=e.target.closest(\'.tile\');if(!t)return;if(e.target.closest&&e.target.closest(\'.dlstatus\'))return;if(selectMode){var id=t.dataset.id;if(selected.has(id)){selected.delete(id);t.classList.remove(\'selected\');}else{selected.add(id);t.classList.add(\'selected\');}updateSel();}else{openPreview(t);}});document.getElementById(\'previewClose\').addEventListener(\'click\',closePreview);document.getElementById(\'previewOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'previewOverlay\')closePreview();});document.getElementById(\'selBtn\').addEventListener(\'click\',function(){selectMode=!selectMode;var g=document.getElementById(\'albumGrid\');if(selectMode){g.classList.add(\'selecting\');this.textContent=\'取消选择\';}else{selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});g.classList.remove(\'selecting\');this.textContent=\'选择\';}updateSel();});document.getElementById(\'dlSelBtn\').addEventListener(\'click\',function(){var tiles=[];document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(selected.has(t.dataset.id))tiles.push(t);});if(!tiles.length)return;var i=0;function next(){if(i>=tiles.length){alert(\'已开始下载 \'+tiles.length+\' 个文件（浏览器可能逐个询问是否允许多个下载）。\');selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});document.getElementById(\'albumGrid\').classList.remove(\'selecting\');selectMode=false;document.getElementById(\'selBtn\').textContent=\'选择\';updateSel();return;}dlTile(tiles[i]);i++;setTimeout(next,600);}next();});document.getElementById(\'newFolderBtn\').addEventListener(\'click\',function(){var f=document.getElementById(\'newFolderForm\');f.style.display=\'flex\';});document.getElementById(\'newFolderCancel\').addEventListener(\'click\',function(){document.getElementById(\'newFolderForm\').style.display=\'none\';});document.getElementById(\'moveForm\').addEventListener(\'submit\',function(e){if(!selected.size){e.preventDefault();alert(\'请先勾选文件\');}});document.getElementById(\'moveBtn\').addEventListener(\'click\',function(){if(!selected.size){alert(\'请先勾选文件\');return;}var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'flex\';});document.getElementById(\'moveCancel\').addEventListener(\'click\',function(){var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'none\';});document.getElementById(\'moveOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'moveOverlay\'){e.target.style.display=\'none\';}});document.querySelectorAll(\'#moveOverlay [data-dest]\').forEach(function(b){b.addEventListener(\'click\',function(){var d=document.getElementById(\'moveDest\');if(d)d.value=b.dataset.dest;document.getElementById(\'moveForm\').submit();});});function _segDl(url,name,size,progEl,doneCb){var CH=8*1024*1024,PAR=3,TRY=3,total=Math.ceil(size/CH),parts=new Array(total),done=0,failed=false,next=0,inflight=0;function show(){if(progEl)progEl.textContent=\'下载中 \'+Math.round(done/total*100)+\'%（\'+(done*CH>size?size:done*CH)+\' / \'+size+\' 字节）\';}function fetchC(idx,att,cb){var st=idx*CH,en=Math.min(size-1,st+CH-1);var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.setRequestHeader(\'Range\',\'bytes=\'+st+\'-\'+en);x.responseType=\'blob\';x.onload=function(){if(x.status===206||x.status===200){cb(null,x.response);}else if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk failed\'));}};x.onerror=function(){if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk network error\'));}};x.send();}function launch(){while(!failed&&inflight<PAR&&next<total){(function(idx){inflight++;fetchC(idx,0,function(err,blob){inflight--;if(failed)return;if(err){failed=true;if(doneCb)doneCb(err);return;}parts[idx]=blob;done++;show();if(done===total){var a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob(parts));a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);if(doneCb)doneCb(null);}else{launch();}});})(next);next++;}}show();launch();}function _dlFeed(url,name,el){el.textContent=\'下载准备中…\';var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.responseType=\'blob\';x.onprogress=function(e){if(e.lengthComputable&&e.total){el.textContent=\'下载中 \'+Math.round(e.loaded/e.total*100)+\'%\';}else{el.textContent=\'下载中 \'+e.loaded+\' 字节\';}};function _fail(){el.innerHTML=\'\';var b=document.createElement(\'button\');b.className=\'btn\';b.type=\'button\';b.textContent=\'下载失败，点我重试\';b.onclick=function(){_dlFeed(url,name,el);};el.appendChild(b);}x.onload=function(){if(x.status===200){el.textContent=\'下载完成\';var a=document.createElement(\'a\');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);setTimeout(function(){if(el.parentNode)el.parentNode.removeChild(el);},2000);}else{_fail();}};x.onerror=function(){_fail();};x.send();}document.getElementById(\'previewBody\').addEventListener(\'click\',function(e){var a=e.target.closest?e.target.closest(\'.segdl\'):null;if(!a)return;var sz=parseInt(a.dataset.size||\'0\',10);if(sz>=20*1024*1024&&sz<=500*1024*1024){e.preventDefault();var prog=document.getElementById(\'segProg\');if(!prog){prog=document.createElement(\'div\');prog.id=\'segProg\';prog.className=\'note\';var _pb=document.getElementById(\'previewBody\');if(_pb)_pb.appendChild(prog);}_segDl(a.dataset.dl,a.dataset.name||\'download\',sz,prog,function(err){if(err&&prog)prog.textContent=\'下载失败，请重试\';else if(prog)prog.textContent=\'下载完成\';});return;}e.preventDefault();var _st2=document.createElement(\'div\');_st2.className=\'note dlstatus\';var _pb2=document.getElementById(\'previewBody\');if(_pb2)_pb2.appendChild(_st2);var _nm=document.getElementById(\'previewTitle\')?document.getElementById(\'previewTitle\').textContent:\'download\';if(!sz||sz>500*1024*1024){_st2.textContent=\'下载准备中…已开始下载，请留意浏览器下载栏\';var _tmp=document.createElement(\'a\');_tmp.href=a.dataset.dl;_tmp.download=_nm;document.body.appendChild(_tmp);_tmp.click();_tmp.remove();return;}_dlFeed(a.dataset.dl,_nm,_st2);});var _pre={};function _preOrig(t){if(!t||t.dataset.isimg!==\'1\')return;var u=t.dataset.view;if(!u||_pre[u])return;_pre[u]=1;var im=new Image();im.src=u;}document.addEventListener(\'touchstart\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);},{passive:true});document.addEventListener(\'mouseover\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);});function _preVisible(){if(navigator.connection&&navigator.connection.saveData)return;var n=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(n>=6)return;if(t.style.display===\'none\')return;var r=t.getBoundingClientRect();if(r.bottom<0||r.top>window.innerHeight)return;var b=Object.keys(_pre).length;_preOrig(t);if(Object.keys(_pre).length>b)n++;});}if(\'requestIdleCallback\' in window){requestIdleCallback(_preVisible,{timeout:2000});}else{setTimeout(_preVisible,1500);}</script></div>'
+    '<div class="tabpanel active" id="tab-published"><div class="pub-toolbar"><input class="search" id="search" type="search" placeholder="搜索文件名…" oninput="onSearch(this.value)"><button class="btn" id="openDrawerBtn" type="button">导航</button><button class="btn" id="selBtn" type="button">选择</button></div><section class="card section"><div class="section-head"><h2>已发布</h2><span class="count">{{ files|length }} 个</span></div>{% if msg %}<p class="note" style="margin-top:10px">{{ msg }}</p>{% endif %}<div class="folderbar" id="folderbar"><button class="tab active" data-folder="all" onclick="showFolder(\'all\',this)">全部（{{ files|length }}）</button>{% for fo in folders %}<button class="tab" data-folder="{{ fo.id }}" onclick="showFolder(\'{{ fo.id }}\',this)">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}<button class="tab" id="newFolderBtn" type="button">+ 新建文件夹</button></div><form id="newFolderForm" method="post" action="/folder/create" style="display:none;gap:8px;margin-top:10px"><input class="textin" name="name" placeholder="新文件夹名字，比如：旅行" required maxlength="50" style="flex:1"><button class="btn primary" type="submit">创建</button><button class="btn" type="button" id="newFolderCancel">取消</button></form><div class="tabs" id="cattabs"><button class="tab active" onclick="showCat(\'全部\',this)">全部（{{ files|length }}）</button>{% for c in cats %}{% if c.count %}<button class="tab" onclick="showCat(\'{{ c.name }}\',this)">{{ c.name }}（{{ c.count }}）</button>{% endif %}{% endfor %}</div><form id="moveForm" method="post" action="/folder/move" style="display:none;margin-top:12px;margin-bottom:4px;gap:8px;flex-wrap:wrap;align-items:center"><span id="selCount" style="font-weight:800"></span><input type="hidden" name="dest_folder_id" id="moveDest"><input type="hidden" name="file_ids" id="moveFileIds"><button class="btn primary" type="button" id="moveBtn">移动</button><button class="btn" type="button" id="dlSelBtn">选择下载</button></form><div class="album-grid" id="albumGrid">{% for f in files %}<div class="tile" data-cat="{{ f.kind }}" data-folder="{{ f.folder_id }}" data-name="{{ f.name|lower }}" data-id="{{ f.id }}" data-dl="/download/{{ f.id }}" data-view="/view/{{ f.id }}" data-isimg="{{ \'1\' if f.is_image else \'0\' }}" data-isvid="{{ \'1\' if f.is_video else \'0\' }}" data-isaud="{{ \'1\' if f.is_audio else \'0\' }}" data-size="{{ f.size_bytes }}"><span class="tile-check"></span>{% if f.is_image or f.is_video %}<img class="tileimg" src="/thumb/{{ f.id }}" data-fb="/thumb/{{ f.id }}" alt="" loading="lazy" onerror="_thumbErr(this)">{% if f.is_video %}<div class="tilefic tile-video" style="display:none">影</div>{% else %}<div class="tilefic tile-img" style="display:none">图</div>{% endif %}{% elif f.is_audio %}<div class="tilefic tile-music">音</div>{% elif f.kind == "文档" %}<div class="tilefic tile-doc">文</div>{% elif f.kind == "压缩包" %}<div class="tilefic tile-zip">压</div>{% elif f.kind == "安装包" %}<div class="tilefic tile-pkg">包</div>{% elif f.kind == "影音" %}<div class="tilefic tile-video">影</div>{% else %}<div class="tilefic tile-other">他</div>{% endif %}<div class="tileinfo"><div class="tile-name" style="display:none">{{ f.name }}</div><div class="tile-meta">{{ f.kind }} · {{ f.size }}{% if f.source == "baidu" %} · 百度{% endif %}{% if f.ai_note %} · {{ f.ai_note }}{% endif %}</div></div><span class="tile-dl">↓ {{ f.dl_count|default(0) }}</span></div>{% endfor %}</div><p class="empty" id="folderEmpty" style="display:none">这个文件夹里还没有文件。</p>{% if not files %}<p class="empty">目前还没有已发布的文件。</p>{% endif %}<p class="note">点图片默认就是预览；点右上角“选择”，再点图片打勾，就可以批量下载或移动到文件夹。</p></section><div id="previewOverlay"><div id="previewCard"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b id="previewTitle" style="word-break:break-all"></b><button class="btn" id="previewClose" type="button">关闭</button></div><div id="previewBody" style="margin-top:12px"></div></div></div><div id="moveOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40;align-items:center;justify-content:center;padding:16px;box-sizing:border-box"><div style="background:var(--surface);border-radius:18px;padding:16px;width:100%;max-width:420px;max-height:90vh;overflow:auto"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b>移到哪里？</b><button class="btn" type="button" id="moveCancel">取消</button></div><p class="note" style="margin-top:8px">点一个文件夹，选中的文件就会移过去。</p><button class="btn" type="button" data-dest="{{ published_id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">已发布根目录</button>{% for fo in folders %}<button class="btn" type="button" data-dest="{{ fo.id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}</div></div><script>var curCat=\'全部\',curFolder=\'all\',curQ=\'\',selectMode=false,selected=new Set();function applyFilter(){var vis=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){var okCat=curCat===\'全部\'||t.dataset.cat===curCat;var okFolder=curFolder===\'all\'||t.dataset.folder===curFolder;var okQ=t.dataset.name.includes(curQ);var show=(okCat&&okFolder&&okQ);var _nm=t.querySelector(\'.tile-name\');if(_nm)_nm.style.display=(show&&curQ)?\'\':\'none\';t.style.display=show?\'\':\'none\';if(show)vis++;});var fe=document.getElementById(\'folderEmpty\');if(fe)fe.style.display=(curFolder!==\'all\'&&vis===0)?\'block\':\'none\';}function showCat(c,el){curCat=c;document.querySelectorAll(\'#cattabs .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function showFolder(fid,el){curFolder=fid;document.querySelectorAll(\'#folderbar .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function onSearch(v){curQ=v.toLowerCase();applyFilter();}function updateSel(){var mf=document.getElementById(\'moveForm\');var sc=document.getElementById(\'selCount\');var ids=document.getElementById(\'moveFileIds\');if(sc)sc.textContent=\'已选 \'+selected.size+\' 个 · 选择模式中，点图片是打勾，点右上角“取消选择”退出后才能查看\';if(ids)ids.value=Array.from(selected).join(\',\');if(mf)mf.style.display=selected.size?\'flex\':\'none\';}function _thumbErr(im){if(!im.dataset.fbDone&&im.dataset.fb){im.dataset.fbDone=\'1\';im.src=im.dataset.fb;return;}im.style.display=\'none\';var nx=im.nextElementSibling;if(nx)nx.style.display=\'grid\';}function openPreview(t){var ov=document.getElementById(\'previewOverlay\');var ti=document.getElementById(\'previewTitle\');var bd=document.getElementById(\'previewBody\');if(!ov||!ti||!bd)return;ti.textContent=t.querySelector(\'.tile-name\').textContent;var view=t.dataset.view,dl=t.dataset.dl;if(t.dataset.isimg===\'1\'){var _th=t.querySelector(\'.tileimg\');var _tu=_th?_th.getAttribute(\'src\'):\'\';bd.innerHTML=\'<img id="pvThumb" src="\'+_tu+\'" style="width:100%;border-radius:12px"><img id="pvOrig" src="\'+view+\'" style="width:100%;border-radius:12px;display:none"><p class="note" id="previewErr" style="display:none">图片预览加载失败，可能是原图太大或网络中断，点下面下载后本地查看。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载原图</a>\';var _im=bd.querySelector(\'img\');if(_im){_im.onerror=function(){_im.style.display=\'none\';var e=document.getElementById(\'previewErr\');if(e)e.style.display=\'block\';};}var _og=bd.querySelector(\'#pvOrig\');var _tb=bd.querySelector(\'#pvThumb\');if(_og){var _ogLoaded=false;var _ogTimer=null;var _ogRetry=null;function _ogShowRetry(){if(_ogRetry){_ogRetry.style.display=\'\';return;}_ogRetry=document.createElement(\'div\');_ogRetry.id=\'pvOrigRetry\';var _rb=document.createElement(\'button\');_rb.className=\'btn primary\';_rb.type=\'button\';_rb.textContent=\'原图加载较慢或加载失败，点我重试原图\';_rb.onclick=function(){_ogLoaded=false;if(_ogRetry)_ogRetry.style.display=\'none\';var _pe=document.getElementById(\'previewErr\');if(_tb&&(!_pe||_pe.style.display!==\'block\'))_tb.style.display=\'\';_og.style.display=\'none\';_ogStartTimer();_og.src=view+(view.indexOf(\'?\')>=0?\'&\':\'?\')+\'retry=\'+(new Date().getTime());};var _bd2=document.getElementById(\'previewBody\');if(_bd2)_bd2.appendChild(_ogRetry);_ogRetry.appendChild(_rb);}function _ogStartTimer(){if(_ogTimer)clearTimeout(_ogTimer);_ogTimer=setTimeout(function(){if(!_ogLoaded)_ogShowRetry();},15000);}_og.onload=function(){_ogLoaded=true;if(_ogTimer)clearTimeout(_ogTimer);if(_ogRetry)_ogRetry.style.display=\'none\';if(_tb)_tb.style.display=\'none\';_og.style.display=\'block\';};_og.onerror=function(){if(_ogTimer)clearTimeout(_ogTimer);_ogShowRetry();};_ogStartTimer();}}else if(t.dataset.isvid===\'1\'){bd.innerHTML=\'<video id="pvVideo" controls preload="metadata" src="\'+view+\'" style="width:100%;border-radius:12px"></video><div style="display:none;gap:8px;margin:10px 0"><button class="btn" id="qLowBtn" type="button">流畅</button><button class="btn" id="qHighBtn" type="button">高清</button></div><div id="qNote" class="note"></div><p class="note">大视频在线播需要先缓冲一会儿；如果一直转圈，点下面下载后本地播放更快。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载视频</a>\';var _vid=bd.querySelector(\'#pvVideo\');var _ql=bd.querySelector(\'#qLowBtn\');var _qh=bd.querySelector(\'#qHighBtn\');var _qn=bd.querySelector(\'#qNote\');var _qrow=_ql?_ql.parentElement:null;function _setQ(mode,play){if(!_vid)return;if(mode===\'low\'){_vid.src=\'/preview/\'+t.dataset.id;}else{_vid.src=view;}_vid.load();if(play){try{_vid.play();}catch(e){}}if(_ql){_ql.style.background=mode===\'low\'?\'var(--green)\':\'\';_ql.style.color=mode===\'low\'?\'#fff\':\'\';}if(_qh){_qh.style.background=mode===\'high\'?\'var(--green)\':\'\';_qh.style.color=mode===\'high\'?\'#fff\':\'\';}try{localStorage.setItem(\'video_quality\',mode);}catch(e){}}if(_ql)_ql.addEventListener(\'click\',function(){_setQ(\'low\',true);});if(_qh)_qh.addEventListener(\'click\',function(){_setQ(\'high\',true);});if(_vid)_vid.addEventListener(\'error\',function(){if(_vid.src.indexOf(\'/preview/\')>=0){_vid.src=view;_vid.load();}});fetch(\'/preview_status/\'+t.dataset.id).then(function(r){return r.json();}).then(function(j){if(j.has_preview){if(_qrow)_qrow.style.display=\'flex\';var saved=null;try{saved=localStorage.getItem(\'video_quality\');}catch(e){}_setQ(saved===\'high\'?\'high\':\'low\',false);if(_qn)_qn.textContent=\'流畅版是低清预览，起播快；点高清切回原片，加载慢自己受着。\';}else{if(_qrow)_qrow.style.display=\'none\';if(_qn)_qn.textContent=\'低清版还没生成，先看原片。\';}}).catch(function(){if(_qrow)_qrow.style.display=\'none\';});}else if(t.dataset.isaud===\'1\'){bd.innerHTML=\'<audio controls src="\'+view+\'" style="width:100%"></audio>\';}else if(t.dataset.cat===\'文档\'){bd.innerHTML=\'<iframe src="\'+view+\'" style="width:100%;height:420px;border:0;border-radius:12px"></iframe><p style="margin-top:10px"><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a></p>\';}else{bd.innerHTML=\'<p class="note">这个类型不能在线预览，请下载后打开。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a>\';}ov.style.display=\'flex\';_loadComments(t.dataset.id);}function _escHtml(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");} function _loadComments(fid){var card=document.getElementById(\'previewCard\');if(!card)return;var cs=document.getElementById(\'commentSection\');if(!cs){cs=document.createElement(\'div\');cs.id=\'commentSection\';card.appendChild(cs);}cs.innerHTML=\'<div style="margin-top:14px;border-top:1px solid var(--line);padding-top:10px"><b>留言</b><div id="commentList" style="margin-top:8px">加载留言中…</div><input id="commentNick" placeholder="昵称（不填就是匿名）" maxlength="50" style="width:100%;margin-top:8px;box-sizing:border-box"><textarea id="commentText" rows="2" placeholder="写下你的留言…" maxlength="500" style="width:100%;margin-top:6px;box-sizing:border-box"></textarea><button class="btn primary" id="commentSend" type="button" style="margin-top:6px">发送留言</button><div id="commentMsg" class="note"></div></div>\';var list=cs.querySelector(\'#commentList\');function render(items){if(!items||!items.length){list.innerHTML=\'<p class="note">还没有留言。</p>\';return;}list.innerHTML=items.map(function(c){return \'<div style="margin-bottom:8px"><div style="font-weight:800;font-size:13px">\'+_escHtml(c.author||\'匿名\')+\' <span style="font-weight:400;color:var(--muted);font-size:11px">\'+_escHtml(c.time||\'\')+\'</span></div><div style="font-size:13px;word-break:break-all">\'+_escHtml(c.text||\'\')+\'</div></div>\';}).join(\'\');}function reload(){fetch(\'/comments/\'+encodeURIComponent(fid)).then(function(r){return r.json();}).then(function(j){render(j.comments);}).catch(function(){list.innerHTML=\'<p class="note">留言加载失败，稍后再试。</p>\';});}reload();var btn=cs.querySelector(\'#commentSend\');if(btn){btn.onclick=function(){var nick=cs.querySelector(\'#commentNick\').value;var txt=cs.querySelector(\'#commentText\').value;var msg=cs.querySelector(\'#commentMsg\');if(!txt.trim()){msg.textContent=\'留言不能为空\';return;}msg.textContent=\'发送中…\';var fd=new FormData();fd.append(\'author\',nick);fd.append(\'text\',txt);fetch(\'/comments/\'+encodeURIComponent(fid),{method:\'POST\',body:fd}).then(function(r){return r.json();}).then(function(j){if(j.ok){cs.querySelector(\'#commentText\').value=\'\';msg.textContent=\'已发送\';reload();}else{msg.textContent=j.error||\'发送失败\';}}).catch(function(){msg.textContent=\'发送失败，请重试\';});};}} function closePreview(){var ov=document.getElementById(\'previewOverlay\');var bd=document.getElementById(\'previewBody\');if(bd){bd.querySelectorAll(\'video,audio\').forEach(function(m){m.pause();m.removeAttribute(\'src\');m.load();});bd.innerHTML=\'\';}if(ov)ov.style.display=\'none\';}function dlTile(t){var url=t.dataset.dl;var name=t.querySelector(\'.tile-name\').textContent;var _st=document.createElement(\'div\');_st.className=\'note dlstatus\';_st.textContent=\'下载准备中…\';t.appendChild(_st);_dlFeed(url,name,_st);}document.getElementById(\'albumGrid\').addEventListener(\'click\',function(e){var t=e.target.closest(\'.tile\');if(!t)return;if(e.target.closest&&e.target.closest(\'.dlstatus\'))return;if(selectMode){var id=t.dataset.id;if(selected.has(id)){selected.delete(id);t.classList.remove(\'selected\');}else{selected.add(id);t.classList.add(\'selected\');}updateSel();}else{openPreview(t);}});document.getElementById(\'previewClose\').addEventListener(\'click\',closePreview);document.getElementById(\'previewOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'previewOverlay\')closePreview();});document.getElementById(\'selBtn\').addEventListener(\'click\',function(){selectMode=!selectMode;var g=document.getElementById(\'albumGrid\');if(selectMode){g.classList.add(\'selecting\');this.textContent=\'取消选择\';}else{selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});g.classList.remove(\'selecting\');this.textContent=\'选择\';}updateSel();});document.getElementById(\'dlSelBtn\').addEventListener(\'click\',function(){var tiles=[];document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(selected.has(t.dataset.id))tiles.push(t);});if(!tiles.length)return;var i=0;function next(){if(i>=tiles.length){alert(\'已开始下载 \'+tiles.length+\' 个文件（浏览器可能逐个询问是否允许多个下载）。\');selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});document.getElementById(\'albumGrid\').classList.remove(\'selecting\');selectMode=false;document.getElementById(\'selBtn\').textContent=\'选择\';updateSel();return;}dlTile(tiles[i]);i++;setTimeout(next,600);}next();});document.getElementById(\'newFolderBtn\').addEventListener(\'click\',function(){var f=document.getElementById(\'newFolderForm\');f.style.display=\'flex\';});document.getElementById(\'newFolderCancel\').addEventListener(\'click\',function(){document.getElementById(\'newFolderForm\').style.display=\'none\';});document.getElementById(\'moveForm\').addEventListener(\'submit\',function(e){if(!selected.size){e.preventDefault();alert(\'请先勾选文件\');}});document.getElementById(\'moveBtn\').addEventListener(\'click\',function(){if(!selected.size){alert(\'请先勾选文件\');return;}var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'flex\';});document.getElementById(\'moveCancel\').addEventListener(\'click\',function(){var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'none\';});document.getElementById(\'moveOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'moveOverlay\'){e.target.style.display=\'none\';}});document.querySelectorAll(\'#moveOverlay [data-dest]\').forEach(function(b){b.addEventListener(\'click\',function(){var d=document.getElementById(\'moveDest\');if(d)d.value=b.dataset.dest;document.getElementById(\'moveForm\').submit();});});function _segDl(url,name,size,progEl,doneCb){var CH=8*1024*1024,PAR=3,TRY=3,total=Math.ceil(size/CH),parts=new Array(total),done=0,failed=false,next=0,inflight=0;function show(){if(progEl)progEl.textContent=\'下载中 \'+Math.round(done/total*100)+\'%（\'+(done*CH>size?size:done*CH)+\' / \'+size+\' 字节）\';}function fetchC(idx,att,cb){var st=idx*CH,en=Math.min(size-1,st+CH-1);var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.setRequestHeader(\'Range\',\'bytes=\'+st+\'-\'+en);x.responseType=\'blob\';x.onload=function(){if(x.status===206||x.status===200){cb(null,x.response);}else if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk failed\'));}};x.onerror=function(){if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk network error\'));}};x.send();}function launch(){while(!failed&&inflight<PAR&&next<total){(function(idx){inflight++;fetchC(idx,0,function(err,blob){inflight--;if(failed)return;if(err){failed=true;if(doneCb)doneCb(err);return;}parts[idx]=blob;done++;show();if(done===total){var a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob(parts));a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);if(doneCb)doneCb(null);}else{launch();}});})(next);next++;}}show();launch();}function _dlFeed(url,name,el){el.textContent=\'下载准备中…\';var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.responseType=\'blob\';x.onprogress=function(e){if(e.lengthComputable&&e.total){el.textContent=\'下载中 \'+Math.round(e.loaded/e.total*100)+\'%\';}else{el.textContent=\'下载中 \'+e.loaded+\' 字节\';}};function _fail(){el.innerHTML=\'\';var b=document.createElement(\'button\');b.className=\'btn\';b.type=\'button\';b.textContent=\'下载失败，点我重试\';b.onclick=function(){_dlFeed(url,name,el);};el.appendChild(b);}x.onload=function(){if(x.status===200){el.textContent=\'下载完成\';var a=document.createElement(\'a\');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);setTimeout(function(){if(el.parentNode)el.parentNode.removeChild(el);},2000);}else{_fail();}};x.onerror=function(){_fail();};x.send();}document.getElementById(\'previewBody\').addEventListener(\'click\',function(e){var a=e.target.closest?e.target.closest(\'.segdl\'):null;if(!a)return;var sz=parseInt(a.dataset.size||\'0\',10);if(sz>=20*1024*1024&&sz<=500*1024*1024){e.preventDefault();var prog=document.getElementById(\'segProg\');if(!prog){prog=document.createElement(\'div\');prog.id=\'segProg\';prog.className=\'note\';var _pb=document.getElementById(\'previewBody\');if(_pb)_pb.appendChild(prog);}_segDl(a.dataset.dl,a.dataset.name||\'download\',sz,prog,function(err){if(err&&prog)prog.textContent=\'下载失败，请重试\';else if(prog)prog.textContent=\'下载完成\';});return;}e.preventDefault();var _st2=document.createElement(\'div\');_st2.className=\'note dlstatus\';var _pb2=document.getElementById(\'previewBody\');if(_pb2)_pb2.appendChild(_st2);var _nm=document.getElementById(\'previewTitle\')?document.getElementById(\'previewTitle\').textContent:\'download\';if(!sz||sz>500*1024*1024){_st2.textContent=\'下载准备中…已开始下载，请留意浏览器下载栏\';var _tmp=document.createElement(\'a\');_tmp.href=a.dataset.dl;_tmp.download=_nm;document.body.appendChild(_tmp);_tmp.click();_tmp.remove();return;}_dlFeed(a.dataset.dl,_nm,_st2);});var _pre={};function _preOrig(t){if(!t||t.dataset.isimg!==\'1\')return;var u=t.dataset.view;if(!u||_pre[u])return;_pre[u]=1;var im=new Image();im.src=u;}document.addEventListener(\'touchstart\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);},{passive:true});document.addEventListener(\'mouseover\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);});function _preVisible(){if(navigator.connection&&navigator.connection.saveData)return;var n=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(n>=6)return;if(t.style.display===\'none\')return;var r=t.getBoundingClientRect();if(r.bottom<0||r.top>window.innerHeight)return;var b=Object.keys(_pre).length;_preOrig(t);if(Object.keys(_pre).length>b)n++;});}if(\'requestIdleCallback\' in window){requestIdleCallback(_preVisible,{timeout:2000});}else{setTimeout(_preVisible,1500);}</script></div>'
     "{% endif %}"
     "<script>function dlFile(btn){var row=btn.closest('.file');var wrap=row.querySelector('.dlprog');var bar=row.querySelector('.dlbar');var tx=row.querySelector('.dltext');if(!wrap)return;wrap.style.display='block';btn.disabled=true;var url=btn.getAttribute('data-dl');var name=btn.getAttribute('data-name');var x=new XMLHttpRequest();x.open('GET',url,true);x.responseType='blob';x.onprogress=function(ev){if(ev.lengthComputable){var pct=Math.round(ev.loaded/ev.total*100);bar.style.width=pct+'%';tx.textContent='下载中… '+pct+'%（'+(ev.loaded/1048576).toFixed(1)+' / '+(ev.total/1048576).toFixed(1)+' MB）';}else{tx.textContent='下载中… '+(ev.loaded/1048576).toFixed(1)+' MB';}};x.onload=function(){if(x.status===200){bar.style.width='100%';tx.textContent='下载完成';var a=document.createElement('a');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}else{tx.textContent='下载失败，请重试';}btn.disabled=false;};x.onerror=function(){tx.textContent='下载失败，请检查网络后重试';btn.disabled=false;};x.send();}</script>"
         '<div class="tabpanel" id="tab-private"><div class="card section"><h2>私人区</h2>'
@@ -1540,11 +1628,10 @@ PAGE = (
     "<div class=\"tabpanel\" id=\"tab-admin\"><div class=\"card section\"><h2>站长审核</h2>"
     "<p class=\"note\">站长入口与熟人入口分开，站长口令只在审核页使用。</p>"
     "<form method=\"post\" action=\"/admin/login\">"
-    "<input class=\"textin\" type=\"password\" name=\"token\" placeholder=\"站长口令\" required> "
-    "<button class=\"btn primary\" type=\"submit\">进入审核</button></form>{% if secondary_configured %}<form method=\"post\" action=\"/admin/secondary_login\" style=\"margin-top:8px\">"
-    "<input class=\"textin\" type=\"password\" name=\"token\" placeholder=\"二级管理员口令\" required> "
-    "<button class=\"btn\" type=\"submit\">二级管理员进入</button></form>{% endif %}</div>"
+    "<input class=\"textin\" type=\"password\" name=\"token\" placeholder=\"站长区口令\" required> "
+    "<button class=\"btn primary\" type=\"submit\">进入站长区</button></form></div>"
     "</div><script>var TAB_NAMES={'principle':'原理区','publish':'发布区','published':'已发布区','feedback':'意见区','private':'私人区','admin':'站长区'};function openDrawer(){var d=document.getElementById('drawer');var b=document.getElementById('drawerBackdrop');if(!d||!b)return;d.style.display='flex';b.style.display='block';requestAnimationFrame(function(){requestAnimationFrame(function(){d.classList.add('open');b.classList.add('open');});});}function closeDrawer(){var d=document.getElementById('drawer');var b=document.getElementById('drawerBackdrop');if(!d||!b||d.style.display==='none')return;d.classList.remove('open');b.classList.remove('open');setTimeout(function(){if(!d.classList.contains('open')){d.style.display='none';b.style.display='none';}},340);}function showTab(name){if(window.__uploading&&name==='admin'&&!confirm('正在上传，点站长区进入审核页会中断上传。确定要中断吗？')){return;}document.querySelectorAll('.tabpanel').forEach(function(el){el.classList.toggle('active',el.id==='tab-'+name);});document.querySelectorAll('#drawernav .drawer-navbtn').forEach(function(b){b.classList.toggle('active',b.dataset.tab===name);});var ct=document.getElementById('curtab');if(ct)ct.textContent='/ '+(TAB_NAMES[name]||name);closeDrawer();}document.getElementById('drawerBtn').addEventListener('click',function(){var d=document.getElementById('drawer');if(d.classList.contains('open')){closeDrawer();}else{openDrawer();}});document.getElementById('drawerBackdrop').addEventListener('click',closeDrawer);document.querySelectorAll('#drawernav .drawer-navbtn').forEach(function(b){b.addEventListener('click',function(e){e.preventDefault();location.hash=b.dataset.tab;showTab(b.dataset.tab);});});document.querySelectorAll('#drawerCats .drawer-navbtn').forEach(function(b){b.addEventListener('click',function(){location.hash='published';showTab('published');curCat=b.dataset.cat;document.querySelectorAll('#cattabs .tab').forEach(function(t){t.classList.toggle('active',t.textContent.indexOf(b.dataset.cat)===0);});applyFilter();});});var _odb=document.getElementById('openDrawerBtn');if(_odb)_odb.addEventListener('click',openDrawer);var h=(location.hash||'#published').replace('#','');if(['principle','publish','published','feedback','private','admin'].indexOf(h)<0){h='published';}showTab(h);</script>"
+    "{% if entered and announcement %}<div class=\"ann-overlay\" id=\"annOverlay\"><div class=\"ann-card\" role=\"dialog\" aria-label=\"公告\"><div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:10px\"><h2>{{ announcement.title|e }}</h2><button class=\"btn\" id=\"annClose\" type=\"button\" aria-label=\"关闭公告\">×</button></div><p>{{ announcement.body_html|safe }}</p><div style=\"text-align:right\"><button class=\"btn primary\" id=\"annOk\" type=\"button\">我知道了</button></div></div></div><script>(function(){var ov=document.getElementById('annOverlay');if(!ov)return;try{if(sessionStorage.getItem('exchange_ann_closed')){ov.remove();return;}}catch(e){}var reduced=!!(window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);function closeAnn(){try{sessionStorage.setItem('exchange_ann_closed','1');}catch(e){}if(reduced){ov.remove();return;}ov.classList.remove('ann-show');var done=false;function hide(){if(done)return;done=true;ov.remove();}ov.addEventListener('transitionend',hide,{once:true});setTimeout(hide,300);}var c=document.getElementById('annClose');if(c)c.addEventListener('click',closeAnn);var o=document.getElementById('annOk');if(o)o.addEventListener('click',closeAnn);ov.addEventListener('click',function(e){if(e.target===ov)closeAnn();});requestAnimationFrame(function(){requestAnimationFrame(function(){ov.classList.add('ann-show');});});})();</script>{% endif %}"
     "<script>(function(){function applyTheme(t){var b=document.getElementById('themeBtn');if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');if(b)b.textContent='\u2600\ufe0f \u767d\u5929\u6a21\u5f0f';}else{document.documentElement.removeAttribute('data-theme');if(b)b.textContent='🌙 \u6df1\u8272\u6a21\u5f0f';}try{localStorage.setItem('theme',t);}catch(e){}}var _b=document.getElementById('themeBtn');if(_b){_b.addEventListener('click',function(){var cur=document.documentElement.getAttribute('data-theme');applyTheme(cur==='dark'?'light':'dark');});}try{var saved=localStorage.getItem('theme');if(saved==='dark'){applyTheme('dark');}else if(saved==='light'){applyTheme('light');}}catch(e){}})();</script></div></body></html>"
 )
 
@@ -1553,7 +1640,7 @@ ADMIN_PAGE = (
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>审核 - 交换站</title><style>"
     + BASE_CSS
-    + "</style></head><body><div class=\"wrap\"><h1>待审核文件</h1>{% if is_secondary %}<p class=\"note\">当前身份：二级管理员（不能查看账号密码、不能改动任何权限）</p>{% endif %}{% if ai_configured %}<div class=\"card section\"><span class=\"note\">上传后自动审核：AI 通过的文件会自动发布；可疑、无法判断或调用失败的留在待审核等站长人工看。</span></div>{% else %}<div class=\"card section warn\">AI 审核未配置（需配置 DEEPSEEK_API_KEY 后可用），原有审核流程不受影响。</div>{% endif %}"
+    + "</style></head><body><div class=\"wrap\" id=\"admin-main\"><h1>待审核文件</h1>{% if ai_configured %}<div class=\"card section\"><span class=\"note\">上传后自动审核：AI 通过的文件会自动发布；可疑、无法判断或调用失败的留在待审核等站长人工看。</span></div>{% else %}<div class=\"card section warn\">AI 审核未配置（需配置 DEEPSEEK_API_KEY 后可用），原有审核流程不受影响。</div>{% endif %}"
     "{% if not drive_configured %}"
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
     "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
@@ -1567,14 +1654,14 @@ ADMIN_PAGE = (
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<button class=\"btn danger\">不通过（移到回收站）</button></form></div></div>{% endfor %}</div>"
     "{% else %}<p class=\"empty\">目前没有待审核的文件。</p>{% endif %}"
-    "<p><a href=\"/admin/accounts\">账号管理</a> · <a href=\"/admin/private\">私人区管理</a> · <a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/comments\">留言管理</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    "<p><a href=\"/admin/accounts\">账号管理</a> · <a href=\"/admin/private\">私人区管理</a> · <a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/comments\">留言管理</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a>{% if not is_secondary %} · <a href=\"/admin/announcement\">公告管理</a>{% endif %} · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div>" + ADMIN_PJAX_SCRIPT + "</body></html>"
 )
 ADMIN_PAGE = (
     "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>审核 - 交换站</title><style>"
     + BASE_CSS
-    + "</style></head><body><div class=\"wrap\"><h1>待审核文件</h1>{% if is_secondary %}<p class=\"note\">当前身份：二级管理员（不能查看账号密码、不能改动任何权限）</p>{% endif %}{% if ai_configured %}<div class=\"card section\"><span class=\"note\">上传后自动审核：AI 通过的文件会自动发布；可疑、无法判断或调用失败的留在待审核等站长人工看。</span></div>{% else %}<div class=\"card section warn\">AI 审核未配置（需配置 DEEPSEEK_API_KEY 后可用），原有审核流程不受影响。</div>{% endif %}"
+    + "</style></head><body><div class=\"wrap\" id=\"admin-main\"><h1>待审核文件</h1>{% if ai_configured %}<div class=\"card section\"><span class=\"note\">上传后自动审核：AI 通过的文件会自动发布；可疑、无法判断或调用失败的留在待审核等站长人工看。</span></div>{% else %}<div class=\"card section warn\">AI 审核未配置（需配置 DEEPSEEK_API_KEY 后可用），原有审核流程不受影响。</div>{% endif %}"
     "{% if not drive_configured %}"
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
     "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
@@ -1588,7 +1675,7 @@ ADMIN_PAGE = (
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<button class=\"btn danger\">不通过（移到回收站）</button></form></div></div>{% endfor %}</div>"
     "{% else %}<p class=\"empty\">目前没有待审核的文件。</p>{% endif %}"
-    "<p><a href=\"/admin/accounts\">账号管理</a> · <a href=\"/admin/private\">私人区管理</a> · <a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/comments\">留言管理</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    "<p><a href=\"/admin/accounts\">账号管理</a> · <a href=\"/admin/private\">私人区管理</a> · <a href=\"/admin/feedback\">意见管理</a> · <a href=\"/admin/logs\">访问日志</a> · <a href=\"/admin/comments\">留言管理</a> · <a href=\"/admin/published\">已发布管理（删除已发布文件）</a>{% if not is_secondary %} · <a href=\"/admin/announcement\">公告管理</a>{% endif %} · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div>" + ADMIN_PJAX_SCRIPT + "</body></html>"
 )
 
 ADMIN_PUBLISHED_PAGE = (
@@ -1596,7 +1683,7 @@ ADMIN_PUBLISHED_PAGE = (
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>已发布管理 - 交换站</title><style>"
     + BASE_CSS
-    + "</style></head><body><div class=\"wrap\"><h1>已发布管理</h1>"
+    + "</style></head><body><div class=\"wrap\" id=\"admin-main\"><h1>已发布管理</h1>"
     "<p class=\"note\">这里可以把已发布的文件移到回收站，熟人就再也下载不到了。回收站里的文件不在列表里，需要去云盘回收站看。</p>"
     "{% if files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
     "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.kind }}</span><span>·</span><span>{{ f.size }}</span></div></div>"
@@ -1608,7 +1695,7 @@ ADMIN_PUBLISHED_PAGE = (
     "<input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
     "<button class=\"btn danger\">删除（移到回收站）</button></form></div></div>{% endfor %}</div>"
     "{% else %}<p class=\"empty\">目前没有已发布的文件。</p>{% endif %}"
-    "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+    "<p><a href=\"/admin\">回待审核</a>{% if not is_secondary %} · <a href=\"/admin/announcement\">公告管理</a>{% endif %} · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div>" + ADMIN_PJAX_SCRIPT + "</body></html>"
 )
 
 
@@ -1675,6 +1762,15 @@ def api_files():
     return jsonify(out)
 
 
+@app.route("/api/announcement")
+def api_announcement():
+    """进站公告 JSON（供中继模式的上海站读取 Render 后端公告；本站直连时不走这里）。"""
+    code = _env("EXCHANGE_CODE")
+    if not _has_gate(code, "exchange_access"):
+        return jsonify({"ok": False}), 403
+    return jsonify({"ok": True, "announcement": _announcement_display(drive_service())})
+
+
 @app.route("/")
 def index():
     code = _env("EXCHANGE_CODE")
@@ -1720,6 +1816,24 @@ def index():
                 if folder:
                     private_files = list_folder(service, folder)
     private_used = sum(f.get("size_bytes", 0) for f in private_files)
+    ann = None
+    if entered:
+        if _is_relay():
+            try:
+                import requests as _rq
+                _cookies = {}
+                if "exchange_access" in request.cookies:
+                    _cookies["exchange_access"] = request.cookies["exchange_access"]
+                _r = _rq.get(_relay_backend() + "/api/announcement", cookies=_cookies, timeout=15)
+                ann = _r.json().get("announcement")
+            except Exception:
+                ann = {"title": ANNOUNCEMENT_DEFAULT_TITLE, "body": ANNOUNCEMENT_DEFAULT_BODY}
+        else:
+            ann = _announcement_display(drive_service())
+        if ann:
+            import html as _html
+            ann = dict(ann)
+            ann["body_html"] = _html.escape(ann["body"]).replace("\n", "<br>")
     return render_template_string(
         PAGE,
         code_configured=bool(code),
@@ -1740,6 +1854,7 @@ def index():
         is_relay=_is_relay(),
         secondary_configured=_secondary_configured(),
         msg=request.args.get("msg", ""),
+        announcement=ann,
     )
 
 
@@ -2268,10 +2383,10 @@ def admin_private():
     return ("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             "<title>私人区管理 - 交换站</title><style>" + BASE_CSS + "</style></head>"
-            "<body><div class=\"wrap\"><h1>私人区管理（站长可见全部）</h1>"
+            "<body><div class=\"wrap\" id=\"admin-main\"><h1>私人区管理（站长可见全部）</h1>"
             "<p class=\"note\">站长能看见所有人的私人文件，普通用户只能看见自己的。</p>"
             + rows +
-            "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>")
+            "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div>" + ADMIN_PJAX_SCRIPT + "</body></html>")
 
 
 @app.route("/feedback", methods=["POST"])
@@ -2449,14 +2564,14 @@ def admin_accounts():
         rows += _row
     if not rows:
         rows = "<p class=\"empty\">目前还没有注册账号。</p>"
-    _note_html = '<p class="note">二级管理员只能看见账号名和状态，看不见密码，也不能改密码、禁用 / 解封。</p>' if _sec else '<p class="note">站长能看见账号和密码，也能改密码、禁用 / 解封。请提醒用户不要用重要密码注册。</p>'
+    _note_html = '<p class="note">当前账号只能看见账号名和状态，看不见密码，也不能改密码、禁用 / 解封。</p>' if _sec else '<p class="note">站长能看见账号和密码，也能改密码、禁用 / 解封。请提醒用户不要用重要密码注册。</p>'
     return render_template_string(
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        "<title>账号管理 - 交换站</title><style>" + BASE_CSS + "</style></head><body><div class=\"wrap\">"
+        "<title>账号管理 - 交换站</title><style>" + BASE_CSS + "</style></head><body><div class=\"wrap\" id=\"admin-main\">"
         "<h1>账号管理</h1>" + _note_html +
         "<div class=\"card section\">" + rows + "</div>"
-        "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+        "<p><a href=\"/admin\">回待审核</a>" + (" · <a href=\"/admin/announcement\">公告管理</a>" if not _sec else "") + " · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div>" + ADMIN_PJAX_SCRIPT + "</body></html>"
     )
 
 
@@ -2497,28 +2612,36 @@ def admin_accounts_toggle():
 
 @app.route("/admin/login", methods=["POST"])
 def admin_login():
-    token = _env("ADMIN_TOKEN")
-    if not token:
+    """站长区统一口令入口：输站长口令进完整权限，输二级口令进受限权限（后端限制不变）。"""
+    admin_token = _env("ADMIN_TOKEN")
+    sec_token = _env("SECONDARY_ADMIN_TOKEN")
+    given = request.form.get("token", "")
+    if admin_token and given == admin_token:
+        resp = redirect("/admin")
+        _log("站长进审核", "")
+        resp.set_cookie("admin_access", _gate_value(admin_token), httponly=True, samesite="Lax")
+        return resp
+    if sec_token and sec_token != admin_token and given == sec_token:
+        resp = redirect("/admin")
+        _log("受限口令进审核", "")
+        resp.set_cookie("secondary_access", _gate_value(sec_token), httponly=True, samesite="Lax")
+        return resp
+    if not admin_token:
         return "站长口令还没配置，请联系站长在 Render 环境变量中设置 ADMIN_TOKEN", 503
-    if request.form.get("token", "") != token:
-        _log("站长进审核失败", "口令不对")
-        return "口令不对", 403
-    resp = redirect("/admin")
-    _log("站长进审核", "")
-    resp.set_cookie("admin_access", _gate_value(token), httponly=True, samesite="Lax")
-    return resp
+    _log("站长进审核失败", "口令不对")
+    return "口令不对", 403
 
 
 @app.route("/admin/secondary_login", methods=["POST"])
 def secondary_login():
     token = _env("SECONDARY_ADMIN_TOKEN")
     if not token or token == _env("ADMIN_TOKEN"):
-        return "二级管理员入口未配置", 503
+        return "受限入口未配置", 503
     if request.form.get("token", "") != token:
-        _log("二级管理员进审核失败", "口令不对")
+        _log("受限口令进审核失败", "口令不对")
         return "口令不对", 403
     resp = redirect("/admin")
-    _log("二级管理员登录", "")
+    _log("受限口令登录", "")
     resp.set_cookie("secondary_access", _gate_value(token), httponly=True, samesite="Lax")
     return resp
 
@@ -2553,7 +2676,7 @@ def _admin_file_or_403(service, file_id):
 # 自动发布、也绝不自动驳回；大小守卫不过或移动失败 → 留待审核、理由写明。
 # 图片走 DeepSeek 识图（deepseek-flash）真看图，结论标注“已看图初审”；
 # 视频/音频仍只按文件名初审，通过自动发布时标注保留。
-# 手动“一键 AI 初审”按钮保留，用于老待审核文件补审。
+# 一键 AI 初审按钮已于 2026-11-04 删除：上传自动审核，单条重试按钮保留给老文件/额度恢复后补审。
 _AI_TEXT_EXTS = {"txt", "md", "markdown", "csv", "json", "srt", "vtt", "ass", "lrc", "log"}
 _AI_TEXT_LIMIT = 6000
 _AI_ZIP_MAX_BYTES = 20 * 1024 * 1024
@@ -3161,6 +3284,48 @@ def _ai_review_one(file_id):
     return _ai_get_result(file_id)
 
 
+@app.route("/admin/announcement")
+def admin_announcement():
+    if not _is_admin():
+        return "只有站长能改公告", 403
+    if _is_relay():
+        return _proxy_to_backend("/admin/announcement")
+    import html as _html
+    service = drive_service()
+    raw = _read_announcement_raw(service) if service else None
+    title = (raw.get("title") if raw else "") or ANNOUNCEMENT_DEFAULT_TITLE
+    body = raw.get("body") if raw else ANNOUNCEMENT_DEFAULT_BODY
+    msg = request.args.get("msg", "")
+    return render_template_string(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>公告管理 - 交换站</title><style>" + BASE_CSS + "</style></head><body><div class=\"wrap\" id=\"admin-main\">"
+        "<h1>公告管理</h1><p class=\"note\">这里改进站公告，保存后立刻生效，不用改代码。正文清空后保存，公告就不再弹出（等于关掉公告）。只有站长能改这里。</p>"
+        + (f"<p class=\"note\">{_html.escape(msg)}</p>" if msg else "") +
+        "<div class=\"card section\"><form method=\"post\" action=\"/admin/announcement\">"
+        f"<input class=\"textin\" type=\"text\" name=\"title\" maxlength=\"100\" value=\"{_html.escape(title, quote=True)}\" placeholder=\"公告标题\" required>"
+        f"<textarea class=\"textin\" name=\"body\" rows=\"6\" maxlength=\"2000\" placeholder=\"公告正文，空着就是关掉公告\" style=\"width:100%\">{_html.escape(body)}</textarea>"
+        "<button class=\"btn primary\">保存公告</button></form></div>"
+        "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div>" + ADMIN_PJAX_SCRIPT + "</body></html>"
+    )
+
+
+@app.route("/admin/announcement", methods=["POST"])
+def admin_announcement_save():
+    if not _is_admin():
+        return "只有站长能改公告", 403
+    if _is_relay():
+        return _proxy_post_to_backend("/admin/announcement")
+    service = drive_service()
+    if service is None:
+        return redirect("/admin/announcement?msg=云盘暂未连接，保存失败")
+    title = (request.form.get("title") or "").strip() or ANNOUNCEMENT_DEFAULT_TITLE
+    body = request.form.get("body") or ""
+    ok = _write_announcement(service, title, body)
+    _log("改公告", "已保存" if ok else "保存失败")
+    return redirect("/admin/announcement?msg=" + ("已保存，立即生效" if ok else "保存失败，请重试"))
+
+
 @app.route("/admin/ai_review", methods=["POST"])
 def admin_ai_review():
     if not _is_manager():
@@ -3541,7 +3706,7 @@ def admin_published():
     else:
         files, _fo = _list_published_tree(drive_service())
     return render_template_string(
-        ADMIN_PUBLISHED_PAGE, files=files, drive_configured=True
+        ADMIN_PUBLISHED_PAGE, files=files, drive_configured=True, is_secondary=_is_secondary()
     )
 
 
@@ -3601,10 +3766,10 @@ def admin_comments():
     return render_template_string(
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        "<title>留言管理 - 交换站</title><style>" + BASE_CSS + "</style></head><body><div class=\"wrap\">"
+        "<title>留言管理 - 交换站</title><style>" + BASE_CSS + "</style></head><body><div class=\"wrap\" id=\"admin-main\">"
         "<h1>留言管理</h1><p class=\"note\">留言由过了熟人门的访客所发，昵称不填就是匿名；站长删了就不再显示。文件已删除的留言会标出来，删了也不报错。</p>"
         "<div class=\"card section\">" + rows + "</div>"
-        "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+        "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div>" + ADMIN_PJAX_SCRIPT + "</body></html>"
     )
 
 
@@ -3639,10 +3804,10 @@ def admin_feedback():
     return render_template_string(
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        "<title>意见管理 - 交换站</title><style>" + BASE_CSS + "</style></head><body><div class=\"wrap\">"
-        "<h1>意见管理</h1><p class=\"note\">站长和二级管理员能改状态，改完后意见区里大家都能看见已解决 / 未解决。</p>"
+        "<title>意见管理 - 交换站</title><style>" + BASE_CSS + "</style></head><body><div class=\"wrap\" id=\"admin-main\">"
+        "<h1>意见管理</h1><p class=\"note\">站长区里能改状态，改完后意见区里大家都能看见已解决 / 未解决。</p>"
         "<div class=\"card section\">" + rows + "</div>"
-        "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+        "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div>" + ADMIN_PJAX_SCRIPT + "</body></html>"
     )
 
 
@@ -3695,10 +3860,10 @@ def admin_logs():
     return render_template_string(
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        "<title>访问日志 - 交换站</title><style>" + BASE_CSS + "</style></head><body><div class=\"wrap\">"
+        "<title>访问日志 - 交换站</title><style>" + BASE_CSS + "</style></head><body><div class=\"wrap\" id=\"admin-main\">"
         "<h1>访问日志</h1><p class=\"note\">只记时间、IP、设备类型、动作和文件名，不记口令。长期记录存在云盘根目录的 交换站访问日志.txt 里（不在待审核/已发布里，熟人看不到），服务休眠或重启也不会丢。</p>"
         "<div class=\"card section\">" + rows + "</div>"
-        "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div></body></html>"
+        "<p><a href=\"/admin\">回待审核</a> · <a href=\"/\">回首页</a> · <a href=\"/logout\">退出</a></p></div>" + ADMIN_PJAX_SCRIPT + "</body></html>"
     )
 
 
@@ -3807,7 +3972,7 @@ def rename():
     is_pending = PENDING_FOLDER_ID in parents
     is_admin = _is_manager()
     if not is_admin:
-        return "只有站长或二级管理员能改名，请先在站长区登录", 403
+        return "只有站长区能改名，请先在站长区登录", 403
     if not is_published and not is_pending:
         return "文件不存在或无权访问", 404
     old_name = meta.get("name", "")
