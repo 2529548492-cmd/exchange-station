@@ -2551,12 +2551,16 @@ def _admin_file_or_403(service, file_id):
 # AI 通过 + 大小守卫过 → 自动发布；可疑/无法判断/调用失败（额度用完、超时、
 # 断线、未配置）→ 留待审核，失败时理由记为“AI 未能审核”，绝不因调不通就
 # 自动发布、也绝不自动驳回；大小守卫不过或移动失败 → 留待审核、理由写明。
-# 图片/视频/音频第一版仍只按文件名初审，通过自动发布时标注保留。
+# 图片走 DeepSeek 识图（deepseek-flash）真看图，结论标注“已看图初审”；
+# 视频/音频仍只按文件名初审，通过自动发布时标注保留。
 # 手动“一键 AI 初审”按钮保留，用于老待审核文件补审。
 _AI_TEXT_EXTS = {"txt", "md", "markdown", "csv", "json", "srt", "vtt", "ass", "lrc", "log"}
 _AI_TEXT_LIMIT = 6000
 _AI_ZIP_MAX_BYTES = 20 * 1024 * 1024
 _AI_ZIP_NAME_LIMIT = 200
+_AI_IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "webp", "bmp"}
+_AI_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+_AI_IMAGE_MAX_SIDE = 1024
 _AI_RESULTS = {}
 _AI_LOCK = threading.Lock()
 _AI_ALL_RUNNING = set()
@@ -2907,9 +2911,109 @@ def _ai_fetch_head(service, file_id, limit):
     return buf.getvalue()[:limit]
 
 
+def _ai_fetch_baidu_head(fs_id, limit):
+    """经 dlink 取百度文件前 limit 字节（流式、到量即停）；失败抛异常。"""
+    import requests as _rq
+    meta = _baidu_meta(fs_id)
+    dlink = meta.get("dlink") or ""
+    if not dlink:
+        raise RuntimeError("baidu dlink missing")
+    tok = _baidu_token()
+    r = _rq.get(dlink, params={"access_token": tok},
+                headers={"User-Agent": "pan.baidu.com"}, stream=True, timeout=60)
+    data = bytearray()
+    for chunk in r.iter_content(chunk_size=65536):
+        if not chunk:
+            continue
+        data.extend(chunk)
+        if len(data) > limit:
+            break
+    return bytes(data)
+
+
+def _ai_image_data_url(service, meta):
+    """取图并本地压成 JPEG data URL。返回 (data_url, error)，
+    error: None / "too_large"（超上限，不识图）/ "fetch_failed" / "decode_failed"。"""
+    try:
+        size = int(meta.get("size") or 0)
+    except Exception:
+        size = 0
+    if size > _AI_IMAGE_MAX_BYTES:
+        return None, "too_large"
+    try:
+        if meta.get("source") == "baidu":
+            raw = _ai_fetch_baidu_head(meta["id"][3:], _AI_IMAGE_MAX_BYTES + 1)
+        else:
+            raw = _ai_fetch_head(service, meta["id"], _AI_IMAGE_MAX_BYTES + 1)
+    except Exception:
+        return None, "fetch_failed"
+    if not raw or len(raw) > _AI_IMAGE_MAX_BYTES:
+        return None, "too_large" if raw else "fetch_failed"
+    try:
+        from PIL import Image, ImageOps
+        im = Image.open(io.BytesIO(raw))
+        im = ImageOps.exif_transpose(im)
+        if im.mode in ("RGBA", "LA", "PA"):
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im.convert("RGBA"), mask=im.convert("RGBA").split()[3])
+            im = bg
+        elif im.mode != "RGB":
+            im = im.convert("RGB")
+        im.thumbnail((_AI_IMAGE_MAX_SIDE, _AI_IMAGE_MAX_SIDE), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=85)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode(), None
+    except Exception:
+        return None, "decode_failed"
+
+
+def _ai_call_deepseek_vision(data_url, filename, size):
+    """调 DeepSeek 识图（OpenAI 兼容 /chat/completions，模型 deepseek-flash）；
+    60 秒超时、失败重试一次；任何失败抛异常，调用方一律记“AI 未能审核”。"""
+    import requests as _rq
+    base = (_env("DEEPSEEK_API_BASE") or "https://api.deepseek.com").rstrip("/")
+    model = _env("DEEPSEEK_VISION_MODEL") or "deepseek-flash"
+    key = _env("DEEPSEEK_API_KEY") or ""
+    system = ("你是文件分享站的初审员。只看图片画面内容，按站内通用口径判断"
+              "是否可能违规：色情、暴力血腥、极端主义、毒品、赌博诈骗、恶意软件、"
+              "明显侵权盗版。只输出严格 JSON，形如 {\"verdict\": \"通过|可疑|无法判断\", "
+              "\"reason\": \"一句话理由\", \"confidence\": 0.0到1.0}，不要输出其他文字。")
+    user_text = ("请审查这张图片的画面内容。文件名：" + filename
+                 + "，大小：" + _fmt_size(size)
+                 + "。只输出严格 JSON，不要输出其他文字。")
+    for _ in range(2):
+        try:
+            r = _rq.post(base + "/chat/completions",
+                         headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+                         json={"model": model,
+                               "messages": [{"role": "system", "content": system},
+                                            {"role": "user", "content": [
+                                                {"type": "text", "text": user_text},
+                                                {"type": "image_url", "image_url": {"url": data_url}}]}],
+                               "temperature": 0.2},
+                         timeout=60)
+            r.raise_for_status()
+            content = (r.json().get("choices") or [{}])[0].get("message", {}).get("content") or ""
+            start = content.find("{")
+            end = content.rfind("}")
+            if start >= 0 and end > start:
+                content = content[start:end + 1]
+            data = json.loads(content)
+            verdict = data.get("verdict") or "无法判断"
+            if verdict not in ("通过", "可疑", "无法判断"):
+                verdict = "无法判断"
+            return {"verdict": verdict,
+                    "reason": str(data.get("reason") or "未给出理由")[:200],
+                    "confidence": data.get("confidence")}
+        except Exception:
+            continue
+    raise RuntimeError("deepseek vision failed")
+
+
 def _ai_collect_evidence(service, meta):
     """返回送审证据。文本抽前部；压缩包只在 <=20MB 时整包列清单；
-    图片/视频/音频/超大压缩包第一版只按文件名初审，并明确标注。"""
+    图片走识图（本地压图后发 data URL）；视频/音频/超大压缩包只按文件名初审，
+    并明确标注。meta["source"] 为 "baidu" 时走 dlink 取字节，否则走谷歌下载。"""
     name = meta.get("name") or ""
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
     base = {"name": name, "size": meta.get("size"), "ext": ext}
@@ -2935,6 +3039,13 @@ def _ai_collect_evidence(service, meta):
             return dict(base, kind="zip", entries=names)
         except Exception:
             return dict(base, kind="zip", entries=[], note="压缩包清单读取失败，仅按文件名初审")
+    if ext in _AI_IMAGE_EXTS:
+        data_url, err = _ai_image_data_url(service, meta)
+        if err == "too_large":
+            return dict(base, kind="image_too_large", note="图片过大未能识图")
+        if err is not None:
+            return dict(base, kind="image_failed", note="图片读取失败，未看图初审")
+        return dict(base, kind="image", data_url=data_url, note="已看图初审")
     return dict(base, kind="name_only", note="仅文件名初审，未看内容")
 
 
@@ -2976,22 +3087,61 @@ def _ai_call_deepseek(prompt):
     raise RuntimeError("deepseek failed")
 
 
-def _ai_review_one(file_id):
-    """对一个待审核文件做初审并存结果；任何失败只记“初审失败可重试”。"""
-    if not _ai_configured():
-        return {"verdict": "unconfigured", "reason": "AI 审核未配置"}
+def _ai_pending_meta(file_id):
+    """取待审核文件元数据（谷歌/百度两源归一化），不在待审核里返回 None。
+    谷歌走 Drive 待审核文件夹；百度走应用待审核目录（_baidu_area 判定）。"""
+    if file_id.startswith("bd:"):
+        if not _baidu_enabled():
+            return None
+        try:
+            raw = _baidu_meta(file_id[3:])
+        except Exception:
+            return None
+        if _baidu_area(raw.get("path") or "") != "pending":
+            return None
+        return {"id": file_id, "name": raw.get("server_filename") or file_id,
+                "size": raw.get("size"), "source": "baidu"}
     service = drive_service()
     if service is None:
-        _ai_set_result(file_id, "failed", "初审失败可重试")
-        return _ai_get_result(file_id)
+        return None
     try:
         meta = _admin_file_or_403(service, file_id)
     except Exception:
-        meta = None
+        return None
+    if meta is None:
+        return None
+    meta = dict(meta)
+    meta["source"] = "google"
+    return meta
+
+
+def _ai_review_one(file_id):
+    """对一个待审核文件做初审并存结果；图片走识图真看图，视频/音频仍只按
+    文件名审，文字文档仍抽正文审；任何调用失败只记“AI 未能审核”，绝不因
+    调不通就自动发布、也绝不自动驳回，更不许悄悄降级回文件名“通过”。"""
+    if not _ai_configured():
+        return {"verdict": "unconfigured", "reason": "AI 审核未配置"}
+    meta = _ai_pending_meta(file_id)
     if meta is None:
         _ai_set_result(file_id, "failed", "该文件不在待审核里")
         return _ai_get_result(file_id)
+    service = None if meta.get("source") == "baidu" else drive_service()
     ev = _ai_collect_evidence(service, meta)
+    if ev["kind"] == "image_too_large":
+        # 超上限：不下载、不识图、不自动发布，留待审核等站长人工看
+        _ai_set_result(file_id, "无法判断", "图片过大未能识图", None, "图片过大未能识图")
+        return _ai_get_result(file_id)
+    if ev["kind"] == "image_failed":
+        _ai_set_result(file_id, "failed", "AI 未能审核")
+        return _ai_get_result(file_id)
+    if ev["kind"] == "image":
+        try:
+            res = _ai_call_deepseek_vision(ev["data_url"], ev["name"], ev.get("size"))
+        except Exception:
+            _ai_set_result(file_id, "failed", "AI 未能审核")
+            return _ai_get_result(file_id)
+        _ai_set_result(file_id, res["verdict"], res["reason"], res.get("confidence"), "已看图初审")
+        return _ai_get_result(file_id)
     parts = ["文件名：" + ev["name"],
              "大小：" + _fmt_size(ev.get("size")),
              "类型：" + (ev.get("ext") or "未知")]
@@ -3002,7 +3152,7 @@ def _ai_review_one(file_id):
     try:
         res = _ai_call_deepseek("\n".join(parts))
     except Exception:
-        _ai_set_result(file_id, "failed", "初审失败可重试")
+        _ai_set_result(file_id, "failed", "AI 未能审核")
         return _ai_get_result(file_id)
     note = ev.get("note") or ""
     if ev["kind"] == "name_only":
