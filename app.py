@@ -92,6 +92,20 @@ def _has_gate(secret, cookie_name):
     return bool(value) and hmac.compare_digest(value, _gate_value(secret))
 
 
+def _access_granted():
+    """熟人访问判定。
+
+    没配 EXCHANGE_CODE，或显式 OPEN_ACCESS=1 时一律放行（公开站）；
+    配了口令则照旧校验 cookie。站长的 ADMIN_TOKEN 不走这里。
+    """
+    if _env("OPEN_ACCESS").lower() in ("1", "true", "yes", "on"):
+        return True
+    code = _env("EXCHANGE_CODE")
+    if not code:
+        return True
+    return _has_gate(code, "exchange_access")
+
+
 def _is_admin():
     token = _env("ADMIN_TOKEN")
     return bool(token) and _has_gate(token, "admin_access")
@@ -1257,7 +1271,7 @@ def _baidu_gate(meta):
     area = _baidu_area(meta.get("path") or "")
     if area == "published":
         code = _env("EXCHANGE_CODE")
-        return "published" if _has_gate(code, "exchange_access") else "need_gate"
+        return "published" if _access_granted() else "need_gate"
     if area == "pending":
         if _is_manager():
             return "pending"
@@ -2672,7 +2686,7 @@ ADMIN_PUBLISHED_PAGE = (
 def api_private():
     code = _env("EXCHANGE_CODE")
     out = {"files": []}
-    if code and _has_gate(code, "exchange_access"):
+    if code and _access_granted():
         fb_user = _account_gate()
         if fb_user and _use_baidu_meta() and _private_account_ok(None, fb_user):
             out["files"] = _baidu_private_list(fb_user)
@@ -2710,7 +2724,7 @@ def api_private_all():
 def api_files():
     code = _env("EXCHANGE_CODE")
     out = {"published": [], "pending": [], "folders": [], "notice": ""}
-    if code and _has_gate(code, "exchange_access"):
+    if code and _access_granted():
         try:
             service = drive_service()
         except Exception:
@@ -2940,7 +2954,7 @@ def api_stats():
 def api_announcement():
     """进站公告 JSON（供中继模式的上海站读取 Render 后端公告；本站直连时不走这里）。"""
     code = _env("EXCHANGE_CODE")
-    if not _has_gate(code, "exchange_access"):
+    if not _access_granted():
         return jsonify({"ok": False}), 403
     return jsonify({"ok": True, "announcement": _announcement_display(drive_service())})
 
@@ -2972,7 +2986,7 @@ def api_baidu_token():
 @app.route("/")
 def index():
     code = _env("EXCHANGE_CODE")
-    entered = _has_gate(code, "exchange_access")
+    entered = _access_granted()
     files = []
     folders = []
     backend_notice = ""
@@ -3058,7 +3072,7 @@ def index():
         _tpl = STUDIO_PAGE
     return render_template_string(
         _tpl,
-        code_configured=bool(code),
+        code_configured=bool(code) or _access_granted(),
         entered=entered,
         drive_configured=True if _is_relay() else _drive_configured(),
         cats=cats,
@@ -3109,7 +3123,7 @@ def logout():
 @app.route("/upload", methods=["POST"])
 def upload():
     code = _env("EXCHANGE_CODE")
-    if not _has_gate(code, "exchange_access"):
+    if not _access_granted():
         return redirect("/?msg=请先输入访问口令")
     if _is_relay():
         try:
@@ -3233,7 +3247,7 @@ def direct_session():
     不是账号密钥，文件直传云盘不再经过 Render 中转，速度只看上传者网速。
     会话地址本身有写权限，所以绝不记进日志、不写进页面源码，只当次返回。"""
     code = _env("EXCHANGE_CODE")
-    if not _has_gate(code, "exchange_access"):
+    if not _access_granted():
         return jsonify({"ok": False, "msg": "请先输入访问口令"}), 403
     if _is_relay():
         try:
@@ -3291,7 +3305,7 @@ def direct_done():
     """直传完成登记：浏览器传完后告诉服务器一声，服务器记一条上传日志；
     实际文件已经在待审核里，站长在站长区通过或删除，不通过就点不通过进回收站。"""
     code = _env("EXCHANGE_CODE")
-    if not _has_gate(code, "exchange_access"):
+    if not _access_granted():
         return jsonify({"ok": False}), 403
     data = request.get_json(silent=True) or {}
     name = _safe_filename(data.get("name", "")) or "文件"
@@ -3361,7 +3375,7 @@ def view(file_id):
     is_pending = PENDING_FOLDER_ID in parents
     if is_published:
         code = _env("EXCHANGE_CODE")
-        if not _has_gate(code, "exchange_access"):
+        if not _access_granted():
             return redirect("/?msg=请先输入访问口令")
     elif is_pending:
         if not _is_manager():
@@ -3439,7 +3453,7 @@ def view(file_id):
 @app.route("/download/<file_id>")
 def download(file_id):
     code = _env("EXCHANGE_CODE")
-    if not _has_gate(code, "exchange_access"):
+    if not _access_granted():
         return redirect("/?msg=请先输入访问口令")
     if _is_relay():
         return _proxy_to_backend(f"/download/{file_id}")
@@ -3524,7 +3538,7 @@ def download(file_id):
 @app.route("/private/upload", methods=["POST"])
 def private_upload():
     code = _env("EXCHANGE_CODE")
-    if not _has_gate(code, "exchange_access"):
+    if not _access_granted():
         return redirect("/?msg=请先输入访问口令")
     fb_user = _account_gate()
     if not fb_user:
@@ -3628,7 +3642,7 @@ def private_upload():
 @app.route("/private/delete", methods=["POST"])
 def private_delete():
     code = _env("EXCHANGE_CODE")
-    if not _has_gate(code, "exchange_access") and not _private_is_admin():
+    if not _access_granted() and not _private_is_admin():
         return redirect("/?msg=请先输入访问口令")
     fb_user = _account_gate()
     if _is_relay():
@@ -3731,7 +3745,7 @@ def admin_private():
 @app.route("/feedback", methods=["POST"])
 def feedback_submit():
     code = _env("EXCHANGE_CODE")
-    if not _has_gate(code, "exchange_access"):
+    if not _access_granted():
         return redirect("/?msg=请先输入访问口令")
     fb_user = _account_gate()
     if not fb_user:
@@ -3779,7 +3793,7 @@ def feedback_resolve():
 @app.route("/register", methods=["POST"])
 def register():
     code = _env("EXCHANGE_CODE")
-    if not _has_gate(code, "exchange_access"):
+    if not _access_granted():
         return redirect("/?msg=请先输入访问口令")
     name = (request.form.get("name") or "").strip()
     pw = request.form.get("password") or ""
@@ -3807,7 +3821,7 @@ def comments_list(file_id):
     if _is_relay():
         return _proxy_to_backend(f"/comments/{file_id}")
     code = _env("EXCHANGE_CODE")
-    if not _has_gate(code, "exchange_access"):
+    if not _access_granted():
         return {"error": "请先输入访问口令"}, 403
     service = drive_service()
     if service is None:
@@ -3823,7 +3837,7 @@ def comments_post(file_id):
     if _is_relay():
         return _proxy_post_to_backend(f"/comments/{file_id}")
     code = _env("EXCHANGE_CODE")
-    if not _has_gate(code, "exchange_access"):
+    if not _access_granted():
         return {"error": "请先输入访问口令"}, 403
     service = drive_service()
     if service is None:
@@ -3855,7 +3869,7 @@ def comments_post(file_id):
 @app.route("/login_feedback", methods=["POST"])
 def login_feedback():
     code = _env("EXCHANGE_CODE")
-    if not _has_gate(code, "exchange_access"):
+    if not _access_granted():
         return redirect("/?msg=请先输入访问口令")
     name = (request.form.get("name") or "").strip()
     pw = request.form.get("password") or ""
@@ -4776,7 +4790,7 @@ def auto_ai_trigger():
     if _is_relay():
         return _proxy_post_to_backend("/auto_ai_trigger")
     code = _env("EXCHANGE_CODE")
-    if not _has_gate(code, "exchange_access"):
+    if not _access_granted():
         return jsonify({"ok": False}), 403
     fid = (request.get_json(silent=True) or {}).get("file_id") or request.form.get("file_id", "")
     _auto_ai_trigger(fid)
@@ -5350,7 +5364,7 @@ def thumb(file_id):
     is_pending = PENDING_FOLDER_ID in parents
     if is_published:
         code = _env("EXCHANGE_CODE")
-        if not _has_gate(code, "exchange_access"):
+        if not _access_granted():
             return "请先输入访问口令", 403
     elif is_pending:
         if not _is_manager():
@@ -5487,7 +5501,7 @@ def preview_img(file_id):
     is_pending = PENDING_FOLDER_ID in parents
     if is_published:
         code = _env("EXCHANGE_CODE")
-        if not _has_gate(code, "exchange_access"):
+        if not _access_granted():
             return "请先输入访问口令", 403
     elif is_pending:
         if not _is_manager():
@@ -5577,7 +5591,7 @@ def folder_create():
     if _is_relay():
         return _proxy_post_to_backend("/folder/create")
     code = _env("EXCHANGE_CODE")
-    if not code or not _has_gate(code, "exchange_access"):
+    if not code or not _access_granted():
         return redirect("/?msg=请先输入访问口令")
     service = drive_service()
     if service is None:
@@ -5616,7 +5630,7 @@ def folder_move():
     if _is_relay():
         return _proxy_post_to_backend("/folder/move")
     code = _env("EXCHANGE_CODE")
-    if not code or not _has_gate(code, "exchange_access"):
+    if not code or not _access_granted():
         return redirect("/?msg=请先输入访问口令")
     service = drive_service()
     if service is None:
