@@ -2425,6 +2425,14 @@ VISUAL_REFRESH_CSS = """
   .drawer-navbtn.active{box-shadow:inset 3px 0 0 var(--green-ink)}
   .folderbar{gap:8px;margin:12px 0 18px}
   .album-grid{gap:12px;margin-top:16px}
+  #tab-published .section{padding:24px 0;background:transparent;border:0}
+  #tab-published .section-head h2{font-size:30px;line-height:36px}
+  .pub-toolbar .search{max-width:none;border-radius:12px;padding:12px 16px}
+  .folderbar .tab{border-radius:10px}
+  #cattabs{padding-bottom:12px;border-bottom:1px solid var(--line)}
+  #cattabs .tab{border:0;border-radius:8px;background:transparent;color:var(--muted)}
+  #cattabs .tab.active{background:var(--green-soft);color:var(--green-ink)}
+  @media(min-width:960px){.album-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}}
   .tile{border-radius:16px;transition:transform .5s var(--motion),box-shadow .3s var(--motion),border-color .3s var(--motion)}
   .tile:hover{transform:translateY(-3px);box-shadow:var(--shadow);border-color:var(--green)}
   .tile-name{font-size:13px;font-weight:600}
@@ -2443,6 +2451,7 @@ VISUAL_REFRESH_CSS = """
     .upload{padding:20px 18px}
     .layout,.maincol{gap:16px}
     .album-grid{gap:8px}
+    @media(max-width:420px){.album-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
     .tile{border-radius:12px}
   }
   @media(prefers-reduced-motion:reduce){
@@ -2576,6 +2585,9 @@ PAGE = (
     "{% if entered and announcement %}<div class=\"ann-overlay\" id=\"annOverlay\"><div class=\"ann-card\" role=\"dialog\" aria-label=\"公告\"><div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:10px\"><h2>{{ announcement.title|e }}</h2><button class=\"btn\" id=\"annClose\" type=\"button\" aria-label=\"关闭公告\">×</button></div><p>{{ announcement.body_html|safe }}</p><div style=\"text-align:right\"><button class=\"btn primary\" id=\"annOk\" type=\"button\">我知道了</button></div></div></div><script>(function(){var ov=document.getElementById('annOverlay');if(!ov)return;try{if(sessionStorage.getItem('exchange_ann_closed')){ov.remove();return;}}catch(e){}var reduced=!!(window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);function closeAnn(){try{sessionStorage.setItem('exchange_ann_closed','1');}catch(e){}if(reduced){ov.remove();return;}ov.classList.remove('ann-show');var done=false;function hide(){if(done)return;done=true;ov.remove();}ov.addEventListener('transitionend',hide,{once:true});setTimeout(hide,300);}var c=document.getElementById('annClose');if(c)c.addEventListener('click',closeAnn);var o=document.getElementById('annOk');if(o)o.addEventListener('click',closeAnn);ov.addEventListener('click',function(e){if(e.target===ov)closeAnn();});requestAnimationFrame(function(){requestAnimationFrame(function(){ov.classList.add('ann-show');});});})();</script>{% endif %}"
     "<script>(function(){function applyTheme(t){var b=document.getElementById('themeBtn');if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');if(b)b.textContent='\u2600\ufe0f \u767d\u5929\u6a21\u5f0f';}else{document.documentElement.removeAttribute('data-theme');if(b)b.textContent='🌙 \u6df1\u8272\u6a21\u5f0f';}try{localStorage.setItem('theme',t);}catch(e){}}var _b=document.getElementById('themeBtn');if(_b){_b.addEventListener('click',function(){var cur=document.documentElement.getAttribute('data-theme');applyTheme(cur==='dark'?'light':'dark');});}try{var saved=localStorage.getItem('theme');if(saved==='dark'){applyTheme('dark');}else if(saved==='light'){applyTheme('light');}}catch(e){}})();</script></div></body></html>"
 )
+
+# Homepage-specific legacy rules follow BASE_CSS; apply the refresh last.
+PAGE = PAGE.replace("</head>", "<style id=\"visual-refresh\">" + VISUAL_REFRESH_CSS + "</style></head>", 1)
 
 ADMIN_PAGE = (
     "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
