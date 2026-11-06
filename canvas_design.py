@@ -137,6 +137,11 @@ html[data-capstyle="none"] .tile .cap{text-shadow:0 1px 2px rgba(0,0,0,.55),0 2p
   background:rgba(60,56,51,.06);letter-spacing:.1em;
 }
 html[data-theme="morandi"] .tile .glyph{background:#E7E1D7}
+.empty-note{
+  position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);
+  max-width:min(520px,80vw);text-align:center;color:var(--sub);
+  font-size:14px;line-height:1.7;
+}
 .tile.dim{opacity:.12;pointer-events:none;filter:grayscale(1)}
 
 /* ---------- hud ---------- */
@@ -416,6 +421,14 @@ window.onerror=function(m,src,l,c){
     return out;
   }
 
+  function emptyState(){
+    if (FILES.length) return;
+    var d = document.createElement('div');
+    d.className = 'empty-note';
+    d.textContent = '还没有已发布的文件。去「发布区」投一份，审核通过后就会出现在这里。';
+    document.getElementById('stage').appendChild(d);
+  }
+
   function build(){
     metrics();
     stage.innerHTML = '';
@@ -683,6 +696,7 @@ window.onerror=function(m,src,l,c){
 
   /* ---------- boot ---------- */
   build();
+  emptyState();
   applyCfg(true);
   syncUI();
   var hintEl = document.getElementById('hint');
