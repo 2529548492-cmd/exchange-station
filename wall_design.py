@@ -67,6 +67,10 @@ body.wall-dragging #albumGrid.wall-grid{cursor:grabbing}
   background:#1f1f1f; will-change:transform; backface-visibility:hidden;
 }
 #albumGrid.wall-grid .tile:hover{transform:none; border-color:transparent; box-shadow:none}
+body.wall-on #albumGrid.wall-grid .tile{
+  transition:none !important;
+  animation:none !important;
+}
 #albumGrid.wall-grid .tile .tileimg{
   position:absolute; inset:0; width:100%; height:100%; aspect-ratio:auto;
   object-fit:cover; border-radius:0;
@@ -139,7 +143,17 @@ WALL_JS = r"""
     return out;
   }
 
+  function rng(seed){
+    return function(){
+      seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+      var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+
   function pack(n, cols, rows, canBig){
+    var rand = rng(cols * 7919 + rows * 131 + n);
     var occ = [], y, x;
     for (y = 0; y < rows; y++){ occ.push([]); for (x = 0; x < cols; x++) occ[y][x] = 0; }
     var sizes = [[2,2],[2,1],[1,2],[1,1],[1,1],[1,1],[2,1],[1,1]];
@@ -149,7 +163,7 @@ WALL_JS = r"""
         if (occ[y][x]) continue;
         var pick = null;
         var pool = canBig && canBig[out.length] ? sizes : [[1,1],[1,1],[2,1]];
-        var order = pool.slice().sort(function(){ return Math.random() - .5; });
+        var order = pool.slice().sort(function(){ return rand() - .5; });
         for (var k = 0; k < order.length; k++){
           var w = order[k][0], h = order[k][1];
           if (x + w > cols || y + h > rows) continue;
@@ -184,8 +198,20 @@ WALL_JS = r"""
     clones = [];
   }
 
+  var busy = false;
+
   function layout(){
+    if (!on || busy) return;
+    busy = true;
+    try { layoutInner(); } finally { busy = false; }
+  }
+
+  var layoutCount = 0;
+
+  function layoutInner(){
     if (!on) return;
+    layoutCount++;
+    grid.setAttribute('data-layouts', layoutCount);
     grid.style.top = gridTop() + 'px';
 
     var base = visible();
@@ -361,7 +387,16 @@ WALL_JS = r"""
   }
 
   if (window.MutationObserver){
-    var mo = new MutationObserver(function(){ if (!on) return; clearTimeout(mo._t); mo._t = setTimeout(layout, 140); });
+    var mo = new MutationObserver(function(recs){
+      if (!on || busy) return;
+      for (var i = 0; i < recs.length; i++){
+        var added = recs[i].addedNodes;
+        var mine = false;
+        for (var j = 0; j < added.length; j++) if (added[j].dataset && added[j].dataset.clone) mine = true;
+        if (mine) return;
+      }
+      clearTimeout(mo._t); mo._t = setTimeout(layout, 160);
+    });
     mo.observe(grid, { childList: true });
   }
 
