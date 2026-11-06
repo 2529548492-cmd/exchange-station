@@ -44,12 +44,12 @@ body.wall-dragging #albumGrid.wall2{cursor:grabbing}
 }
 #albumGrid.wall2 .tile .tileinfo{
   position:absolute; left:0; right:0; bottom:0; z-index:2; margin:0;
-  padding:16px 7px 6px; background:none;
-  background-image:linear-gradient(180deg, transparent, rgba(0,0,0,.72));
+  padding:26px 7px 6px; background:none;
+  background-image:linear-gradient(180deg, transparent, rgba(0,0,0,.62));
 }
 #albumGrid.wall2 .tile .tile-name{
   display:-webkit-box; -webkit-line-clamp:1; -webkit-box-orient:vertical;
-  font-size:11px; line-height:1.3; margin:0; color:#fff;
+  font-size:10.5px; line-height:1.3; margin:0; color:#fff;
 }
 #albumGrid.wall2 .tile .tile-meta{
   font-size:8.5px; line-height:1.3; margin:1px 0 0; min-height:0;
@@ -57,7 +57,8 @@ body.wall-dragging #albumGrid.wall2{cursor:grabbing}
   -webkit-line-clamp:1; -webkit-box-orient:vertical; overflow:hidden;
 }
 #albumGrid.wall2 .tile .tilefic{
-  font-weight:800; color:var(--green) !important;
+  font-weight:700; font-size:clamp(18px,2.2vw,30px) !important;
+  color:var(--muted) !important; opacity:.75;
   background:linear-gradient(160deg, var(--surface-2), var(--surface)) !important;
 }
 
