@@ -2592,9 +2592,9 @@ from studio_design import build_studio_page
 STUDIO_PAGE = build_studio_page(PAGE)
 
 try:
-    from canvas_design import build_canvas_page
-    CANVAS_PAGE = build_canvas_page()
-except Exception:          # 画布页缺失时静默回退，不影响线上
+    from wall_design import build_wall_page
+    CANVAS_PAGE = build_wall_page(STUDIO_PAGE)     # 只加一个「画布视图」开关，其余不动
+except Exception:          # 增强层缺失时静默回退，不影响线上
     CANVAS_PAGE = None
 
 @app.after_request
