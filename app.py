@@ -2943,6 +2943,11 @@ def _visit_env():
         "ref": (request.headers.get("Referer") or "")[:200],
         "path": request.full_path[:120] if request.query_string else request.path,
         "m": request.method,
+        "proto": request.environ.get("SERVER_PROTOCOL", ""),
+        "ch_ua": (request.headers.get("sec-ch-ua") or "")[:80],
+        "ch_plat": (request.headers.get("sec-ch-ua-platform") or "")[:30],
+        "ch_mobile": (request.headers.get("sec-ch-ua-mobile") or "")[:4],
+        "enc": (request.headers.get("Accept-Encoding") or "")[:40],
     }
 
 
@@ -3093,6 +3098,14 @@ def api_visit():
                 row["cores"] = str(payload.get("cores") or "")[:10]
                 row["model"] = str(payload.get("model") or "")[:60]
                 row["battery"] = str(payload.get("battery") or "")[:20]
+                row["gpu"] = str(payload.get("gpu") or "")[:80]
+                row["screen2"] = str(payload.get("window") or "")[:24]
+                row["avail"] = str(payload.get("avail") or "")[:24]
+                row["touch"] = str(payload.get("touch") or "")[:12]
+                row["cookies"] = str(payload.get("cookies") or "")[:6]
+                row["dnt"] = str(payload.get("dnt") or "")[:6]
+                row["lang2"] = str(payload.get("lang") or "")[:60]
+                row["extra"] = {k: str(v)[:60] for k, v in payload.items()}
                 if geo:
                     row.update({
                         "loc": geo.get("loc", ""),
@@ -4233,7 +4246,7 @@ VISITORS_CARD = (
     'var rows=d.items.map(function(v){return "<div style=\"padding:8px 0;border-top:1px solid var(--line)\">"'
     '+"<b>"+v.t+"</b> · "+v.ip+" · "+v.dev+"/"+v.os+"/"+v.br'
     '+"<div style=\"color:var(--muted);word-break:break-all\">"+ (v.path||"") + (v.ref?(" \u2190 "+v.ref):"") +"</div>"'
-    '+"<div style=\"color:var(--muted);word-break:break-all;font-size:11.5px\">"+v.ua+"</div></div>"});'
+    '+"<div style=\"color:var(--muted);word-break:break-all;font-size:11.5px\">"+extra+"</div>"+"<div style=\"color:var(--muted);word-break:break-all;font-size:11px\">"+v.ua+"</div></div>"});'
     'document.getElementById("visitorList").innerHTML=rows.join("")||"<p class=\"empty\">\u6682\u65e0\u8bb0\u5f55</p>";'
     '}).catch(function(){b.disabled=false;b.textContent="\u91cd\u8bd5"});'
     '});})();</script>'
