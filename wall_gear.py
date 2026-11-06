@@ -35,29 +35,29 @@ body.wall-on #wallGear{display:grid}
 .wp-note{margin:8px 0 2px; font-size:10px; color:var(--muted)}
 
 /* 遮罩与信息条样式，由面板上的 CSS 变量驱动 */
-#albumGrid.wall-grid .tile::after{
+#albumGrid.wall2 .tile::after{
   content:""; position:absolute; inset:0; z-index:1; pointer-events:none;
   background:linear-gradient(180deg, transparent 42%, rgba(0,0,0,var(--wall-scrim,.42)));
 }
-body.wall-cap-v #albumGrid.wall-grid .tile::after{
+body.wall-cap-v #albumGrid.wall2 .tile::after{
   background:linear-gradient(90deg, transparent 34%, rgba(0,0,0,var(--wall-scrim,.42)));
 }
-body.wall-cap-v #albumGrid.wall-grid .tileinfo{
+body.wall-cap-v #albumGrid.wall2 .tileinfo{
   left:auto; right:0; top:0; bottom:0; width:auto; max-width:26%;
   padding:7px 5px; writing-mode:vertical-rl; text-orientation:mixed;
   display:flex; flex-direction:column; justify-content:flex-end;
   background-image:none;
 }
-body.wall-cap-paper #albumGrid.wall-grid .tileinfo{ background:#F2EEE8; }
-body.wall-cap-paper #albumGrid.wall-grid .tile-name,
-body.wall-cap-paper #albumGrid.wall-grid .tile-meta{ color:#3C3833 !important; }
-body.wall-cap-ink #albumGrid.wall-grid .tileinfo{ background:rgba(17,16,15,.92); }
-body.wall-cap-frost #albumGrid.wall-grid .tileinfo{
+body.wall-cap-paper #albumGrid.wall2 .tileinfo{ background:#F2EEE8; }
+body.wall-cap-paper #albumGrid.wall2 .tile-name,
+body.wall-cap-paper #albumGrid.wall2 .tile-meta{ color:#3C3833 !important; }
+body.wall-cap-ink #albumGrid.wall2 .tileinfo{ background:rgba(17,16,15,.92); }
+body.wall-cap-frost #albumGrid.wall2 .tileinfo{
   background:rgba(255,255,255,.18);
   -webkit-backdrop-filter:blur(12px) saturate(150%);
   backdrop-filter:blur(12px) saturate(150%);
 }
-body.wall-blur #albumGrid.wall-grid .tile .tileimg{ filter:blur(2px) saturate(.9); }
+body.wall-blur #albumGrid.wall2 .tile .tileimg{ filter:blur(2px) saturate(.9); }
 </style>
 """
 

@@ -386,6 +386,8 @@ WALL2_JS = r"""
   hookPreview();
   setTimeout(hookPreview, 700);
 
+  window.__wallRelayout = function(){ if (on) layout(); };
+
   if (!/[?&]wall=0/.test(location.search)) setTimeout(function(){ setOn(true); }, 140);
 })();
 </script>
