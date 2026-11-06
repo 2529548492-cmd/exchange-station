@@ -2597,6 +2597,13 @@ try:
 except Exception:          # 画布页缺失时静默回退，不影响线上
     CANVAS_PAGE = None
 
+@app.after_request
+def _ui_version_header(resp):
+    """部署标记：用来确认线上跑的是哪一版前端。"""
+    resp.headers["X-UI-Version"] = "canvas-1"
+    return resp
+
+
 ADMIN_PAGE = (
     "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
