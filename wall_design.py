@@ -610,6 +610,12 @@ STATS_JS = r"""
 
 
 try:
+    from wall2 import build_wall2
+    W2_CSS, W2_JS = build_wall2()
+except Exception:
+    W2_CSS = W2_JS = ""
+
+try:
     from download_ux import build_download_ux
     DL_CSS, DL_JS = build_download_ux()
 except Exception:
@@ -623,7 +629,7 @@ except Exception:
 
 
 def build_wall_page(page: str) -> str:
-    page = page.replace("</head>", STATS_CSS + DL_CSS + "</head>", 1)
+    page = page.replace("</head>", STATS_CSS + DL_CSS + W2_CSS + GEAR_CSS + "</head>", 1)
     # 顶部：交换站 标题右边插入在线/累计
     head_anchor = '<div class="badge-live">'
     if head_anchor in page:
@@ -631,5 +637,5 @@ def build_wall_page(page: str) -> str:
     anchor = '<button id="themeBtn"'
     if anchor in page:
         page = page.replace(anchor, DRAWER_BLOCK + anchor, 1)
-    page = page.replace("</body>", STATS_JS + DL_JS + "</body>", 1)
+    page = page.replace("</body>", GEAR_HTML + W2_JS + STATS_JS + DL_JS + GEAR_JS + "</body>", 1)
     return page
