@@ -2350,6 +2350,108 @@ BASE_CSS = """
   @media (prefers-reduced-motion:reduce){ #admin-main{transition:none} #admin-main.pjax-in{animation:none} .ann-overlay,.ann-card{transition:none} }
  """
 
+# Visual refresh stays separate from the original rules so the previous look
+# remains easy to restore. The existing drawer markup and JavaScript are intact.
+VISUAL_REFRESH_CSS = """
+  :root{
+    --bg:#f6f5f0;
+    --surface:#fffefa;
+    --surface-2:#eeeee7;
+    --ink:#202b23;
+    --muted:#66746b;
+    --line:#dce2d9;
+    --green:#176a4c;
+    --green-ink:#14573f;
+    --green-soft:#e3f0e8;
+    --shadow:0 14px 36px rgba(33,55,40,.055);
+    --radius:16px;
+    --motion:cubic-bezier(.22,1,.36,1);
+  }
+  [data-theme="dark"]{
+    --bg:#151b17;
+    --surface:#202923;
+    --surface-2:#29342d;
+    --ink:#eef3ed;
+    --muted:#abb9ae;
+    --line:#3a493e;
+    --green:#48ad7d;
+    --green-ink:#93ddb2;
+    --green-soft:#244332;
+    --shadow:0 14px 36px rgba(0,0,0,.18);
+  }
+  body{font-family:"Noto Sans SC","Microsoft YaHei",system-ui,sans-serif;line-height:1.55}
+  .wrap{max-width:1120px;padding:32px 24px 72px}
+  h1,h2,h3{letter-spacing:-.025em;text-wrap:balance}
+  h1{font-family:inherit;font-weight:700}
+  p{ text-wrap:pretty }
+  .card{box-shadow:none}
+  .section{padding:28px 32px}
+  .section-head{align-items:center;margin-bottom:16px}
+  .section-head h2,.upload h2{font-size:20px;line-height:28px;font-weight:700}
+  .section-head p{font-size:14px}
+  .layout{grid-template-columns:minmax(280px,340px) minmax(0,1fr);gap:24px;margin-top:24px}
+  .maincol{gap:24px}
+  .upload{padding:28px;top:80px}
+  .badge-live{box-shadow:none;font-weight:600;padding:7px 12px}
+  .note{background:var(--surface-2);border:1px solid var(--line);line-height:1.65}
+  .count,.chip{font-weight:700;font-variant-numeric:tabular-nums}
+  .fname,.qname{font-weight:600}
+  .file{padding:18px 0}
+  .filelist{margin-top:8px}
+  .tab,.btn,.qbtn,.drawer-navbtn,.jiabtn,.topnav a{
+    transition:background-color .3s var(--motion),border-color .3s var(--motion),
+      color .3s var(--motion),transform .5s var(--motion),box-shadow .3s var(--motion)
+  }
+  .btn:hover,.qbtn:hover,.tab:hover:not(.active){background:var(--green-soft);border-color:var(--green);color:var(--green-ink)}
+  .btn.primary:hover,.tab.active:hover{background:var(--green-ink);border-color:var(--green-ink);color:#fff}
+  .btn:active,.qbtn:active,.tab:active,.jiabtn:active{transform:scale(.97)}
+  :where(button,a,input,select,textarea,[role="button"]):focus-visible{
+    outline:3px solid var(--green);outline-offset:3px
+  }
+  .textin,.search,.renametext{transition:border-color .3s var(--motion),box-shadow .3s var(--motion)}
+  .textin:focus,.search:focus,.renametext:focus{border-color:var(--green);box-shadow:0 0 0 4px var(--green-soft);outline:none}
+  .empty{background:var(--surface-2);border-style:solid;line-height:1.7}
+  .shellhead{height:72px;padding:10px 0;background:var(--bg);border-color:var(--line)}
+  .headtitle h1{font-size:26px;line-height:1.2}
+  #curtab{font-size:14px;font-weight:500}
+  .jiabtn{width:48px;height:48px;border-radius:14px;font-size:22px;box-shadow:0 5px 14px rgba(23,106,76,.18)}
+  .jiabtn:hover{transform:translateY(-2px);box-shadow:0 9px 20px rgba(23,106,76,.23)}
+  .drawer,.drawer-backdrop{top:72px}
+  .drawer{width:288px;padding:18px 16px 20px;transition:transform .5s var(--motion)}
+  .drawer-backdrop{transition:opacity .3s var(--motion)}
+  .drawer-label{padding:12px 12px 8px;font-size:12px;letter-spacing:.08em}
+  .drawer-navbtn{font-weight:600;font-size:15px;padding:12px 14px;margin-bottom:4px}
+  .drawer-navbtn:hover:not(.active){background:var(--green-soft);color:var(--green-ink);transform:translateX(3px)}
+  .drawer-navbtn.active{box-shadow:inset 3px 0 0 var(--green-ink)}
+  .folderbar{gap:8px;margin:12px 0 18px}
+  .album-grid{gap:12px;margin-top:16px}
+  .tile{border-radius:16px;transition:transform .5s var(--motion),box-shadow .3s var(--motion),border-color .3s var(--motion)}
+  .tile:hover{transform:translateY(-3px);box-shadow:var(--shadow);border-color:var(--green)}
+  .tile-name{font-size:13px;font-weight:600}
+  .tile-meta{font-size:12px;font-variant-numeric:tabular-nums}
+  #previewCard{border:1px solid var(--line);box-shadow:var(--shadow)}
+  .ann-card{box-shadow:var(--shadow)}
+  @media(max-width:860px){.layout{grid-template-columns:1fr}.upload{position:static}}
+  @media(max-width:640px){
+    .wrap{padding:16px 14px 48px}
+    .shellhead{height:64px}
+    .headtitle h1{font-size:23px}
+    .badge-live{font-size:12px}
+    .drawer,.drawer-backdrop{top:64px}
+    .drawer{width:min(320px,88vw)}
+    .section{padding:20px 18px}
+    .upload{padding:20px 18px}
+    .layout,.maincol{gap:16px}
+    .album-grid{gap:8px}
+    .tile{border-radius:12px}
+  }
+  @media(prefers-reduced-motion:reduce){
+    .drawer,.drawer-backdrop,.tile,.jiabtn,.btn,.qbtn,.tab,.drawer-navbtn,
+    .textin,.search,.renametext{transition:none!important;animation:none!important}
+  }
+"""
+BASE_CSS += VISUAL_REFRESH_CSS
+
 # 站长区 PJAX：拦截站长区内部链接（/admin 与 /admin/*，退出与回首页除外），
 # fetch 取页、只换 #admin-main 内容并推 history；前进/后退同样换内容不刷新。
 # 表单提交一律走整页跳转；取页失败、目标无容器时回退整页跳转。
@@ -2470,7 +2572,7 @@ PAGE = (
     "<form method=\"post\" action=\"/admin/login\">"
     "<input class=\"textin\" type=\"password\" name=\"token\" placeholder=\"站长区口令\" required> "
     "<button class=\"btn primary\" type=\"submit\">进入站长区</button></form></div>"
-    "</div><script>var TAB_NAMES={'principle':'原理区','publish':'发布区','published':'已发布区','feedback':'意见区','private':'私人区','admin':'站长区'};function openDrawer(){var d=document.getElementById('drawer');var b=document.getElementById('drawerBackdrop');if(!d||!b)return;d.style.display='flex';b.style.display='block';requestAnimationFrame(function(){requestAnimationFrame(function(){d.classList.add('open');b.classList.add('open');});});}function closeDrawer(){var d=document.getElementById('drawer');var b=document.getElementById('drawerBackdrop');if(!d||!b||d.style.display==='none')return;d.classList.remove('open');b.classList.remove('open');setTimeout(function(){if(!d.classList.contains('open')){d.style.display='none';b.style.display='none';}},340);}function showTab(name){if(window.__uploading&&name==='admin'&&!confirm('正在上传，点站长区进入审核页会中断上传。确定要中断吗？')){return;}document.querySelectorAll('.tabpanel').forEach(function(el){el.classList.toggle('active',el.id==='tab-'+name);});document.querySelectorAll('#drawernav .drawer-navbtn').forEach(function(b){b.classList.toggle('active',b.dataset.tab===name);});var ct=document.getElementById('curtab');if(ct)ct.textContent='/ '+(TAB_NAMES[name]||name);closeDrawer();}document.getElementById('drawerBtn').addEventListener('click',function(){var d=document.getElementById('drawer');if(d.classList.contains('open')){closeDrawer();}else{openDrawer();}});document.getElementById('drawerBackdrop').addEventListener('click',closeDrawer);document.querySelectorAll('#drawernav .drawer-navbtn').forEach(function(b){b.addEventListener('click',function(e){e.preventDefault();location.hash=b.dataset.tab;showTab(b.dataset.tab);});});document.querySelectorAll('#drawerCats .drawer-navbtn').forEach(function(b){b.addEventListener('click',function(){location.hash='published';showTab('published');curCat=b.dataset.cat;document.querySelectorAll('#cattabs .tab').forEach(function(t){t.classList.toggle('active',t.textContent.indexOf(b.dataset.cat)===0);});applyFilter();});});var _odb=document.getElementById('openDrawerBtn');if(_odb)_odb.addEventListener('click',openDrawer);var h=(location.hash||'#published').replace('#','');if(['principle','publish','published','feedback','private','admin'].indexOf(h)<0){h='published';}showTab(h);</script>"
+    "</div><script>var TAB_NAMES={'principle':'原理区','publish':'发布区','published':'已发布区','feedback':'意见区','private':'私人区','admin':'站长区'};function openDrawer(){var d=document.getElementById('drawer');var b=document.getElementById('drawerBackdrop');if(!d||!b)return;d.style.display='flex';b.style.display='block';requestAnimationFrame(function(){requestAnimationFrame(function(){d.classList.add('open');b.classList.add('open');});});}function closeDrawer(){var d=document.getElementById('drawer');var b=document.getElementById('drawerBackdrop');if(!d||!b||d.style.display==='none')return;d.classList.remove('open');b.classList.remove('open');setTimeout(function(){if(!d.classList.contains('open')){d.style.display='none';b.style.display='none';}},520);}function showTab(name){if(window.__uploading&&name==='admin'&&!confirm('正在上传，点站长区进入审核页会中断上传。确定要中断吗？')){return;}document.querySelectorAll('.tabpanel').forEach(function(el){el.classList.toggle('active',el.id==='tab-'+name);});document.querySelectorAll('#drawernav .drawer-navbtn').forEach(function(b){b.classList.toggle('active',b.dataset.tab===name);});var ct=document.getElementById('curtab');if(ct)ct.textContent='/ '+(TAB_NAMES[name]||name);closeDrawer();}document.getElementById('drawerBtn').addEventListener('click',function(){var d=document.getElementById('drawer');if(d.classList.contains('open')){closeDrawer();}else{openDrawer();}});document.getElementById('drawerBackdrop').addEventListener('click',closeDrawer);document.querySelectorAll('#drawernav .drawer-navbtn').forEach(function(b){b.addEventListener('click',function(e){e.preventDefault();location.hash=b.dataset.tab;showTab(b.dataset.tab);});});document.querySelectorAll('#drawerCats .drawer-navbtn').forEach(function(b){b.addEventListener('click',function(){location.hash='published';showTab('published');curCat=b.dataset.cat;document.querySelectorAll('#cattabs .tab').forEach(function(t){t.classList.toggle('active',t.textContent.indexOf(b.dataset.cat)===0);});applyFilter();});});var _odb=document.getElementById('openDrawerBtn');if(_odb)_odb.addEventListener('click',openDrawer);var h=(location.hash||'#published').replace('#','');if(['principle','publish','published','feedback','private','admin'].indexOf(h)<0){h='published';}showTab(h);</script>"
     "{% if entered and announcement %}<div class=\"ann-overlay\" id=\"annOverlay\"><div class=\"ann-card\" role=\"dialog\" aria-label=\"公告\"><div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:10px\"><h2>{{ announcement.title|e }}</h2><button class=\"btn\" id=\"annClose\" type=\"button\" aria-label=\"关闭公告\">×</button></div><p>{{ announcement.body_html|safe }}</p><div style=\"text-align:right\"><button class=\"btn primary\" id=\"annOk\" type=\"button\">我知道了</button></div></div></div><script>(function(){var ov=document.getElementById('annOverlay');if(!ov)return;try{if(sessionStorage.getItem('exchange_ann_closed')){ov.remove();return;}}catch(e){}var reduced=!!(window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);function closeAnn(){try{sessionStorage.setItem('exchange_ann_closed','1');}catch(e){}if(reduced){ov.remove();return;}ov.classList.remove('ann-show');var done=false;function hide(){if(done)return;done=true;ov.remove();}ov.addEventListener('transitionend',hide,{once:true});setTimeout(hide,300);}var c=document.getElementById('annClose');if(c)c.addEventListener('click',closeAnn);var o=document.getElementById('annOk');if(o)o.addEventListener('click',closeAnn);ov.addEventListener('click',function(e){if(e.target===ov)closeAnn();});requestAnimationFrame(function(){requestAnimationFrame(function(){ov.classList.add('ann-show');});});})();</script>{% endif %}"
     "<script>(function(){function applyTheme(t){var b=document.getElementById('themeBtn');if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');if(b)b.textContent='\u2600\ufe0f \u767d\u5929\u6a21\u5f0f';}else{document.documentElement.removeAttribute('data-theme');if(b)b.textContent='🌙 \u6df1\u8272\u6a21\u5f0f';}try{localStorage.setItem('theme',t);}catch(e){}}var _b=document.getElementById('themeBtn');if(_b){_b.addEventListener('click',function(){var cur=document.documentElement.getAttribute('data-theme');applyTheme(cur==='dark'?'light':'dark');});}try{var saved=localStorage.getItem('theme');if(saved==='dark'){applyTheme('dark');}else if(saved==='light'){applyTheme('light');}}catch(e){}})();</script></div></body></html>"
 )
