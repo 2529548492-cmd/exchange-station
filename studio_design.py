@@ -30,4 +30,5 @@ def build_studio_page(page):
     page = page.replace('<div class="tabpanel active" id="tab-published">', '<div class="tabpanel active" id="tab-published">' + HERO, 1)
     page = page.replace('<h2>已发布</h2>', '<h2>大家的收藏</h2>', 1)
     page = page.replace('<div id="previewOverlay">', TAGLINE + '<div id="previewOverlay">', 1)
-    return page.replace('</body>', SCRIPT + '</body>', 1)
+    motion = '<style>.shellhead{z-index:40}.gsap-motion .drawer,.gsap-motion .drawer-backdrop,.gsap-motion .drawer-navbtn{transition:none}.gsap-motion #drawernav .drawer-navbtn{opacity:1}</style><script src="/static/gsap.min.js" defer></script><script src="/static/CustomEase.min.js" defer></script><script src="/static/studio-motion.js" defer></script>'
+    return page.replace('</body>', SCRIPT + motion + '</body>', 1)
