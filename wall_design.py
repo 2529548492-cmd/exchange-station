@@ -6,8 +6,6 @@
 """
 
 DRAWER_BLOCK = (
-    '<div class="drawer-label">展示方式</div>'
-    '<button id="wallNavBtn" class="drawer-navbtn" type="button">卡片墙视图</button>'
     '<div class="drawer-label">主题</div>'
     '<div class="skin-row">'
     '<button type="button" class="skin-btn" data-skin="current">当前主题</button>'
@@ -285,6 +283,8 @@ WALL_JS = r"""
     try { layoutInner(); } finally { busy = false; }
   }
 
+  var world = {w: 0, h: 0};
+
   function layoutInner(){
     layoutCount++;
     grid.setAttribute('data-layouts', layoutCount);
@@ -292,17 +292,19 @@ WALL_JS = r"""
 
     clearClones();
     var base = visible();
-    if (!base.length){ items = []; bankW = bankH = 0; return; }
+    for (var bi = 0; bi < base.length; bi++) base[bi].style.display = '';
+    if (!base.length){ items = []; return; }
 
     var vw = window.innerWidth, vh = Math.max(360, window.innerHeight - gridTop() - 8);
-    var unit = Math.max(88, Math.round(Math.min(vw / 7.2, vh / 4.2)));
+    var dens = 1;
+    if (window.__wallCfg && window.__wallCfg.density) dens = parseFloat(window.__wallCfg.density) || 1;
+    var unit = Math.max(64, Math.round(Math.min(vw / 7.2, vh / 4.2) / dens));
 
-    /* 2x2 拼块网格：每块内部用 2x2 / 2x1 / 1x2 / 1x1 组合，必然无缝铺满 */
-    var bCols = Math.ceil(vw / (2 * unit)) + 1;
-    var bRows = Math.ceil(vh / (2 * unit)) + 1;
-    var cols = bCols * 2, rows = bRows * 2;
-    bankW = cols * unit;
-    bankH = rows * unit;
+    /* 画布是视口的 2.5 倍，足够拖，且铺满不会有空洞 */
+    var worldW = Math.ceil(vw * 2.5), worldH = Math.ceil(vh * 2.5);
+    var bCols = Math.ceil(worldW / (2 * unit)), bRows = Math.ceil(worldH / (2 * unit));
+    world.w = bCols * 2 * unit;
+    world.h = bRows * 2 * unit;
 
     var blocks = [
       [[0,0,2,2]],
@@ -310,19 +312,15 @@ WALL_JS = r"""
       [[0,0,2,1],[0,1,2,1]],
       [[0,0,2,1],[0,1,1,1],[1,1,1,1]],
       [[0,0,1,2],[1,0,1,1],[1,1,1,1]],
-      [[0,0,1,1],[1,0,1,1],[0,1,2,1]],
-      [[0,0,2,1],[0,1,1,1],[1,1,1,1]]
+      [[0,0,1,1],[1,0,1,1],[0,1,2,1]]
     ];
-
-    function seedOf(a, b){ return (a * 73856093) ^ (b * 19349663); }
     function pick(a, b){
-      var x = Math.abs(seedOf(a + 11, b + 7)) % 1000;
-      var r = x / 1000;
-      if (r < 0.16) return blocks[0];
-      if (r < 0.40) return blocks[1];
-      if (r < 0.56) return blocks[2];
-      if (r < 0.74) return blocks[5];
-      if (r < 0.88) return blocks[3];
+      var x = Math.abs(((a + 11) * 73856093) ^ ((b + 7) * 19349663)) % 1000 / 1000;
+      if (x < 0.16) return blocks[0];
+      if (x < 0.40) return blocks[1];
+      if (x < 0.56) return blocks[2];
+      if (x < 0.74) return blocks[5];
+      if (x < 0.88) return blocks[3];
       return blocks[4];
     }
 
@@ -332,12 +330,7 @@ WALL_JS = r"""
         var pat = pick(bx, by);
         for (var q = 0; q < pat.length; q++){
           var pp = pat[q];
-          pieces.push({
-            x: bx * 2 + pp[0],
-            y: by * 2 + pp[1],
-            w: pp[2],
-            h: pp[3]
-          });
+          pieces.push({x: bx*2 + pp[0], y: by*2 + pp[1], w: pp[2], h: pp[3]});
         }
       }
     }
@@ -353,18 +346,28 @@ WALL_JS = r"""
       clones.push(c);
       pool.push(c);
     }
-    /* 文件比格子多时，多出来的先藏起来，避免叠在一起 */
     for (var h = pieces.length; h < base.length; h++) base[h].style.display = 'none';
 
     items = [];
     for (var k = 0; k < pieces.length; k++){
-      var el = pool[k], pi = pieces[k];
+      var el2 = pool[k], pi = pieces[k];
       var w = pi.w * unit, hh = pi.h * unit;
-      el.style.width = w + 'px';
-      el.style.height = hh + 'px';
-      items.push({el:el, bx:pi.x*unit, by:pi.y*unit, w:w, h:hh});
+      el2.style.width = w + 'px';
+      el2.style.height = hh + 'px';
+      items.push({el: el2, bx: pi.x*unit, by: pi.y*unit, w: w, h: hh});
     }
+    clampCam();
     render();
+  }
+
+  function clampCam(){
+    var vw = window.innerWidth, vh = window.innerHeight - gridTop();
+    var maxX = Math.max(0, world.w - vw);
+    var maxY = Math.max(0, world.h - vh);
+    if (cam.x < 0) cam.x = 0;
+    if (cam.y < 0) cam.y = 0;
+    if (cam.x > maxX) cam.x = maxX;
+    if (cam.y > maxY) cam.y = maxY;
   }
 
   function mod(v, m){ return ((v % m) + m) % m; }
@@ -374,10 +377,8 @@ WALL_JS = r"""
     var vw = window.innerWidth, vh = window.innerHeight;
     for (var i = 0; i < items.length; i++){
       var it = items[i];
-      var x = mod(it.bx + cam.x, bankW);
-      var y = mod(it.by + cam.y, bankH);
-      if (x >= bankW) x -= bankW;
-      if (y >= bankH) y -= bankH;
+      var x = it.bx - cam.x;
+      var y = it.by - cam.y;
       it.el.style.transform = 'translate3d(' + x + 'px,' + y + 'px,0)';
       it.el.style.visibility = (x < -it.w - 16 || y < -it.h - 16) ? 'hidden' : 'visible';
     }
@@ -401,7 +402,7 @@ WALL_JS = r"""
     if (navBtn) navBtn.textContent = on ? '列表模式' : '卡片墙视图';
 
     if (on){
-      cam = {x: -80, y: -60};
+      cam = {x: 60, y: 20};
       var all = grid.querySelectorAll('.tile');
       for (var i = 0; i < all.length; i++){
         if (window.gsap) gsap.killTweensOf(all[i]);
@@ -441,7 +442,7 @@ WALL_JS = r"""
     drag.vx = dx / dt * 16; drag.vy = dy / dt * 16;
     drag.lx = e.clientX; drag.ly = e.clientY; drag.lt = now;
     drag.moved += Math.abs(dx) + Math.abs(dy);
-    if (drag.moved > 4){ cam.x += dx; cam.y += dy; render(); }
+    if (drag.moved > 4){ cam.x += dx; cam.y += dy; clampCam(); render(); }
   }, {passive:true});
 
   function endDrag(){
@@ -455,7 +456,7 @@ WALL_JS = r"""
     var st = {x: vx, y: vy};
     drag.tw = gsap.to(st, {
       x: 0, y: 0, duration: 1.1, ease: 'power3.out',
-      onUpdate: function(){ cam.x += st.x; cam.y += st.y; render(); }
+      onUpdate: function(){ cam.x += st.x; cam.y += st.y; clampCam(); render(); }
     });
   }
   grid.addEventListener('pointerup', endDrag);
@@ -504,8 +505,43 @@ WALL_JS = r"""
     clearTimeout(rt); rt = setTimeout(layout, 180);
   });
 
+  /* ---------------- 点卡片：从原位置飞到正中放大（FLIP） ---------------- */
+  function flipFrom(tile, card, overlay){
+    if (!window.gsap || !tile || !card) return;
+    var tr = tile.getBoundingClientRect();
+    var cr = card.getBoundingClientRect();
+    if (!cr.width || !cr.height) return;
+    var sx = tr.width / cr.width, sy = tr.height / cr.height;
+    var dx = (tr.left + tr.width / 2) - (cr.left + cr.width / 2);
+    var dy = (tr.top + tr.height / 2) - (cr.top + cr.height / 2);
+    gsap.killTweensOf(card);
+    if (overlay) gsap.fromTo(overlay, {opacity:0}, {opacity:1, duration:.28, ease:'power2.out'});
+    gsap.fromTo(card,
+      {x:dx, y:dy, scale:Math.min(sx, sy), opacity:.5, transformOrigin:'50% 50%'},
+      {x:0, y:0, scale:1, opacity:1, duration:.62, ease:'expo.out', clearProps:'transform'});
+  }
+
+  function hookPreview(){
+    if (typeof window.openPreview !== 'function' || window.__flipHooked) return;
+    window.__flipHooked = true;
+    var _open = window.openPreview;
+    window.openPreview = function(t){
+      var r = _open.apply(this, arguments);
+      setTimeout(function(){
+        var ov = document.getElementById('previewOverlay');
+        var card = document.getElementById('previewCard');
+        if (card && t) flipFrom(t, card, ov);
+      }, 16);
+      return r;
+    };
+  }
+  hookPreview();
+  setTimeout(hookPreview, 800);
+
   /* 默认就是卡片墙；?wall=0 或点「列表模式」才回到列表 */
   /* 暂时默认列表：卡片墙排布还有 bug，等修稳了再默认开启（?wall=1 可手动进入） */
+  window.__wallRelayout = function(){ if (on) layout(); };
+
   if (/[?&]wall=1/.test(location.search)) setTimeout(function(){ setOn(true); }, 120);
 })();
 </script>
@@ -573,8 +609,21 @@ STATS_JS = r"""
 """
 
 
+try:
+    from download_ux import build_download_ux
+    DL_CSS, DL_JS = build_download_ux()
+except Exception:
+    DL_CSS = DL_JS = ""
+
+try:
+    from wall_gear import build_gear
+    GEAR_CSS, GEAR_HTML, GEAR_JS = build_gear()
+except Exception:
+    GEAR_CSS = GEAR_HTML = GEAR_JS = ""
+
+
 def build_wall_page(page: str) -> str:
-    page = page.replace("</head>", WALL_CSS + STATS_CSS + "</head>", 1)
+    page = page.replace("</head>", STATS_CSS + DL_CSS + "</head>", 1)
     # 顶部：交换站 标题右边插入在线/累计
     head_anchor = '<div class="badge-live">'
     if head_anchor in page:
@@ -582,5 +631,5 @@ def build_wall_page(page: str) -> str:
     anchor = '<button id="themeBtn"'
     if anchor in page:
         page = page.replace(anchor, DRAWER_BLOCK + anchor, 1)
-    page = page.replace("</body>", WALL_JS + STATS_JS + "</body>", 1)
+    page = page.replace("</body>", STATS_JS + DL_JS + "</body>", 1)
     return page
