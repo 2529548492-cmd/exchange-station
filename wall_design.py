@@ -616,6 +616,12 @@ except Exception:
     W2_CSS = W2_JS = ""
 
 try:
+    from rename_queue import build_rename_queue
+    REN_CSS, REN_JS = build_rename_queue()
+except Exception:
+    REN_CSS = REN_JS = ""
+
+try:
     from pjax_admin import build_admin_pjax
     ADM_CSS, ADM_JS = build_admin_pjax()
 except Exception:
@@ -647,7 +653,7 @@ except Exception:
 
 
 def build_wall_page(page: str) -> str:
-    page = page.replace("</head>", WALL_CSS + STATS_CSS + DL_CSS + W2_CSS + GEAR_CSS + PROG_CSS + SKIN_CSS + ADM_CSS + "</head>", 1)
+    page = page.replace("</head>", WALL_CSS + STATS_CSS + DL_CSS + W2_CSS + GEAR_CSS + PROG_CSS + SKIN_CSS + ADM_CSS + REN_CSS + "</head>", 1)
     # 顶部：交换站 标题右边插入在线/累计
     head_anchor = '<div class="badge-live">'
     if head_anchor in page:
@@ -655,5 +661,5 @@ def build_wall_page(page: str) -> str:
     anchor = '<button id="themeBtn"'
     if anchor in page:
         page = page.replace(anchor, DRAWER_BLOCK + anchor, 1)
-    page = page.replace("</body>", GEAR_HTML + W2_JS + STATS_JS + DL_JS + GEAR_JS + PROG_JS + SKIN_JS + ADM_JS + "</body>", 1)
+    page = page.replace("</body>", GEAR_HTML + W2_JS + STATS_JS + DL_JS + GEAR_JS + PROG_JS + SKIN_JS + ADM_JS + REN_JS + "</body>", 1)
     return page
