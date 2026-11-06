@@ -38,6 +38,12 @@ body.wall-dragging #albumGrid.wall2{cursor:grabbing}
   transition:none !important; animation:none !important;
 }
 #albumGrid.wall2 .tile:hover{transform:none; box-shadow:none}
+#albumGrid.wall2 img,
+#albumGrid.wall2 .tile .tileimg{
+  -webkit-user-drag:none; -moz-user-drag:none; user-drag:none;
+  pointer-events:none; user-select:none; -webkit-user-select:none;
+}
+#albumGrid img{ -webkit-user-drag:none; user-drag:none; }
 #albumGrid.wall2 .tile .tileimg{
   position:absolute; inset:0; width:100%; height:100%; aspect-ratio:auto;
   object-fit:cover; border-radius:0;
@@ -331,6 +337,11 @@ WALL2_JS = r"""
     render();
     e.preventDefault();
   }, {passive:false});
+
+  /* 禁止浏览器原生「把图片拖出来」的行为 */
+  grid.addEventListener('dragstart', function(e){ e.preventDefault(); return false; }, true);
+  grid.addEventListener('selectstart', function(e){ if (on) e.preventDefault(); }, true);
+  grid.addEventListener('contextmenu', function(e){ if (on && drag.moved > 8) e.preventDefault(); });
 
   grid.addEventListener('click', function(e){
     if (on && drag.moved > 8){ e.stopPropagation(); e.preventDefault(); drag.moved = 0; }
