@@ -365,12 +365,15 @@ WALL2_JS = r"""
       {x:dx, y:dy, scale:Math.min(sx, sy), opacity:.55, transformOrigin:'50% 50%'},
       {x:0, y:0, scale:1, opacity:1, duration:.62, ease:'expo.out', clearProps:'transform'});
   }
+  function isDesktop(){ return window.matchMedia('(min-width: 761px)').matches; }
+
   function hookPreview(){
     if (typeof window.openPreview !== 'function' || window.__flip2) return;
     window.__flip2 = true;
     var _open = window.openPreview;
     window.openPreview = function(t){
       var r = _open.apply(this, arguments);
+      if (!isDesktop()) return r;
       setTimeout(function(){
         var ov = document.getElementById('previewOverlay');
         var card = document.getElementById('previewCard');
