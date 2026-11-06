@@ -3050,8 +3050,10 @@ def index():
     _design = request.args.get("design")
     if _design == "legacy":
         _tpl = PAGE
-    elif _design == "canvas" and CANVAS_PAGE and entered:
-        _tpl = CANVAS_PAGE
+    elif _design == "studio":
+        _tpl = STUDIO_PAGE
+    elif CANVAS_PAGE and entered:
+        _tpl = CANVAS_PAGE          # 默认就是增强版（统计/主题/下载/卡片墙/站长区免刷新）
     else:
         _tpl = STUDIO_PAGE
     return render_template_string(
