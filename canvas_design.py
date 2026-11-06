@@ -345,6 +345,14 @@ html[data-theme="apple"] .btn.ghost{background:rgba(0,0,0,.05)}
   </div>
 </div>
 
+<script>
+window.onerror=function(m,src,l,c){
+  var d=document.createElement('pre');d.id='errbox';
+  d.style.cssText='position:fixed;z-index:99999;left:0;right:0;bottom:0;background:#ffe4e1;color:#8b0000;font:12px/1.45 monospace;padding:8px;margin:0;white-space:pre-wrap';
+  d.textContent='JS ERROR: '+m+' @'+l+':'+c;
+  document.body.appendChild(d);
+};
+</script>
 <script src="assets/vendor/gsap.min.js"></script>
 <script>
 (function(){
