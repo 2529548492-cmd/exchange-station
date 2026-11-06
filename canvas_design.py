@@ -353,7 +353,7 @@ window.onerror=function(m,src,l,c){
   document.body.appendChild(d);
 };
 </script>
-<script src="assets/vendor/gsap.min.js"></script>
+<script src="/static/gsap.min.js"></script>
 <script>
 (function(){
   'use strict';
