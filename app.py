@@ -2759,6 +2759,183 @@ def api_files():
     return jsonify(out)
 
 
+# ---------------- 统计：在线 / 今日活跃 / 累计（云盘持久化） ----------------
+_STATS_FILE = "_exchange_stats.json"
+_ONLINE = {}
+_ONLINE_LOCK = threading.Lock()
+_ONLINE_WINDOW = 300
+
+_STATS = {"date": "", "today": 0, "total": 0}
+_STATS_LOCK = threading.Lock()
+_STATS_STATE = {"loaded": False, "last_load": 0, "last_flush": 0, "dirty": False, "file_id": None}
+_SEEN = {}
+_SEEN_LOCK = threading.Lock()
+
+
+def _today_str():
+    return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
+
+
+def _stats_load(service):
+    """从云盘读回统计；没文件也算成功（从 0 起算，不编造历史）。"""
+    if service is None:
+        return False
+    try:
+        res = service.files().list(
+            q="name = '" + _STATS_FILE + "' and '" + PUBLISHED_FOLDER_ID + "' in parents and trashed = false",
+            fields="files(id, modifiedTime)", pageSize=1).execute()
+        items = res.get("files") or []
+        if not items:
+            _STATS_STATE["loaded"] = True
+            return True
+        fid = items[0]["id"]
+        raw = service.files().get_media(fileId=fid).execute()
+        import json as _json
+        data = _json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+        with _STATS_LOCK:
+            _STATS["total"] = int(data.get("total") or 0)
+            _STATS["date"] = str(data.get("date") or _today_str())
+            _STATS["today"] = int(data.get("today") or 0)
+            if _STATS["date"] != _today_str():
+                _STATS["date"] = _today_str()
+                _STATS["today"] = 0
+        _STATS_STATE["file_id"] = fid
+        _STATS_STATE["loaded"] = True
+        return True
+    except Exception:
+        return False
+
+
+def _stats_flush(service):
+    """把内存里的统计写回云盘，失败静默。"""
+    if service is None:
+        return False
+    with _STATS_LOCK:
+        payload = {"date": _STATS["date"], "today": _STATS["today"], "total": _STATS["total"]}
+    try:
+        import json as _json
+        body = _json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        media = _MediaInMemoryUpload(body, mimetype="application/json") if "_MediaInMemoryUpload" in globals() else None
+        if media is None:
+            from googleapiclient.http import MediaIoBaseUpload
+            import io as _io
+            media = MediaIoBaseUpload(_io.BytesIO(body), mimetype="application/json", resumable=False)
+        fid = _STATS_STATE.get("file_id")
+        if fid:
+            service.files().update(fileId=fid, media_body=media).execute()
+        else:
+            created = service.files().create(
+                body={"name": _STATS_FILE, "parents": [PUBLISHED_FOLDER_ID]},
+                media_body=media, fields="id").execute()
+            _STATS_STATE["file_id"] = created.get("id")
+        _STATS_STATE["last_flush"] = time.time()
+        _STATS_STATE["dirty"] = False
+        return True
+    except Exception:
+        return False
+
+
+def _stats_touch():
+    """每次进站记一次：同一天同一会话只算一次。"""
+    try:
+        key = _online_key()
+        day = _today_str()
+        with _SEEN_LOCK:
+            if _SEEN.get(key) == day:
+                return
+            _SEEN[key] = day
+            if len(_SEEN) > 2000:
+                _SEEN.clear()
+                _SEEN[key] = day
+        with _STATS_LOCK:
+            if _STATS["date"] != day:
+                _STATS["date"] = day
+                _STATS["today"] = 0
+            _STATS["today"] += 1
+            _STATS["total"] += 1
+        _STATS_STATE["dirty"] = True
+    except Exception:
+        pass
+
+
+def _online_key():
+    gate = (request.cookies.get("exchange_access", "") or "")[:12]
+    ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "?").split(",")[0].strip()
+    return gate + "|" + ip
+
+
+@app.before_request
+def _track_stats():
+    try:
+        if request.method != "GET":
+            return
+        pth = request.path
+        if pth != "/" and not pth.startswith("/view/") and not pth.startswith("/download/"):
+            return
+        now = time.time()
+        with _ONLINE_LOCK:
+            _ONLINE[_online_key()] = now
+            if len(_ONLINE) > 800:
+                cut = now - _ONLINE_WINDOW
+                for k in [k for k, v in _ONLINE.items() if v < cut]:
+                    _ONLINE.pop(k, None)
+        if pth == "/":
+            _stats_touch()
+    except Exception:
+        pass
+
+
+@app.route("/api/stats")
+def api_stats():
+    now = time.time()
+    try:
+        with _ONLINE_LOCK:
+            online = sum(1 for v in _ONLINE.values() if now - v <= _ONLINE_WINDOW)
+    except Exception:
+        online = 0
+
+    service = None
+    try:
+        service = drive_service()
+    except Exception:
+        service = None
+
+    # 首次或超过 5 分钟，读一次云盘
+    if service is not None and (not _STATS_STATE["loaded"] or now - _STATS_STATE["last_load"] > 300):
+        _STATS_STATE["last_load"] = now
+        if _stats_load(service):
+            _STATS_STATE["loaded"] = True
+
+    # 有改动就节流写回
+    if service is not None and _STATS_STATE["dirty"] and now - _STATS_STATE["last_flush"] > 60:
+        def _bg():
+            try:
+                _stats_flush(service)
+            except Exception:
+                pass
+        threading.Thread(target=_bg, daemon=True).start()
+
+    with _STATS_LOCK:
+        today = _STATS["today"]
+        total = _STATS["total"]
+
+    dl_total = 0
+    files_n = 0
+    try:
+        files, _folders, _notice = _cached_published(service)
+        files_n = len(files)
+        for f in files:
+            try:
+                dl_total += int(f.get("dl_count") or 0)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return jsonify({"online": online, "today": today, "total": total,
+                    "downloads": dl_total, "files": files_n})
+
+
 @app.route("/api/announcement")
 def api_announcement():
     """进站公告 JSON（供中继模式的上海站读取 Render 后端公告；本站直连时不走这里）。"""

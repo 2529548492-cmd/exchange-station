@@ -287,11 +287,13 @@ WALL_JS = r"""
     if (!base.length){ items = []; bankW = bankH = 0; return; }
 
     var vw = window.innerWidth, vh = Math.max(360, window.innerHeight - gridTop() - 8);
-    var ideal = Math.max(96, Math.round(Math.min(vw / 6.4, vh / 3.6)));
-    var cols = Math.max(2, Math.round(vw / ideal));
-    var rows = Math.max(2, Math.ceil(base.length / cols) + 1);
-    step = Math.max(Math.ceil(vw / cols), Math.ceil(vh / rows));
-    bankW = cols * step; bankH = rows * step;
+
+    /* 等尺寸格子：行列都比视口多两圈，循环补位永远不会露空 */
+    step = Math.round(Math.max(96, Math.min(vw / 6.2, vh / 3.4)));
+    var cols = Math.ceil(vw / step) + 2;
+    var rows = Math.ceil(vh / step) + 2;
+    bankW = cols * step;
+    bankH = rows * step;
 
     var cells = cols * rows, pool = [];
     for (var i = 0; i < cells; i++){
@@ -305,19 +307,13 @@ WALL_JS = r"""
       pool.push(c);
     }
 
-    var canBig = [];
-    for (var ci = 0; ci < pool.length; ci++){
-      var im = pool[ci].querySelector('.tileimg');
-      canBig.push(!!(im && im.getAttribute('src') && im.style.display !== 'none'));
-    }
-    var pat = pack(cells, cols, rows, canBig);
-
     items = [];
     for (var k = 0; k < cells; k++){
-      var el = pool[k], p = pat[k] || {x:0,y:0,w:1,h:1};
-      el.style.width = (p.w * step) + 'px';
-      el.style.height = (p.h * step) + 'px';
-      items.push({el:el, bx:p.x*step, by:p.y*step, w:p.w*step, h:p.h*step});
+      var el = pool[k];
+      var col = k % cols, row = Math.floor(k / cols);
+      el.style.width = step + 'px';
+      el.style.height = step + 'px';
+      items.push({el:el, bx:col*step, by:row*step, w:step, h:step});
     }
     render();
   }
@@ -329,10 +325,10 @@ WALL_JS = r"""
     var vw = window.innerWidth, vh = window.innerHeight;
     for (var i = 0; i < items.length; i++){
       var it = items[i];
-      var x = mod(it.bx + cam.x, bankW) - step;
-      var y = mod(it.by + cam.y, bankH) - step;
-      if (x > vw + it.w) x -= bankW;
-      if (y > vh + it.h) y -= bankH;
+      var x = mod(it.bx + cam.x, bankW);
+      var y = mod(it.by + cam.y, bankH);
+      if (x >= bankW) x -= bankW;
+      if (y >= bankH) y -= bankH;
       it.el.style.transform = 'translate3d(' + x + 'px,' + y + 'px,0)';
       it.el.style.visibility = (x < -it.w - 16 || y < -it.h - 16) ? 'hidden' : 'visible';
     }
@@ -460,16 +456,82 @@ WALL_JS = r"""
   });
 
   /* 默认就是卡片墙；?wall=0 或点「列表模式」才回到列表 */
-  if (!/[?&]wall=0/.test(location.search)) setTimeout(function(){ setOn(true); }, 120);
+  /* 暂时默认列表：卡片墙排布还有 bug，等修稳了再默认开启（?wall=1 可手动进入） */
+  if (/[?&]wall=1/.test(location.search)) setTimeout(function(){ setOn(true); }, 120);
+})();
+</script>
+"""
+
+
+STATS_HTML = (
+    '<div class="live-stats" id="liveStats" aria-live="polite">'
+    '<span class="ls-item"><b id="lsOnline">–</b><i>在线</i></span>'
+    '<span class="ls-sep"></span>'
+    '<span class="ls-item"><b id="lsToday">–</b><i>今日活跃</i></span>'
+    '<span class="ls-sep"></span>'
+    '<span class="ls-item"><b id="lsTotal">–</b><i>累计使用</i></span>'
+    '</div>'
+)
+
+STATS_CSS = r"""
+<style id="live-stats-css">
+.live-stats{
+  display:inline-flex; align-items:center; gap:10px; flex:0 0 auto;
+  height:34px; padding:0 12px; border-radius:10px;
+  background:var(--surface-2); border:1px solid var(--line);
+  font:700 12px/1 Manrope,"Microsoft YaHei",sans-serif; color:var(--ink);
+}
+.ls-item{display:inline-flex; align-items:baseline; gap:5px; white-space:nowrap}
+.ls-item b{font-size:13px; font-variant-numeric:tabular-nums}
+.ls-item i{font-style:normal; font-size:10px; color:var(--muted); letter-spacing:.04em}
+.ls-sep{width:1px; height:14px; background:var(--line)}
+@media (max-width:760px){
+  .live-stats{height:28px; padding:0 9px; gap:7px}
+  .ls-item b{font-size:12px}
+  .ls-item i{font-size:9px}
+  .live-stats .ls-sep{height:12px}
+}
+</style>
+"""
+
+STATS_JS = r"""
+<script id="live-stats-js">
+(function(){
+  var box = document.getElementById('liveStats');
+  if (!box) return;
+  var oEl = document.getElementById('lsOnline'),
+      tEl = document.getElementById('lsToday'),
+      aEl = document.getElementById('lsTotal');
+  function fmt(n){
+    n = n || 0;
+    return (n >= 10000) ? (n / 10000).toFixed(1) + 'w' : String(n);
+  }
+  function tick(){
+    fetch('/api/stats', {credentials: 'same-origin'})
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(d){
+        if (!d) return;
+        oEl.textContent = fmt(d.online);
+        tEl.textContent = fmt(d.today);
+        aEl.textContent = fmt(d.total);
+      })
+      .catch(function(){});
+  }
+  tick();
+  setInterval(tick, 30000);
 })();
 </script>
 """
 
 
 def build_wall_page(page: str) -> str:
-    page = page.replace("</head>", WALL_CSS + "</head>", 1)
+    page = page.replace("</head>", WALL_CSS + STATS_CSS + "</head>", 1)
+    # 顶部：交换站 标题右边插入在线/累计
+    head_anchor = '<div class="badge-live">'
+    if head_anchor in page:
+        page = page.replace(head_anchor, STATS_HTML + head_anchor, 1)
     anchor = '<button id="themeBtn"'
     if anchor in page:
         page = page.replace(anchor, DRAWER_BLOCK + anchor, 1)
-    page = page.replace("</body>", WALL_JS + "</body>", 1)
+    page = page.replace("</body>", WALL_JS + STATS_JS + "</body>", 1)
     return page
