@@ -2858,7 +2858,7 @@ def index():
             ann = dict(ann)
             ann["body_html"] = _html.escape(ann["body"]).replace("\n", "<br>")
     return render_template_string(
-        STUDIO_PAGE if request.args.get("design") == "studio" else PAGE,
+        PAGE if request.args.get("design") == "legacy" else STUDIO_PAGE,
         code_configured=bool(code),
         entered=entered,
         drive_configured=True if _is_relay() else _drive_configured(),
