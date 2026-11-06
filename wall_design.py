@@ -108,6 +108,14 @@ body.wall-dragging #albumGrid.wall-grid{cursor:grabbing}
   position:absolute; inset:0; width:100%; height:100%; aspect-ratio:auto;
   object-fit:cover; border-radius:0;
 }
+#albumGrid.wall-grid .tile .tilefic,
+#albumGrid.wall-grid .tile .fileicon{
+  font-size:clamp(22px,3vw,40px) !important;
+  font-weight:800;
+  color:var(--green) !important;
+  background:linear-gradient(160deg, var(--surface-2), var(--surface)) !important;
+  letter-spacing:.02em;
+}
 #albumGrid.wall-grid .tile .tileinfo{
   position:absolute; left:0; right:0; bottom:0; z-index:2; margin:0;
   padding:16px 7px 6px; background:none;
@@ -287,16 +295,55 @@ WALL_JS = r"""
     if (!base.length){ items = []; bankW = bankH = 0; return; }
 
     var vw = window.innerWidth, vh = Math.max(360, window.innerHeight - gridTop() - 8);
+    var unit = Math.max(88, Math.round(Math.min(vw / 7.2, vh / 4.2)));
 
-    /* 等尺寸格子：行列都比视口多两圈，循环补位永远不会露空 */
-    step = Math.round(Math.max(96, Math.min(vw / 6.2, vh / 3.4)));
-    var cols = Math.ceil(vw / step) + 2;
-    var rows = Math.ceil(vh / step) + 2;
-    bankW = cols * step;
-    bankH = rows * step;
+    /* 2x2 拼块网格：每块内部用 2x2 / 2x1 / 1x2 / 1x1 组合，必然无缝铺满 */
+    var bCols = Math.ceil(vw / (2 * unit)) + 1;
+    var bRows = Math.ceil(vh / (2 * unit)) + 1;
+    var cols = bCols * 2, rows = bRows * 2;
+    bankW = cols * unit;
+    bankH = rows * unit;
 
-    var cells = cols * rows, pool = [];
-    for (var i = 0; i < cells; i++){
+    var blocks = [
+      [[0,0,2,2]],
+      [[0,0,1,2],[1,0,1,2]],
+      [[0,0,2,1],[0,1,2,1]],
+      [[0,0,2,1],[0,1,1,1],[1,1,1,1]],
+      [[0,0,1,2],[1,0,1,1],[1,1,1,1]],
+      [[0,0,1,1],[1,0,1,1],[0,1,2,1]],
+      [[0,0,2,1],[0,1,1,1],[1,1,1,1]]
+    ];
+
+    function seedOf(a, b){ return (a * 73856093) ^ (b * 19349663); }
+    function pick(a, b){
+      var x = Math.abs(seedOf(a + 11, b + 7)) % 1000;
+      var r = x / 1000;
+      if (r < 0.16) return blocks[0];
+      if (r < 0.40) return blocks[1];
+      if (r < 0.56) return blocks[2];
+      if (r < 0.74) return blocks[5];
+      if (r < 0.88) return blocks[3];
+      return blocks[4];
+    }
+
+    var pieces = [];
+    for (var by = 0; by < bRows; by++){
+      for (var bx = 0; bx < bCols; bx++){
+        var pat = pick(bx, by);
+        for (var q = 0; q < pat.length; q++){
+          var pp = pat[q];
+          pieces.push({
+            x: bx * 2 + pp[0],
+            y: by * 2 + pp[1],
+            w: pp[2],
+            h: pp[3]
+          });
+        }
+      }
+    }
+
+    var pool = [];
+    for (var i = 0; i < pieces.length; i++){
       if (i < base.length){ pool.push(base[i]); continue; }
       var src = base[i % base.length];
       var c = src.cloneNode(true);
@@ -306,14 +353,16 @@ WALL_JS = r"""
       clones.push(c);
       pool.push(c);
     }
+    /* 文件比格子多时，多出来的先藏起来，避免叠在一起 */
+    for (var h = pieces.length; h < base.length; h++) base[h].style.display = 'none';
 
     items = [];
-    for (var k = 0; k < cells; k++){
-      var el = pool[k];
-      var col = k % cols, row = Math.floor(k / cols);
-      el.style.width = step + 'px';
-      el.style.height = step + 'px';
-      items.push({el:el, bx:col*step, by:row*step, w:step, h:step});
+    for (var k = 0; k < pieces.length; k++){
+      var el = pool[k], pi = pieces[k];
+      var w = pi.w * unit, hh = pi.h * unit;
+      el.style.width = w + 'px';
+      el.style.height = hh + 'px';
+      items.push({el:el, bx:pi.x*unit, by:pi.y*unit, w:w, h:hh});
     }
     render();
   }
