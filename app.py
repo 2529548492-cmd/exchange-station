@@ -3324,8 +3324,9 @@ def index():
         _tpl = PAGE
     elif _design == "studio":
         _tpl = STUDIO_PAGE
-    elif CANVAS_PAGE and entered:
-        _tpl = CANVAS_PAGE          # 默认就是增强版（统计/主题/下载/卡片墙/站长区免刷新）
+    elif CANVAS_PAGE:
+        _tpl = CANVAS_PAGE          # 默认就是增强版；未登录（口令页）也用同一套皮肤，
+                                    # 否则退出后回退到老页面，看起来像「卡回旧版」
     else:
         _tpl = STUDIO_PAGE
     return render_template_string(
