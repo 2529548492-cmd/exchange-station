@@ -2605,11 +2605,16 @@ PAGE = PAGE.replace("</head>", "<style id=\"visual-refresh\">" + VISUAL_REFRESH_
 from studio_design import build_studio_page
 STUDIO_PAGE = build_studio_page(PAGE)
 
+_BUILD = {"canvas": False, "err": "", "modules": {}}
+
 try:
     from wall_design import build_wall_page
-    CANVAS_PAGE = build_wall_page(STUDIO_PAGE)     # 只加一个「画布视图」开关，其余不动
-except Exception:          # 增强层缺失时静默回退，不影响线上
+    CANVAS_PAGE = build_wall_page(STUDIO_PAGE)
+    _BUILD["canvas"] = True     # 只加一个「画布视图」开关，其余不动
+except Exception as _e:    # 增强层缺失时回退，但把原因留下来给 /version 看
     CANVAS_PAGE = None
+    _BUILD["canvas"] = False
+    _BUILD["err"] = type(_e).__name__ + ": " + str(_e)[:200]
 
 @app.after_request
 def _ui_version_header(resp):
@@ -3126,6 +3131,30 @@ def api_visitors():
         rows = list(_VISITS)
     rows.reverse()
     return jsonify({"ok": True, "total": len(rows), "items": rows[:500]})
+
+
+def _probe_modules():
+    mods = {}
+    for name in ("wall2", "wall_design", "wall_gear", "download_ux",
+                 "progress_ux", "theme_skin", "pjax_admin",
+                 "rename_queue", "visit_enrich"):
+        try:
+            __import__(name)
+            mods[name] = "ok"
+        except Exception as e:
+            mods[name] = type(e).__name__ + ": " + str(e)[:80]
+    return mods
+
+
+@app.route("/version")
+def version():
+    return jsonify({
+        "version": "canvas-2",
+        "canvas_page": bool(_BUILD.get("canvas")),
+        "canvas_err": _BUILD.get("err", ""),
+        "modules": _BUILD.get("modules") or _probe_modules(),
+        "python": __import__("sys").version.split()[0],
+    })
 
 
 @app.route("/api/stats")
