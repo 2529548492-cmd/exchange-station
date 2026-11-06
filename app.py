@@ -2591,6 +2591,19 @@ PAGE = PAGE.replace("</head>", "<style id=\"visual-refresh\">" + VISUAL_REFRESH_
 from studio_design import build_studio_page
 STUDIO_PAGE = build_studio_page(PAGE)
 
+try:
+    from canvas_design import build_canvas_page
+    CANVAS_PAGE = build_canvas_page()
+except Exception:          # 画布页缺失时静默回退，不影响线上
+    CANVAS_PAGE = None
+
+@app.after_request
+def _ui_version_header(resp):
+    """部署标记：用来确认线上跑的是哪一版前端。"""
+    resp.headers["X-UI-Version"] = "canvas-1"
+    return resp
+
+
 ADMIN_PAGE = (
     "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
@@ -2857,8 +2870,15 @@ def index():
             import html as _html
             ann = dict(ann)
             ann["body_html"] = _html.escape(ann["body"]).replace("\n", "<br>")
+    _design = request.args.get("design")
+    if _design == "legacy":
+        _tpl = PAGE
+    elif _design == "canvas" and CANVAS_PAGE and entered:
+        _tpl = CANVAS_PAGE
+    else:
+        _tpl = STUDIO_PAGE
     return render_template_string(
-        PAGE if request.args.get("design") == "legacy" else STUDIO_PAGE,
+        _tpl,
         code_configured=bool(code),
         entered=entered,
         drive_configured=True if _is_relay() else _drive_configured(),
