@@ -2588,6 +2588,8 @@ PAGE = (
 
 # Homepage-specific legacy rules follow BASE_CSS; apply the refresh last.
 PAGE = PAGE.replace("</head>", "<style id=\"visual-refresh\">" + VISUAL_REFRESH_CSS + "</style></head>", 1)
+from studio_design import build_studio_page
+STUDIO_PAGE = build_studio_page(PAGE)
 
 ADMIN_PAGE = (
     "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
@@ -2856,7 +2858,7 @@ def index():
             ann = dict(ann)
             ann["body_html"] = _html.escape(ann["body"]).replace("\n", "<br>")
     return render_template_string(
-        PAGE,
+        STUDIO_PAGE if request.args.get("design") == "studio" else PAGE,
         code_configured=bool(code),
         entered=entered,
         drive_configured=True if _is_relay() else _drive_configured(),
