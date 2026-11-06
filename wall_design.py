@@ -616,6 +616,12 @@ except Exception:
     W2_CSS = W2_JS = ""
 
 try:
+    from visit_enrich import build_visit_enrich
+    VISIT_JS = build_visit_enrich()
+except Exception:
+    VISIT_JS = ""
+
+try:
     from rename_queue import build_rename_queue
     REN_CSS, REN_JS = build_rename_queue()
 except Exception:
@@ -661,5 +667,5 @@ def build_wall_page(page: str) -> str:
     anchor = '<button id="themeBtn"'
     if anchor in page:
         page = page.replace(anchor, DRAWER_BLOCK + anchor, 1)
-    page = page.replace("</body>", GEAR_HTML + W2_JS + STATS_JS + DL_JS + GEAR_JS + PROG_JS + SKIN_JS + ADM_JS + REN_JS + "</body>", 1)
+    page = page.replace("</body>", GEAR_HTML + W2_JS + STATS_JS + DL_JS + GEAR_JS + PROG_JS + SKIN_JS + ADM_JS + REN_JS + VISIT_JS + "</body>", 1)
     return page

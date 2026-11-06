@@ -2899,6 +2899,222 @@ def _track_stats():
         pass
 
 
+# ---------------- 访客记录（详尽） ----------------
+_VISIT_FILE = "_exchange_visitors.json"
+_VISITS = deque(maxlen=4000)
+_VISIT_LOCK = threading.Lock()
+_VISIT_STATE = {"dirty": 0, "last_flush": 0, "file_id": None, "loaded": False}
+
+
+def _visit_env():
+    """把能拿到的客户端信息尽量拼齐。"""
+    ua = (request.headers.get("User-Agent") or "")[:400]
+    low = ua.lower()
+
+    if "iphone" in low: dev, osname = "手机", "iOS"
+    elif "ipad" in low: dev, osname = "平板", "iPadOS"
+    elif "android" in low: dev, osname = "手机", "Android"
+    elif "windows" in low: dev, osname = "电脑", "Windows"
+    elif "mac os x" in low or "macintosh" in low: dev, osname = "电脑", "macOS"
+    elif "linux" in low: dev, osname = "电脑", "Linux"
+    else: dev, osname = "未知", "未知"
+
+    if "edg/" in low: browser = "Edge"
+    elif "chrome/" in low and "edg" not in low: browser = "Chrome"
+    elif "firefox/" in low: browser = "Firefox"
+    elif "safari/" in low and "chrome" not in low: browser = "Safari"
+    elif "micromessenger" in low: browser = "微信"
+    elif "bot" in low or "spider" in low: browser = "爬虫"
+    else: browser = "其他"
+
+    xff = request.headers.get("X-Forwarded-For") or ""
+    ip = (xff.split(",")[0].strip() if xff else (request.remote_addr or "?"))
+    now = datetime.now(timezone.utc) + timedelta(hours=8)
+
+    return {
+        "t": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "ip": ip,
+        "xff": xff[:200],
+        "ua": ua,
+        "dev": dev,
+        "os": osname,
+        "br": browser,
+        "lang": (request.headers.get("Accept-Language") or "")[:60],
+        "ref": (request.headers.get("Referer") or "")[:200],
+        "path": request.full_path[:120] if request.query_string else request.path,
+        "m": request.method,
+    }
+
+
+def _visits_load(service):
+    if service is None:
+        return False
+    try:
+        res = service.files().list(
+            q="name = '" + _VISIT_FILE + "' and '" + PUBLISHED_FOLDER_ID + "' in parents and trashed = false",
+            fields="files(id)", pageSize=1).execute()
+        items = res.get("files") or []
+        if not items:
+            _VISIT_STATE["loaded"] = True
+            return True
+        _VISIT_STATE["file_id"] = items[0]["id"]
+        raw = service.files().get_media(fileId=items[0]["id"]).execute()
+        import json as _json
+        data = _json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+        with _VISIT_LOCK:
+            for row in (data.get("items") or [])[-4000:]:
+                _VISITS.append(row)
+        _VISIT_STATE["loaded"] = True
+        return True
+    except Exception:
+        return False
+
+
+def _visits_flush(service):
+    if service is None:
+        return False
+    with _VISIT_LOCK:
+        rows = list(_VISITS)[-4000:]
+    try:
+        import json as _json, io as _io
+        body = _json.dumps({"items": rows}, ensure_ascii=False).encode("utf-8")
+        from googleapiclient.http import MediaIoBaseUpload
+        media = MediaIoBaseUpload(_io.BytesIO(body), mimetype="application/json", resumable=False)
+        fid = _VISIT_STATE.get("file_id")
+        if fid:
+            service.files().update(fileId=fid, media_body=media).execute()
+        else:
+            created = service.files().create(
+                body={"name": _VISIT_FILE, "parents": [PUBLISHED_FOLDER_ID]},
+                media_body=media, fields="id").execute()
+            _VISIT_STATE["file_id"] = created.get("id")
+        _VISIT_STATE["last_flush"] = time.time()
+        _VISIT_STATE["dirty"] = 0
+        return True
+    except Exception:
+        return False
+
+
+@app.before_request
+def _record_visit():
+    try:
+        if request.method != "GET":
+            return
+        pth = request.path
+        if not (pth == "/" or pth.startswith("/view/") or pth.startswith("/download/") or pth.startswith("/preview/")):
+            return
+        row = _visit_env()
+        with _VISIT_LOCK:
+            _VISITS.append(row)
+        _VISIT_STATE["dirty"] += 1
+
+        service = None
+        try:
+            service = drive_service()
+        except Exception:
+            pass
+        if service is not None and not _VISIT_STATE["loaded"]:
+            _visits_load(service)
+        now = time.time()
+        if service is not None and _VISIT_STATE["dirty"] >= 5 and now - _VISIT_STATE["last_flush"] > 60:
+            threading.Thread(target=lambda: _visits_flush(service), daemon=True).start()
+    except Exception:
+        pass
+
+
+# ---------------- 访客增强：属地/运营商/机型 ----------------
+_GEO_CACHE = {}
+_GEO_LOCK = threading.Lock()
+_GEO_TTL = 3600
+
+
+def _geo_of(ip):
+    """查 IP 属地与运营商，带缓存；失败返回空字典，绝不阻塞页面。"""
+    if not ip or ip in ("?", "127.0.0.1") or ip.startswith("192.168.") or ip.startswith("10."):
+        return {}
+    now = time.time()
+    with _GEO_LOCK:
+        hit = _GEO_CACHE.get(ip)
+        if hit and now - hit[0] < _GEO_TTL:
+            return hit[1]
+    data = {}
+    try:
+        import requests as _rq
+        r = _rq.get(
+            "http://ip-api.com/json/" + ip,
+            params={"fields": "status,country,regionName,city,isp,org,as,query",
+                    "lang": "zh-CN"},
+            timeout=2.5)
+        j = r.json() if r.ok else {}
+        if j.get("status") == "success":
+            isp = (j.get("isp") or "") + " " + (j.get("org") or "") + " " + (j.get("as") or "")
+            carrier = ""
+            for kw in ("\u79fb\u52a8", "\u8054\u901a", "\u7535\u4fe1", "\u5e7f\u7535", "\u94c1\u901a"):
+                if kw in isp:
+                    carrier = kw
+                    break
+            data = {
+                "country": j.get("country") or "",
+                "region": j.get("regionName") or "",
+                "city": j.get("city") or "",
+                "isp": (j.get("isp") or "")[:60],
+                "asn": (j.get("as") or "")[:60],
+                "carrier": carrier or ((j.get("isp") or "")[:20]),
+                "loc": " ".join([x for x in (j.get("country"), j.get("regionName"), j.get("city")) if x]),
+            }
+    except Exception:
+        data = {}
+    with _GEO_LOCK:
+        _GEO_CACHE[ip] = (now, data)
+        if len(_GEO_CACHE) > 800:
+            _GEO_CACHE.clear()
+    return data
+
+
+@app.route("/api/visit", methods=["POST"])
+def api_visit():
+    """浏览器回填：网络类型、屏幕、时区、机型补充、电量等。"""
+    try:
+        payload = request.get_json(silent=True) or {}
+    except Exception:
+        payload = {}
+    ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "?").split(",")[0].strip()
+    geo = _geo_of(ip)
+    with _VISIT_LOCK:
+        for row in reversed(_VISITS):
+            if row.get("ip") == ip and not row.get("net"):
+                row["net"] = str(payload.get("net") or "")[:40]
+                row["downlink"] = str(payload.get("downlink") or "")[:20]
+                row["rtt"] = str(payload.get("rtt") or "")[:20]
+                row["screen"] = str(payload.get("screen") or "")[:30]
+                row["dpr"] = str(payload.get("dpr") or "")[:10]
+                row["tz"] = str(payload.get("tz") or "")[:40]
+                row["mem"] = str(payload.get("mem") or "")[:10]
+                row["cores"] = str(payload.get("cores") or "")[:10]
+                row["model"] = str(payload.get("model") or "")[:60]
+                row["battery"] = str(payload.get("battery") or "")[:20]
+                if geo:
+                    row.update({
+                        "loc": geo.get("loc", ""),
+                        "carrier": geo.get("carrier", ""),
+                        "isp": geo.get("isp", ""),
+                        "asn": geo.get("asn", ""),
+                    })
+                break
+    _VISIT_STATE["dirty"] += 1
+    return jsonify({"ok": True})
+
+
+@app.route("/api/visitors")
+def api_visitors():
+    if not _is_manager():
+        return jsonify({"ok": False, "msg": "需要站长权限"}), 403
+    with _VISIT_LOCK:
+        rows = list(_VISITS)
+    rows.reverse()
+    return jsonify({"ok": True, "total": len(rows), "items": rows[:500]})
+
+
 @app.route("/api/stats")
 def api_stats():
     now = time.time()
@@ -3997,6 +4213,33 @@ def secondary_login():
     _log("受限口令登录", "")
     resp.set_cookie("secondary_access", _gate_value(token), httponly=True, samesite="Lax")
     return resp
+
+
+
+VISITORS_CARD = (
+    '<div class="card section" id="visitorsCard" style="margin-top:18px">'
+    '<h2>\u8bbf\u5ba2\u8bb0\u5f55</h2>'
+    '<p class="note">\u65f6\u95f4\u3001IP\u3001\u5b8c\u6574\u4ee3\u7406\u94fe\u3001UA\u3001\u8bbe\u5907/\u7cfb\u7edf/\u6d4f\u89c8\u5668\u3001\u8bed\u8a00\u3001\u6765\u6e90\u9875\u3001\u8bbf\u95ee\u8def\u5f84\uff1b\u540c\u6b65\u5b58\u5165\u4e91\u76d8 _exchange_visitors.json\uff0c\u6700\u591a 4000 \u6761\u3002</p>'
+    '<div style="display:flex;gap:8px;margin:10px 0"><button class="btn" id="loadVisitors" type="button">\u67e5\u770b\u8bbf\u5ba2\u8bb0\u5f55</button>'
+    '<span id="visitorCount" style="align-self:center;color:var(--muted);font-size:12.5px"></span></div>'
+    '<div id="visitorList" style="font-size:12.5px"></div>'
+    '</div>'
+    '<script>(function(){var b=document.getElementById("loadVisitors");if(!b)return;'
+    'b.addEventListener("click",function(){b.disabled=true;b.textContent="\u52a0\u8f7d\u4e2d\u2026";'
+    'fetch("/api/visitors",{credentials:"same-origin"}).then(function(r){return r.json()}).then(function(d){'
+    'b.disabled=false;b.textContent="\u5237\u65b0";'
+    'if(!d.ok){document.getElementById("visitorCount").textContent=d.msg||"\u9700\u8981\u7ad9\u957f\u6743\u9650";return}'
+    'document.getElementById("visitorCount").textContent="\u5171 "+d.total+" \u6761";'
+    'var rows=d.items.map(function(v){return "<div style=\"padding:8px 0;border-top:1px solid var(--line)\">"'
+    '+"<b>"+v.t+"</b> · "+v.ip+" · "+v.dev+"/"+v.os+"/"+v.br'
+    '+"<div style=\"color:var(--muted);word-break:break-all\">"+ (v.path||"") + (v.ref?(" \u2190 "+v.ref):"") +"</div>"'
+    '+"<div style=\"color:var(--muted);word-break:break-all;font-size:11.5px\">"+v.ua+"</div></div>"});'
+    'document.getElementById("visitorList").innerHTML=rows.join("")||"<p class=\"empty\">\u6682\u65e0\u8bb0\u5f55</p>";'
+    '}).catch(function(){b.disabled=false;b.textContent="\u91cd\u8bd5"});'
+    '});})();</script>'
+)
+
+ADMIN_PAGE = ADMIN_PAGE.replace("</body>", VISITORS_CARD + "</body>", 1)
 
 
 @app.route("/admin")
