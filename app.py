@@ -106,6 +106,32 @@ def _access_granted():
     return _has_gate(code, "exchange_access")
 
 
+def _cacheable(resp, days=7):
+    """给图片/缩略图加长缓存，避免每次刷新都重复吃掉 Render 的出口流量。"""
+    try:
+        resp.headers["Cache-Control"] = "private, max-age=" + str(int(days * 86400))
+        resp.headers["Vary"] = "Cookie"
+    except Exception:
+        pass
+    return resp
+
+
+@app.after_request
+def _cache_headers_after(resp):
+    """图片类接口加长缓存，减少 Render 出口流量消耗。"""
+    try:
+        pth = request.path or ""
+        if pth.startswith("/thumb/"):
+            resp.headers["Cache-Control"] = "private, max-age=1209600"   # 14 天
+        elif pth.startswith("/view/") or pth.startswith("/preview"):
+            resp.headers["Cache-Control"] = "private, max-age=86400"     # 1 天
+        if pth.startswith("/thumb/") or pth.startswith("/view/"):
+            resp.headers["Vary"] = "Cookie"
+    except Exception:
+        pass
+    return resp
+
+
 def _is_admin():
     token = _env("ADMIN_TOKEN")
     return bool(token) and _has_gate(token, "admin_access")
@@ -5630,6 +5656,11 @@ def admin_logs():
 
 @app.route("/thumb/<file_id>")
 def thumb(file_id):
+    _r = _thumb_impl(file_id)
+    return _cacheable(_r, 14)
+
+
+def _thumb_impl(file_id):
     """图片缩略图：只给已发布（熟人）或待审核（站长）看，权限和预览一致。
     狠压版（2026-11-03）：手机相册格子约 120 像素宽，缩略图只留 192 像素长边、
     JPEG 质量 45，目标是手机上能认出图片是什么就行，不追求清晰；点开预览时
