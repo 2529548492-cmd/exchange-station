@@ -7420,14 +7420,21 @@ _AI_REC_JS = """
 
   // ============ 上传队列 ============
   var Q={},QSEQ=0,QHIDE=0;
-  function qAdd(name){
+  function qAdd(name,size){
     var id='q'+(++QSEQ);
-    Q[id]={name:name||'文件',pct:0,status:'wait',err:''};
+    Q[id]={name:name||'文件',pct:0,status:'wait',err:'',t0:Date.now(),size:size||0,spd:0};
     qRender();return id;
   }
   function qSet(id,pct,status,err){
     var it=Q[id];if(!it)return;
-    if(pct!=null)it.pct=Math.max(it.pct||0,pct);
+    if(pct!=null){
+      it.pct=Math.max(it.pct||0,pct);
+      // _UP_SPEED_ETA 估算速度与剩余时间
+      try{
+        var dt=(Date.now()-it.t0)/1000;
+        if(dt>0.5&&it.size>0&&it.pct>1){ it.spd=it.size*it.pct/100/dt; }
+      }catch(e){}
+    }
     if(status)it.status=status;
     if(err)it.err=err;
     qRender();
@@ -7450,7 +7457,16 @@ _AI_REC_JS = """
     for(var i=0;i<order.length;i++){
       var it=Q[order[i]];
       var st=it.status,chip='等待',cls='q-wait';
-      if(st==='run'||st==='uploading'){chip='上传中 '+it.pct+'%';cls='q-run';}
+      if(st==='run'||st==='uploading'){
+        chip='上传中 '+it.pct+'%';
+        if(it.spd>0){
+          var mbps=(it.spd/1048576).toFixed(2);
+          var left=it.size>0?Math.max(0,(it.size*(100-it.pct)/100)/it.spd):0;
+          var leftTxt=left>60?Math.round(left/60)+'分钟':Math.round(left)+'秒';
+          chip+=' · '+mbps+' MB/s · 剩余 '+leftTxt;
+        }
+        cls='q-run';
+      }
       else if(st==='success'){chip='成功';cls='q-ok';}
       else if(st==='fail'){chip='失败';cls='q-fail';}
       var bar=st==='success'?100:(st==='fail'?100:it.pct||0);
@@ -7503,7 +7519,7 @@ _AI_REC_JS = """
         var u=this.__u||'';
         if(u.indexOf('/upload')>=0||u.indexOf('/direct')>=0){
           var names=namesFromBody(body),ids=[],self=this;
-          for(var i=0;i<names.length;i++){ids.push(qAdd(names[i]));}
+          var fs0=[];try{if(body&&body.getAll)fs0=body.getAll('file')||[];}catch(e){}for(var i=0;i<names.length;i++){ids.push(qAdd(names[i], (fs0[i]&&fs0[i].size)||0));}
           for(var j=0;j<ids.length;j++){qSet(ids[j],0,'run');}
           if(this.upload&&this.upload.addEventListener){
             this.upload.addEventListener('progress',function(e){
