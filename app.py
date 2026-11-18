@@ -8044,3 +8044,130 @@ def api_admin_stats():
     except Exception as e:
         out["error"] = str(e)[:120]
     return jsonify(out)
+
+# ===== _HOME_SPEED_CACHE：首页依赖的云盘查询 TTL 缓存（避免每次渲染等百度）=====
+try:
+    _orig_baidu_published_cached = _baidu_published
+except Exception:
+    _orig_baidu_published_cached = None
+
+_BP_CACHE = {"data": None, "at": 0.0}
+_BP_LOCK = threading.Lock()
+
+
+def _baidu_published(*args, **kwargs):
+    if _orig_baidu_published_cached is None:
+        return ([], [])
+    now = time.time()
+    with _BP_LOCK:
+        data = _BP_CACHE["data"]
+        at = _BP_CACHE["at"]
+    if data is not None and now - at < 20:
+        return data
+    res = _orig_baidu_published_cached(*args, **kwargs)
+    with _BP_LOCK:
+        _BP_CACHE["data"] = res
+        _BP_CACHE["at"] = time.time()
+    return res
+
+
+def _bp_cache_invalidate():
+    with _BP_LOCK:
+        _BP_CACHE["data"] = None
+        _BP_CACHE["at"] = 0.0
+
+
+try:
+    _orig_ai_read_shared = _ai_read_shared
+    _ARS_CACHE = {"svc_key": None, "data": None, "at": 0.0}
+    _ARS_LOCK = threading.Lock()
+
+    def _ai_read_shared(service=None):
+        now = time.time()
+        key = id(service)
+        with _ARS_LOCK:
+            if _ARS_CACHE["data"] is not None and _ARS_CACHE["svc_key"] == key and now - _ARS_CACHE["at"] < 20:
+                return _ARS_CACHE["data"]
+        try:
+            res = _orig_ai_read_shared(service)
+        except Exception:
+            res = None
+        with _ARS_LOCK:
+            _ARS_CACHE["svc_key"] = key
+            _ARS_CACHE["data"] = res
+            _ARS_CACHE["at"] = time.time()
+        return res
+except Exception:
+    pass
+
+# ===== _TPL_COMPILE_CACHE：缓存大模板编译结果（首页 170KB，每次重编译 ~0.8s）=====
+try:
+    _orig_render_template_string = render_template_string
+    _TPL_COMPILE_CACHE = {}
+    _TPL_CACHE_LOCK = threading.Lock()
+
+    def render_template_string(source, **context):
+        # _TPL_COMPILE_CACHE
+        key = (len(source), hash(source))
+        tpl = None
+        with _TPL_CACHE_LOCK:
+            tpl = _TPL_COMPILE_CACHE.get(key)
+        if tpl is None:
+            tpl = app.jinja_env.from_string(source)
+            with _TPL_CACHE_LOCK:
+                if len(_TPL_COMPILE_CACHE) > 6:
+                    _TPL_COMPILE_CACHE.clear()
+                _TPL_COMPILE_CACHE[key] = tpl
+        return tpl.render(**context)
+except Exception as _tpl_err:
+    print("[tpl-cache] disabled: %s" % _tpl_err, flush=True)
+
+# ===== _PAGE_RENDER_CACHE：首页渲染结果缓存（这台机器渲染一次约 2.4 秒）=====
+try:
+    import flask as _flask
+
+    _orig_index_view = app.view_functions.get("index")
+    _PAGE_CACHE = {}
+    _PAGE_LOCK = threading.Lock()
+    _PAGE_TTL = 15
+
+    def _cached_index_view(*args, **kwargs):
+        # _PAGE_RENDER_CACHE
+        rq = _flask.request
+        try:
+            if rq.method != "GET":
+                return _orig_index_view(*args, **kwargs)
+            if rq.args.get("msg") or rq.args.get("design") or rq.args.get("nocache"):
+                return _orig_index_view(*args, **kwargs)
+            key = (rq.path, rq.full_path,
+                   bool(rq.cookies.get("admin_access")),
+                   bool(rq.cookies.get("exchange_access")))
+            now = time.time()
+            with _PAGE_LOCK:
+                hit = _PAGE_CACHE.get(key)
+            if hit and now - hit[0] < _PAGE_TTL:
+                return _flask.Response(hit[1], status=hit[2], content_type=hit[3])
+            resp = _orig_index_view(*args, **kwargs)
+            try:
+                if isinstance(resp, str):
+                    with _PAGE_LOCK:
+                        if len(_PAGE_CACHE) > 12:
+                            _PAGE_CACHE.clear()
+                        _PAGE_CACHE[key] = (now, resp, 200, "text/html; charset=utf-8")
+                else:
+                    code = getattr(resp, "status_code", 200)
+                    if code == 200:
+                        body = resp.get_data()
+                        with _PAGE_LOCK:
+                            if len(_PAGE_CACHE) > 12:
+                                _PAGE_CACHE.clear()
+                            _PAGE_CACHE[key] = (now, body, code, resp.content_type)
+            except Exception:
+                pass
+            return resp
+        except Exception:
+            return _orig_index_view(*args, **kwargs)
+
+    app.view_functions["index"] = _cached_index_view
+except Exception as _pc_err:
+    print("[page-cache] disabled: %s" % _pc_err, flush=True)
