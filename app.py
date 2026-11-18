@@ -1369,7 +1369,7 @@ def _baidu_stream_response(meta, name, ctype, disposition_kind):
             r = _rq.get(meta["dlink"], params={"access_token": tok},
                         headers=headers, stream=True, timeout=60)
             pos = rng[0] if (rng is not None and r.status_code == 206) else 0
-            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
+            for chunk in r.iter_content(chunk_size=128 * 1024):
                 if not chunk:
                     continue
                 cl = len(chunk)
@@ -6512,56 +6512,89 @@ def _inject_img_fix(resp):
 
 
 # ================= 音视频在线播放（新增） =================
-_MEDIA_JS = """
-<script id="_MEDIA_PLAYER">
+_MEDIA_JS = """<script id="_MEDIA_PLAYER">
 (function(){
   if(window.__mediaReady) return; window.__mediaReady = 1;
 
-  function ov(title, kind, id){
-    var box = document.getElementById('__mplayer');
-    if(!box){
-      box = document.createElement('div');
-      box.id = '__mplayer';
-      box.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:10000;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box';
-      box.innerHTML = '<div style="width:100%;max-width:520px;background:#101410;border-radius:16px;padding:14px">'
-        + '<div id="__mpTitle" style="color:#cfe6d7;font-size:13px;font-weight:700;margin-bottom:10px;word-break:break-all"></div>'
-        + '<div id="__mpBody"></div>'
-        + '<div style="text-align:center;margin-top:12px"><span id="__mpClose" style="color:#48ad7d;font-weight:800;font-size:14px;padding:6px 18px">关闭</span></div>'
-        + '</div>';
-      document.body.appendChild(box);
-      document.getElementById('__mpClose').onclick = function(){
-        var b = document.getElementById('__mpBody');
-        if(b) b.innerHTML = '';
-        box.style.display = 'none';
-      };
-    }
-    document.getElementById('__mpTitle').textContent = title || '';
-    var body = document.getElementById('__mpBody');
+  function $id(x){ return document.getElementById(x); }
+
+  function build(){
+    var box = $id('__mplayer');
+    if(box) return box;
+    box = document.createElement('div');
+    box.id = '__mplayer';
+    box.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:10000;display:none;align-items:center;justify-content:center;padding:12px;box-sizing:border-box';
+    box.innerHTML =
+      '<div style="width:100%;max-width:560px;background:#0f1410;border-radius:16px;padding:14px">'
+      + '<div id="__mpTitle" style="color:#cfe6d7;font-size:13px;font-weight:700;margin-bottom:8px;word-break:break-all"></div>'
+      + '<div id="__mpBody"></div>'
+      + '<div style="display:flex;gap:10px;align-items:center;margin-top:12px">'
+      +   '<span id="__mpStatus" style="flex:1;color:#8b948c;font-size:12px"></span>'
+      +   '<span id="__mpDl" style="color:#48ad7d;font-weight:800;font-size:13px;padding:6px 14px;border:1px solid #2f7d4f;border-radius:999px">下载</span>'
+      +   '<span id="__mpClose" style="color:#cfe6d7;font-weight:800;font-size:13px;padding:6px 14px">关闭</span>'
+      + '</div></div>';
+    document.body.appendChild(box);
+    $id('__mpClose').onclick = function(){
+      var b = $id('__mpBody'); if(b) b.innerHTML = '';
+      box.style.display = 'none';
+    };
+    return box;
+  }
+
+  var CUR = null;
+
+  function open(title, kind, id, name){
+    var box = build();
+    $id('__mpTitle').textContent = title || '';
+    $id('__mpStatus').textContent = '正在连接…';
+    CUR = {kind: kind, id: id, name: name || title || 'file'};
+    var body = $id('__mpBody');
     if(kind === 'video'){
-      body.innerHTML = '<video id="__v" controls playsinline preload="metadata" style="width:100%;border-radius:10px;background:#000" src="/view/' + id + '"></video>';
+      body.innerHTML = '<video id="__v" controls autoplay playsinline preload="auto" '
+        + 'style="width:100%;border-radius:10px;background:#000;max-height:60vh" src="/view/' + id + '"></video>';
+      var v = $id('__v');
+      if(v){
+        v.addEventListener('loadstart', function(){ $id('__mpStatus').textContent = '已请求视频，等待服务器响应…'; });
+        v.addEventListener('loadedmetadata', function(){ $id('__mpStatus').textContent = '已就绪 · ' + (v.duration?v.duration.toFixed(1)+' 秒':''); });
+        v.addEventListener('waiting', function(){ $id('__mpStatus').textContent = '缓冲中…（服务器正在从百度网盘拉取）'; });
+        v.addEventListener('playing', function(){ $id('__mpStatus').textContent = '播放中'; });
+        v.addEventListener('error', function(){ $id('__mpStatus').textContent = '视频加载失败，可点右侧「下载」保存后本地播放'; });
+      }
     } else {
-      body.innerHTML = '<audio id="__a" controls preload="metadata" style="width:100%" src="/view/' + id + '"></audio>'
-        + '<div style="color:#8b948c;font-size:12px;margin-top:8px">正在加载音频…</div>';
+      body.innerHTML = '<audio id="__a" controls autoplay preload="auto" style="width:100%" src="/view/' + id + '"></audio>';
+      var a = $id('__a');
+      if(a){
+        a.addEventListener('loadedmetadata', function(){ $id('__mpStatus').textContent = '已就绪 · ' + (a.duration?a.duration.toFixed(1)+' 秒':''); });
+        a.addEventListener('waiting', function(){ $id('__mpStatus').textContent = '缓冲中…'; });
+        a.addEventListener('playing', function(){ $id('__mpStatus').textContent = '播放中'; });
+      }
     }
     box.style.display = 'flex';
   }
 
+  // 下载按钮：复用带进度条的下载器
+  document.addEventListener('click', function(e){
+    if(!e.target || e.target.id !== '__mpDl') return;
+    if(!CUR) return;
+    var url = '/download/' + CUR.id;
+    if(window.__dl){ window.__dl(url, CUR.name); }
+    else { window.location.href = url; }
+  });
+
+  // 点视频/音频格子 -> 播放器
   document.addEventListener('click', function(e){
     var t = e.target;
     while(t && t !== document.body && !(t.classList && t.classList.contains('tile'))) t = t.parentNode;
     if(!t || !t.classList || !t.classList.contains('tile')) return;
-    var isVid = t.dataset.isvid === '1';
-    var isAud = t.dataset.isaud === '1';
+    var isVid = t.dataset.isvid === '1', isAud = t.dataset.isaud === '1';
     if(!isVid && !isAud) return;
-    e.preventDefault();
-    e.stopPropagation();
+    e.preventDefault(); e.stopPropagation();
     var nmEl = t.querySelector('.tile-name');
     var nm = nmEl ? nmEl.textContent : (t.dataset.name || '媒体');
-    ov(nm, isVid ? 'video' : 'audio', t.dataset.id);
+    open(nm, isVid ? 'video' : 'audio', t.dataset.id, nm);
   }, true);
 })();
-</script>
-"""
+</script>"""
 
 
 @app.after_request
