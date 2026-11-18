@@ -53,3 +53,22 @@ Windows Server 2012 R2 + waitress（serve.py）
 - 百度 `refresh_token` 会轮换：新旧令牌由 `baidu_token.json` 自动维护，**不要手动改环境变量里的旧值**
 - 上传大文件走「precreate → superfile2 分片 → create」三段式，任一步失败都会记日志 `[baidu-upload]`
 - 缩略图仅对图片生效，视频/安装包返回文字角标
+
+## 五、纯百度模式改造（2026-11-18）
+
+目标：站点已从 Google Drive 完全切到百度网盘，去掉所有「必须先连上 Google」的入口守卫。
+
+| # | 改动 | 说明 |
+|---|---|---|
+| 17 | 批量放宽入口守卫 | 15 处 `service is None` 守卫改为 `service is None and not _use_baidu_meta()`，覆盖上传/预览/下载/审核/删除/重命名/文件夹/意见区/留言 |
+| 18 | 留言支持百度 | `_published_file_exists` 对 `bd:` 文件直接查百度元数据判断是否在「已发布」目录，不再依赖 Google 缓存 |
+| 19 | 留言删除支持百度 | `/admin/comments/delete` 守卫同步放宽 |
+| 20 | 视频缩略图 | 调用百度 `filemetas?thumb=1` 取首帧图，返回 JPEG（原先固定 404） |
+| 21 | 音视频在线播放 | 注入播放器：点视频弹 `<video>`（支持拖动进度，服务端已支持 Range），点音频/FLAC 弹 `<audio>` |
+| 22 | HEIC/HEIF 支持 | 安装 pillow-heif，缩略图与 `/view` 自动把 iPhone 照片转成 JPEG；新增 `/img/<id>` 转码接口 |
+| 23 | 公告改存百度 | 公告读写已走百度文本文件；修掉「未连 Google 就拒绝保存」的守卫 |
+| 24 | 下载进度条 | 注入前端下载器：点非图片文件弹进度条，完成后自动保存 |
+
+仍未支持百度的模块（依赖 Google 文件夹 ID/服务端能力）：
+- 私人区（`_private_root_id` 需要 Google 目录树）
+- 视频转码预览（`/preview`）

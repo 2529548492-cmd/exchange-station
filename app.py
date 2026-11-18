@@ -49,7 +49,17 @@ from urllib.parse import quote
 
 from flask import Flask, Response, jsonify, redirect, render_template_string, request
 
-# Data dir: same folder as this file by default; override with EXCHANGE_DATA_DIR (works on Windows and Linux)
+# ---- HEIC/HEIF 支持（iPhone 照片）：装了 pillow-heif 就能直接解码 ----
+try:
+    import pillow_heif as _pillow_heif
+
+    _pillow_heif.register_heif_opener()
+    _heif_ok = True
+except Exception as _e:
+    _heif_ok = False
+    print("[heif] pillow-heif not available: %s" % _e, flush=True)
+
+# ????????????????? EXCHANGE_DATA_DIR ???Windows/Linux ???
 _DATA_DIR = os.environ.get("EXCHANGE_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
 
 app = Flask(__name__)
@@ -1406,6 +1416,39 @@ _BAIDU_CT = {
 }
 
 
+_IMG_EXTS = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif"}
+
+
+def _baidu_is_heic(data):
+    """看文件头判断是不是 HEIC/HEIF（iPhone 照片）。"""
+    try:
+        head = data[:32]
+        if len(head) < 12 or head[4:8] != b"ftyp":
+            return False
+        brand = head[8:12]
+        return brand in (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1")
+    except Exception:
+        return False
+
+
+def _jpg_from_bytes(data, max_edge=1600, quality=88):
+    """任意 PIL 能解的图片 -> JPEG 字节。"""
+    from PIL import Image, ImageOps
+    im = Image.open(io.BytesIO(data))
+    im = ImageOps.exif_transpose(im)
+    im.thumbnail((max_edge, max_edge))
+    if im.mode in ("RGBA", "LA", "P"):
+        bg = Image.new("RGB", im.size, (255, 255, 255))
+        alpha = im.convert("RGBA").split()[3]
+        bg.paste(im.convert("RGBA"), mask=alpha)
+        im = bg
+    else:
+        im = im.convert("RGB")
+    out = io.BytesIO()
+    im.save(out, format="JPEG", quality=quality, optimize=True)
+    return out.getvalue()
+
+
 def _baidu_view(file_id):
     if not _baidu_enabled():
         return "百度源暂未连接", 503
@@ -1428,6 +1471,25 @@ def _baidu_view(file_id):
     if ctype is None:
         # SVG/HTML 等可执行类型与设计一致：不 inline，改走下载（比谷歌现版更严）。
         return redirect(f"/download/{file_id}")
+    # HEIC/HEIF（iPhone 照片）浏览器不认：先取字节判断，是 HEIC 就转成 JPEG 再返回
+    if low in _IMG_EXTS:
+        try:
+            import requests as _rq2
+            _tok = _baidu_token()
+            _r = _rq2.get(meta["dlink"], params={"access_token": _tok},
+                          headers={"User-Agent": "pan.baidu.com"}, stream=True, timeout=60)
+            _buf = bytearray()
+            for _ch in _r.iter_content(65536):
+                _buf.extend(_ch)
+                if len(_buf) > 40 * 1024 * 1024:
+                    raise RuntimeError("image too large")
+            _data = bytes(_buf)
+            if _baidu_is_heic(_data):
+                _jpg = _jpg_from_bytes(_data)
+                return Response(_jpg, headers={"Content-Type": "image/jpeg",
+                                               "Cache-Control": "public, max-age=86400"})
+        except Exception as _e:
+            print("[view] heic convert failed: %s" % _e, flush=True)
     return _baidu_stream_response(meta, name, ctype, "inline")
 
 
@@ -1473,7 +1535,23 @@ def _baidu_thumb(file_id):
         name = (meta.get("path") or "").rsplit("/", 1)[-1] or file_id
     low = name.rsplit(".", 1)[-1].lower() if "." in name else ""
     if low in ("mp4", "mov", "mkv", "webm", "avi"):
-        # 百度不保证视频缩略图：第一期按无缩略图处理，不伪造、不跳转直链。
+        # 百度 filemetas 带 thumb=1 会返回视频首帧缩略图（thumbs.url1/2/3）
+        try:
+            import requests as _rqv
+            _jv = _baidu_api("multimedia", {"method": "filemetas",
+                                            "fsids": json.dumps([int(file_id[3:])]),
+                                            "dlink": 1, "thumb": 1})
+            _lst = _jv.get("list") or []
+            _th = (_lst[0].get("thumbs") or {}) if _lst else {}
+            _u = _th.get("url2") or _th.get("url1") or _th.get("url3")
+            if _u:
+                _rv = _rqv.get(_u, timeout=30)
+                if _rv.status_code == 200 and len(_rv.content) > 500:
+                    return Response(_rv.content, headers={
+                        "Content-Type": _rv.headers.get("Content-Type", "image/jpeg"),
+                        "Cache-Control": "public, max-age=86400"})
+        except Exception as _ev:
+            print("[thumb] video thumb failed: %s" % _ev, flush=True)
         return "暂无视频缩略图", 404
     if low not in ("jpg", "jpeg", "png", "gif", "webp", "bmp"):
         return "文件不存在或无权访问", 404
@@ -1993,6 +2071,14 @@ def _published_file_exists(service, file_id):
     """True if file_id is in the published tree (Google or Baidu).
     文件被删除后它就不在这里，留言随之失效/隐藏，不报错。"""
     try:
+        if file_id.startswith("bd:"):
+            # 百度：直接查元数据，看它当前是否在“已发布”目录里
+            _meta = _baidu_meta(file_id[3:])
+            _path = _meta.get("path") or ""
+            _base, _pub, _pend = _baidu_dirs()
+            _norm = "/" + _path.strip("/") + "/" if _path else ""
+            _pnorm = "/" + _pub.strip("/") + "/"
+            return _norm.startswith(_pnorm)
         files, _folders = _cached_published(service)
         return any(f.get("id") == file_id for f in files)
     except Exception:
@@ -2614,7 +2700,7 @@ PAGE = (
     "var __lastFileMeta=null;var __up={done:0,total:0,start:0,lastT:0,lastDone:0};function __fmtSp(bps){return bps>1048576?(bps/1048576).toFixed(1)+' MB/s':(bps/1024).toFixed(0)+' KB/s';}function __showProg(curFile,idx,totalFiles){var bar=document.getElementById('progbar');var tx=document.getElementById('progtext');if(!bar||!tx)return;var pct=__up.total?Math.round(__up.done/__up.total*100):0;if(__up.waitConfirm&&pct>99){pct=99;}bar.style.width=pct+'%';var el=(Date.now()-__up.start)/1000;var bps=el>0.5?__up.done/el:0;var eta=bps>0?'，还剩约'+Math.round((__up.total-__up.done)/bps)+'秒':'';var stalled=(Date.now()-__up.lastT>30000&&__up.done<__up.total)?'（进度 30 秒没动，网可能卡住了，别刷新，等它自己续传）':'';tx.textContent='上传中 '+idx+'/'+totalFiles+'：'+curFile+' '+pct+'%（'+(__up.done/1048576).toFixed(1)+' / '+(__up.total/1048576).toFixed(1)+' MB，'+__fmtSp(bps)+eta+'）'+stalled+(__up.waitConfirm?'（等云盘确认，还没到 100%）':'');}function putChunk(session,file,start,end,total,base){return new Promise(function(res,rej){var x=new XMLHttpRequest();var __to=null;var __finished=false;function arm(){clearTimeout(__to);__to=setTimeout(function(){if(__finished)return;__finished=true;try{x.abort();}catch(e){}rej(new Error('直传 45 秒无进度，已改中转'));},45000);}x.open('PUT',session,true);x.setRequestHeader('Content-Range','bytes '+start+'-'+(end-1)+'/'+total);x.upload.onprogress=function(ev){if(ev.lengthComputable){__up.done=base+ev.loaded;__up.lastT=Date.now();__showProg(file.name,__up.idx,__up.n);arm();}};x.onload=function(){__finished=true;clearTimeout(__to);if(x.status===308){var rg=x.getResponseHeader('Range');res(rg?parseInt(rg.split('-')[1])+1:start);}else if(x.status>=200&&x.status<300){try{__lastFileMeta=JSON.parse(x.responseText);}catch(e){}res(total);}else{rej(new Error('直传失败 '+x.status));}};x.onerror=function(){__finished=true;clearTimeout(__to);rej(new Error('直传网络失败'));};arm();x.send(file.slice(start,end));});}"
     "async function directOne(file,idx,totalFiles){var tx0=document.getElementById('progtext');if(tx0){tx0.textContent='正在向云盘申请直传通道: '+file.name;}var ac=new AbortController();var to=setTimeout(function(){if(tx0){tx0.textContent='直传通道申请超过15秒没回音，可能是服务器刚睡醒，正在重试…';}},15000);var rs=await fetch('/direct_session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,size:file.size}),signal:ac.signal});clearTimeout(to);if(!rs.ok){throw new Error('直传会话失败 '+rs.status);}var sj=await rs.json();if(!sj.ok){throw new Error(sj.msg||'直传会话失败');}var session=sj.session;var CH=8*1024*1024;var off=0;var fileBase=__up.done;__up.idx=idx;__up.n=totalFiles;__up.lastT=Date.now();while(off<file.size){var nxt=Math.min(off+CH,file.size);off=await putChunk(session,file,off,nxt,file.size,fileBase+off);__up.done=fileBase+off;__up.lastT=Date.now();__showProg(file.name,idx,totalFiles);}__up.waitConfirm=true;__showProg(file.name,idx,totalFiles);var dd=await fetch('/direct_done',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,file_id:__lastFileMeta?__lastFileMeta.id:'',size:file.size})});__up.waitConfirm=false;if(!dd.ok){throw new Error('直传确认失败 '+dd.status);}}"
     "window.__uploading=false;window.addEventListener('beforeunload',function(e){if(window.__uploading){e.preventDefault();e.returnValue='正在上传，离开本页会中断上传';}});document.querySelectorAll('#topnav a').forEach(function(a){a.addEventListener('click',function(e){if(window.__uploading&&a.dataset.tab==='admin'){if(!confirm('正在上传，点站长区进入审核页会中断上传。确定要中断吗？')){e.preventDefault();e.stopImmediatePropagation();}}});});pf.addEventListener('submit',async function(e){e.preventDefault();window.__uploading=true;function __failReset(msg){window.__uploading=false;var bar=document.getElementById('progbar');if(bar){bar.style.width='0%';}if(tx){tx.textContent=msg;}if(us){us.textContent=msg;}if(b){b.disabled=false;}queue.splice(0,__doneCount);try{syncInput();show();}catch(e){}}var us=document.getElementById('uploadstatus');if(us){us.textContent='已点上传，正在向云盘申请直传通道…（如果这行一直不动，说明页面是旧版，请刷新一次再传）';}var b=document.getElementById('uploadbtn');var w=document.getElementById('progwrap');var tx=document.getElementById('progtext');if(!queue.length){if(b){b.disabled=false;}window.__uploading=false;return;}if(b){b.disabled=true;}if(w){w.style.display='block';}if(window.__pollTimer){clearInterval(window.__pollTimer);window.__pollTimer=null;}var __doneCount=0;var __sentNames=[];__up.done=0;__up.waitConfirm=false;__up.total=queue.reduce(function(a,f){return a+f.size;},0);__up.start=Date.now();__up.lastT=Date.now();try { {% if is_relay %}throw new Error('__relay__');{% else %}for(var k=0;k<queue.length;k++){await directOne(queue[k],k+1,queue.length);__doneCount++;__sentNames.push({n:queue[k].name,s:queue[k].size});}{% endif %}window.__uploading=false;var __n=queue.length;queue.length=0;try{syncInput();show();}catch(e){}var bar0=document.getElementById('progbar');if(bar0){bar0.style.width='100%';}if(tx){tx.textContent='上传完成，正在等 AI 审核…';}if(us){us.textContent='已上传 '+__n+' 个，正在等 AI 审核，发布后会自动出现在这里，不用刷新';}if(window.__pollPublished){window.__pollPublished(__sentNames,__n);}}catch(err){if(tx){tx.textContent=(err.message==='__relay__'?'正在经本站中转上传（手机→上海→海外→云盘），进度跟着国内这一段走…':'直传失败，正在改用本站中转上传: '+err.message);}try{var __rest=queue.slice(__doneCount);__sentNames=__sentNames.concat(__rest.map(function(f){return {n:f.name,s:f.size};}));var fd2=new FormData();__rest.forEach(function(f){fd2.append('file',f);});var x2=new XMLHttpRequest();x2.open('POST','/upload',true);x2.setRequestHeader('X-Requested-With','XMLHttpRequest');var bar2=document.getElementById('progbar');x2.upload.onprogress=function(ev){if(ev.lengthComputable){var pct=Math.min(99,Math.round(ev.loaded/ev.total*100));if(bar2){bar2.style.width=pct+'%';}if(tx){tx.textContent='中转上传（手机→本站→云盘）: '+pct+'%（浏览器已发出 '+(ev.loaded/1048576).toFixed(1)+' / '+(ev.total/1048576).toFixed(1)+' MB，到 99% 后是本站在转存云盘）';}}};x2.upload.onload=function(){if(bar2){bar2.style.width='99%';}if(tx){tx.textContent='已全部发给本站，正在转存云盘，请稍等…（这一步没有百分比，别刷新）';}};x2.onload=function(){try{var r=JSON.parse(x2.responseText);if(r.ok){window.__uploading=false;queue.length=0;try{syncInput();show();}catch(e){}var bar3=document.getElementById('progbar');if(bar3){bar3.style.width='100%';}if(tx){tx.textContent='上传完成，正在等 AI 审核…';}if(us){us.textContent=(r.msg||'已上传到待审核')+'，发布后会自动出现在这里，不用刷新';}if(window.__pollPublished){window.__pollPublished(__sentNames,__sentNames.length);}}else{__failReset('上传失败：'+(r.msg||'未知原因')+'，已传好的文件还在待审核，剩下的点上传可重试');}}catch(e2){__failReset('上传失败：服务器返回异常，请重试，已传好的文件还在待审核，剩下的点上传可重试');}};x2.onerror=function(){__failReset('上传失败，请检查网络后重试，已传好的文件还在待审核，剩下的点上传可重试');};x2.send(fd2);}catch(e3){__failReset('上传失败：'+err.message+'，请检查网络后重试，已传好的文件还在待审核，剩下的点上传可重试');}}});</script>"
-    "<script>var __pollTimer=null;function __escA(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');}function __tileHtml(f){var id=f.id||'';var name=f.name||'';var kind=f.kind||'其他';var isimg=f.is_image?1:0;var isvid=f.is_video?1:0;var isaud=f.is_audio?1:0;var media='';if(isimg||isvid){media='<img class=\"tileimg\" src=\"/thumb/'+__escA(id)+'?v=2\" data-fb=\"/thumb/'+__escA(id)+'?v=2\" alt=\"\" loading=\"lazy\" onerror=\"_thumbErr(this)\">'+(isvid?'<div class=\"tilefic tile-video\" style=\"display:none\">影</div>':'<div class=\"tilefic tile-img\" style=\"display:none\">图</div>');}else if(isaud){media='<div class=\"tilefic tile-music\">音</div>';}else if(kind==='文档'){media='<div class=\"tilefic tile-doc\">文</div>';}else if(kind==='压缩包'){media='<div class=\"tilefic tile-zip\">压</div>';}else if(kind==='安装包'){media='<div class=\"tilefic tile-pkg\">包</div>';}else if(kind==='影音'){media='<div class=\"tilefic tile-video\">影</div>';}else{media='<div class=\"tilefic tile-other\">他</div>';}var meta=__escA(kind)+' · '+__escA(f.size||'')+(f.source==='baidu'?' · 百度':'')+(f.ai_note?' · '+__escA(f.ai_note):'');return '<div class=\"tile\" data-cat=\"'+__escA(kind)+'\" data-folder=\"'+__escA(f.folder_id||'')+'\" data-name=\"'+__escA(name.toLowerCase())+'\" data-id=\"'+__escA(id)+'\" data-dl=\"/download/'+__escA(id)+'\" data-view=\"/view/'+__escA(id)+'\" data-isimg=\"'+isimg+'\" data-isvid=\"'+isvid+'\" data-isaud=\"'+isaud+'\" data-size=\"'+(f.size_bytes||0)+'\"><span class=\"tile-check\"></span>'+media+'<div class=\"tileinfo\"><div class=\"tile-name\" style=\"display:none\">'+__escA(name)+'</div><div class=\"tile-meta\">'+meta+'</div></div><span class=\"tile-dl\">↓ '+(f.dl_count||0)+'</span></div>';}function __syncPublished(j){var grid=document.getElementById('albumGrid');if(!grid||!j||!j.published)return;var files=j.published;var folders=j.folders||[];var have={};grid.querySelectorAll('.tile').forEach(function(t){have[t.dataset.id]=t;});var pvName=null;var ov=document.getElementById('previewOverlay');if(ov&&ov.style.display==='flex'){var pt=document.getElementById('previewTitle');if(pt)pvName=pt.textContent;}files.forEach(function(f){if(!have[f.id]){var tmp=document.createElement('div');tmp.innerHTML=__tileHtml(f);var t=tmp.firstChild;if(t){grid.appendChild(t);}}else{var dl=have[f.id].querySelector('.tile-dl');if(dl)dl.textContent='↓ '+(f.dl_count||0);}});var ids={};files.forEach(function(f){ids[f.id]=1;});grid.querySelectorAll('.tile').forEach(function(t){if(!ids[t.dataset.id]){var nm=t.querySelector('.tile-name');if(pvName&&nm&&nm.textContent===pvName)return;if(t.parentNode)t.parentNode.removeChild(t);}});var total=files.length;var sec=document.querySelector('#tab-published .section-head .count');if(sec)sec.textContent=total+' 个';var fb=document.getElementById('folderbar');if(fb){fb.querySelectorAll('.tab').forEach(function(btn){if(btn.dataset.folder==='all'){btn.textContent='全部（'+total+'）';}});folders.forEach(function(fo){var found=null;fb.querySelectorAll('.tab').forEach(function(btn){if(btn.dataset.folder===fo.id)found=btn;});if(found){found.textContent=fo.name+'（'+fo.count+'）';}else{var nb=document.createElement('button');nb.className='tab';nb.dataset.folder=fo.id;nb.textContent=fo.name+'（'+fo.count+'）';nb.addEventListener('click',function(){if(typeof showFolder==='function')showFolder(fo.id,nb);});var addBtn=document.getElementById('newFolderBtn');if(addBtn&&addBtn.parentNode){addBtn.parentNode.insertBefore(nb,addBtn);}else{fb.appendChild(nb);}}});}var ct=document.getElementById('cattabs');if(ct){var tabs=ct.querySelectorAll('.tab');if(tabs.length)tabs[0].textContent='全部（'+total+'）';['文档','图片','影音','压缩包','安装包','其他'].forEach(function(cn){var cc=0;files.forEach(function(f){if(f.kind===cn)cc++;});var found=null;ct.querySelectorAll('.tab').forEach(function(btn){if(btn.textContent.indexOf(cn)===0)found=btn;});if(found){found.textContent=cn+'（'+cc+'）';}else if(cc>0){var nb2=document.createElement('button');nb2.className='tab';nb2.textContent=cn+'（'+cc+'）';nb2.addEventListener('click',function(){if(typeof showCat==='function')showCat(cn,nb2);});ct.appendChild(nb2);}});}if(grid.querySelectorAll('.tile').length){document.querySelectorAll('#tab-published .empty:not(#folderEmpty)').forEach(function(p){p.style.display='none';});}if(typeof applyFilter==='function'){try{applyFilter();}catch(e){}}}function __pollPublished(want,total){if(window.__pollTimer){clearInterval(window.__pollTimer);window.__pollTimer=null;}var tries=0;var MAX=40;var got=0;var us=document.getElementById('uploadstatus');function stop(msg){if(window.__pollTimer){clearInterval(window.__pollTimer);window.__pollTimer=null;}if(us)us.textContent=msg;}function tick(){tries++;fetch('/api/files',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(j){__syncPublished(j);var avail={};(j.published||[]).forEach(function(f){var k=(f.name||'').toLowerCase()+'|'+(f.size_bytes||0);avail[k]=(avail[k]||0)+1;});got=0;want.forEach(function(w){var k=String(w.n).toLowerCase()+'|'+(w.s||0);if(avail[k]>0){avail[k]--;got++;}});if(us)us.textContent='AI 审核跟进中：已发布 '+got+' / '+total+' 个…';if(got>=total){stop('已发布 '+got+' 个，全部通过审核出现在已发布区');}else if(tries>=MAX){stop('已发布 '+got+' 个，剩下 '+(total-got)+' 个还在审核或未通过，不会在已发布区出现');}}).catch(function(){if(tries>=MAX){stop('已发布跟进中断（最后一次看到 '+got+' 个已发布），请刷新页面查看已发布区');}});}tick();window.__pollTimer=setInterval(tick,3000);}</script>"
+    "<script>var __pollTimer=null;function __escA(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');}function __tileHtml(f){var id=f.id||'';var name=f.name||'';var kind=f.kind||'其他';var isimg=f.is_image?1:0;var isvid=f.is_video?1:0;var isaud=f.is_audio?1:0;var media='';if(isimg||isvid){media='<img class=\"tileimg\" src=\"/thumb/'+__escA(id)+'?v=3\" data-fb=\"/thumb/'+__escA(id)+'?v=3\" alt=\"\" loading=\"lazy\" onerror=\"_thumbErr(this)\">'+(isvid?'<div class=\"tilefic tile-video\" style=\"display:none\">影</div>':'<div class=\"tilefic tile-img\" style=\"display:none\">图</div>');}else if(isaud){media='<div class=\"tilefic tile-music\">音</div>';}else if(kind==='文档'){media='<div class=\"tilefic tile-doc\">文</div>';}else if(kind==='压缩包'){media='<div class=\"tilefic tile-zip\">压</div>';}else if(kind==='安装包'){media='<div class=\"tilefic tile-pkg\">包</div>';}else if(kind==='影音'){media='<div class=\"tilefic tile-video\">影</div>';}else{media='<div class=\"tilefic tile-other\">他</div>';}var meta=__escA(kind)+' · '+__escA(f.size||'')+(f.source==='baidu'?' · 百度':'')+(f.ai_note?' · '+__escA(f.ai_note):'');return '<div class=\"tile\" data-cat=\"'+__escA(kind)+'\" data-folder=\"'+__escA(f.folder_id||'')+'\" data-name=\"'+__escA(name.toLowerCase())+'\" data-id=\"'+__escA(id)+'\" data-dl=\"/download/'+__escA(id)+'\" data-view=\"/view/'+__escA(id)+'\" data-isimg=\"'+isimg+'\" data-isvid=\"'+isvid+'\" data-isaud=\"'+isaud+'\" data-size=\"'+(f.size_bytes||0)+'\"><span class=\"tile-check\"></span>'+media+'<div class=\"tileinfo\"><div class=\"tile-name\" style=\"display:none\">'+__escA(name)+'</div><div class=\"tile-meta\">'+meta+'</div></div><span class=\"tile-dl\">↓ '+(f.dl_count||0)+'</span></div>';}function __syncPublished(j){var grid=document.getElementById('albumGrid');if(!grid||!j||!j.published)return;var files=j.published;var folders=j.folders||[];var have={};grid.querySelectorAll('.tile').forEach(function(t){have[t.dataset.id]=t;});var pvName=null;var ov=document.getElementById('previewOverlay');if(ov&&ov.style.display==='flex'){var pt=document.getElementById('previewTitle');if(pt)pvName=pt.textContent;}files.forEach(function(f){if(!have[f.id]){var tmp=document.createElement('div');tmp.innerHTML=__tileHtml(f);var t=tmp.firstChild;if(t){grid.appendChild(t);}}else{var dl=have[f.id].querySelector('.tile-dl');if(dl)dl.textContent='↓ '+(f.dl_count||0);}});var ids={};files.forEach(function(f){ids[f.id]=1;});grid.querySelectorAll('.tile').forEach(function(t){if(!ids[t.dataset.id]){var nm=t.querySelector('.tile-name');if(pvName&&nm&&nm.textContent===pvName)return;if(t.parentNode)t.parentNode.removeChild(t);}});var total=files.length;var sec=document.querySelector('#tab-published .section-head .count');if(sec)sec.textContent=total+' 个';var fb=document.getElementById('folderbar');if(fb){fb.querySelectorAll('.tab').forEach(function(btn){if(btn.dataset.folder==='all'){btn.textContent='全部（'+total+'）';}});folders.forEach(function(fo){var found=null;fb.querySelectorAll('.tab').forEach(function(btn){if(btn.dataset.folder===fo.id)found=btn;});if(found){found.textContent=fo.name+'（'+fo.count+'）';}else{var nb=document.createElement('button');nb.className='tab';nb.dataset.folder=fo.id;nb.textContent=fo.name+'（'+fo.count+'）';nb.addEventListener('click',function(){if(typeof showFolder==='function')showFolder(fo.id,nb);});var addBtn=document.getElementById('newFolderBtn');if(addBtn&&addBtn.parentNode){addBtn.parentNode.insertBefore(nb,addBtn);}else{fb.appendChild(nb);}}});}var ct=document.getElementById('cattabs');if(ct){var tabs=ct.querySelectorAll('.tab');if(tabs.length)tabs[0].textContent='全部（'+total+'）';['文档','图片','影音','压缩包','安装包','其他'].forEach(function(cn){var cc=0;files.forEach(function(f){if(f.kind===cn)cc++;});var found=null;ct.querySelectorAll('.tab').forEach(function(btn){if(btn.textContent.indexOf(cn)===0)found=btn;});if(found){found.textContent=cn+'（'+cc+'）';}else if(cc>0){var nb2=document.createElement('button');nb2.className='tab';nb2.textContent=cn+'（'+cc+'）';nb2.addEventListener('click',function(){if(typeof showCat==='function')showCat(cn,nb2);});ct.appendChild(nb2);}});}if(grid.querySelectorAll('.tile').length){document.querySelectorAll('#tab-published .empty:not(#folderEmpty)').forEach(function(p){p.style.display='none';});}if(typeof applyFilter==='function'){try{applyFilter();}catch(e){}}}function __pollPublished(want,total){if(window.__pollTimer){clearInterval(window.__pollTimer);window.__pollTimer=null;}var tries=0;var MAX=40;var got=0;var us=document.getElementById('uploadstatus');function stop(msg){if(window.__pollTimer){clearInterval(window.__pollTimer);window.__pollTimer=null;}if(us)us.textContent=msg;}function tick(){tries++;fetch('/api/files',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(j){__syncPublished(j);var avail={};(j.published||[]).forEach(function(f){var k=(f.name||'').toLowerCase()+'|'+(f.size_bytes||0);avail[k]=(avail[k]||0)+1;});got=0;want.forEach(function(w){var k=String(w.n).toLowerCase()+'|'+(w.s||0);if(avail[k]>0){avail[k]--;got++;}});if(us)us.textContent='AI 审核跟进中：已发布 '+got+' / '+total+' 个…';if(got>=total){stop('已发布 '+got+' 个，全部通过审核出现在已发布区');}else if(tries>=MAX){stop('已发布 '+got+' 个，剩下 '+(total-got)+' 个还在审核或未通过，不会在已发布区出现');}}).catch(function(){if(tries>=MAX){stop('已发布跟进中断（最后一次看到 '+got+' 个已发布），请刷新页面查看已发布区');}});}tick();window.__pollTimer=setInterval(tick,3000);}</script>"
     ""
     "<script>var d=document.getElementById('drop'),i=document.getElementById('fileinput');"
     "d.addEventListener('click',function(e){if(e.target!==i){i.click();}});"
@@ -2632,7 +2718,7 @@ PAGE = (
     "var dropped=0;function addQ(fs){var before=queue.length;Array.from(fs).forEach(function(f){if(queue.length<30){queue.push(f);}else{dropped++;}});syncInput();show();}"
     "i.addEventListener('change',function(){addQ(i.files);});</script>"
     "{% if msg %}<p class=\"note\">{{ msg }}</p>{% endif %}</div></div>"
-    '<div class="tabpanel active" id="tab-published"><div class="pub-toolbar"><input class="search" id="search" type="search" placeholder="搜索文件名…" oninput="onSearch(this.value)"><button class="btn" id="openDrawerBtn" type="button">导航</button><button class="btn" id="selBtn" type="button">选择</button></div><section class="card section"><div class="section-head"><h2>已发布</h2><span class="count">{{ files|length }} 个</span></div>{% if msg %}<p class="note" style="margin-top:10px">{{ msg }}</p>{% endif %}{% if backend_notice %}<p class=\"note\" style=\"margin-top:10px\">{{ backend_notice }}</p>{% endif %}<div class="folderbar" id="folderbar"><button class="tab active" data-folder="all" onclick="showFolder(\'all\',this)">全部（{{ files|length }}）</button>{% for fo in folders %}<button class="tab" data-folder="{{ fo.id }}" onclick="showFolder(\'{{ fo.id }}\',this)">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}<button class="tab" id="newFolderBtn" type="button">+ 新建文件夹</button></div><form id="newFolderForm" method="post" action="/folder/create" style="display:none;gap:8px;margin-top:10px"><input class="textin" name="name" placeholder="新文件夹名字，比如：旅行" required maxlength="50" style="flex:1"><button class="btn primary" type="submit">创建</button><button class="btn" type="button" id="newFolderCancel">取消</button></form><div class="tabs" id="cattabs"><button class="tab active" onclick="showCat(\'全部\',this)">全部（{{ files|length }}）</button>{% for c in cats %}{% if c.count %}<button class="tab" onclick="showCat(\'{{ c.name }}\',this)">{{ c.name }}（{{ c.count }}）</button>{% endif %}{% endfor %}</div><form id="moveForm" method="post" action="/folder/move" style="display:none;margin-top:12px;margin-bottom:4px;gap:8px;flex-wrap:wrap;align-items:center"><span id="selCount" style="font-weight:800"></span><input type="hidden" name="dest_folder_id" id="moveDest"><input type="hidden" name="file_ids" id="moveFileIds"><button class="btn primary" type="button" id="moveBtn">移动</button><button class="btn" type="button" id="dlSelBtn">选择下载</button></form><div class="album-grid" id="albumGrid">{% for f in files %}<div class="tile" data-cat="{{ f.kind }}" data-folder="{{ f.folder_id }}" data-name="{{ f.name|lower }}" data-id="{{ f.id }}" data-dl="/download/{{ f.id }}" data-view="/view/{{ f.id }}" data-isimg="{{ \'1\' if f.is_image else \'0\' }}" data-isvid="{{ \'1\' if f.is_video else \'0\' }}" data-isaud="{{ \'1\' if f.is_audio else \'0\' }}" data-size="{{ f.size_bytes }}"><span class="tile-check"></span>{% if f.is_image or f.is_video %}<img class="tileimg" src="/thumb/{{ f.id }}?v=2" data-fb="/thumb/{{ f.id }}?v=2" alt="" loading="lazy" onerror="_thumbErr(this)">{% if f.is_video %}<div class="tilefic tile-video" style="display:none">影</div>{% else %}<div class="tilefic tile-img" style="display:none">图</div>{% endif %}{% elif f.is_audio %}<div class="tilefic tile-music">音</div>{% elif f.kind == "文档" %}<div class="tilefic tile-doc">文</div>{% elif f.kind == "压缩包" %}<div class="tilefic tile-zip">压</div>{% elif f.kind == "安装包" %}<div class="tilefic tile-pkg">包</div>{% elif f.kind == "影音" %}<div class="tilefic tile-video">影</div>{% else %}<div class="tilefic tile-other">他</div>{% endif %}<div class="tileinfo"><div class="tile-name" style="display:none">{{ f.name }}</div><div class="tile-meta">{{ f.kind }} · {{ f.size }}{% if f.source == "baidu" %} · 百度{% endif %}{% if f.ai_note %} · {{ f.ai_note }}{% endif %}</div></div><span class="tile-dl">↓ {{ f.dl_count|default(0) }}</span></div>{% endfor %}</div><p class="empty" id="folderEmpty" style="display:none">这个文件夹里还没有文件。</p>{% if not files %}<p class="empty">目前还没有已发布的文件。</p>{% endif %}<p class="note">点图片默认就是预览；点右上角“选择”，再点图片打勾，就可以批量下载或移动到文件夹。</p></section><div id="previewOverlay"><div id="previewCard"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b id="previewTitle" style="word-break:break-all"></b><button class="btn" id="previewClose" type="button">关闭</button></div><div id="previewBody" style="margin-top:12px"></div></div></div><div id="moveOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40;align-items:center;justify-content:center;padding:16px;box-sizing:border-box"><div style="background:var(--surface);border-radius:18px;padding:16px;width:100%;max-width:420px;max-height:90vh;overflow:auto"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b>移到哪里？</b><button class="btn" type="button" id="moveCancel">取消</button></div><p class="note" style="margin-top:8px">点一个文件夹，选中的文件就会移过去。</p><button class="btn" type="button" data-dest="{{ published_id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">已发布根目录</button>{% for fo in folders %}<button class="btn" type="button" data-dest="{{ fo.id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}</div></div><script>var curCat=\'全部\',curFolder=\'all\',curQ=\'\',selectMode=false,selected=new Set();function applyFilter(){var vis=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){var okCat=curCat===\'全部\'||t.dataset.cat===curCat;var okFolder=curFolder===\'all\'||t.dataset.folder===curFolder;var okQ=t.dataset.name.includes(curQ);var show=(okCat&&okFolder&&okQ);var _nm=t.querySelector(\'.tile-name\');if(_nm)_nm.style.display=(show&&curQ)?\'\':\'none\';t.style.display=show?\'\':\'none\';if(show)vis++;});var fe=document.getElementById(\'folderEmpty\');if(fe)fe.style.display=(curFolder!==\'all\'&&vis===0)?\'block\':\'none\';}function showCat(c,el){curCat=c;document.querySelectorAll(\'#cattabs .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function showFolder(fid,el){curFolder=fid;document.querySelectorAll(\'#folderbar .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function onSearch(v){curQ=v.toLowerCase();applyFilter();}function updateSel(){var mf=document.getElementById(\'moveForm\');var sc=document.getElementById(\'selCount\');var ids=document.getElementById(\'moveFileIds\');if(sc)sc.textContent=\'已选 \'+selected.size+\' 个 · 选择模式中，点图片是打勾，点右上角“取消选择”退出后才能查看\';if(ids)ids.value=Array.from(selected).join(\',\');if(mf)mf.style.display=selected.size?\'flex\':\'none\';}function _thumbErr(im){if(!im.dataset.fbDone&&im.dataset.fb){im.dataset.fbDone=\'1\';im.src=im.dataset.fb;return;}im.style.display=\'none\';var nx=im.nextElementSibling;if(nx)nx.style.display=\'grid\';}function openPreview(t){var ov=document.getElementById(\'previewOverlay\');var ti=document.getElementById(\'previewTitle\');var bd=document.getElementById(\'previewBody\');if(!ov||!ti||!bd)return;ti.textContent=t.querySelector(\'.tile-name\').textContent;var view=t.dataset.view,dl=t.dataset.dl;if(t.dataset.isimg===\'1\'){var _th=t.querySelector(\'.tileimg\');var _tu=_th?_th.getAttribute(\'src\'):\'\';bd.innerHTML=\'<img id="pvThumb" src="\'+_tu+\'" style="width:100%;border-radius:12px"><img id="pvMid" style="width:100%;border-radius:12px;display:none"><img id="pvOrig" style="width:100%;border-radius:12px;display:none"><p class="note" id="pvProg">正在取清晰图…</p><div id="pvRetryWrap" style="display:none;margin:10px 0"><button class="btn primary" id="pvRetryBtn" type="button">原图加载较慢或加载失败，点我重试原图</button><p class="note" id="pvFail"></p></div><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载原图</a>\';var _tb=bd.querySelector(\'#pvThumb\');var _md=bd.querySelector(\'#pvMid\');var _og=bd.querySelector(\'#pvOrig\');var _pg=bd.querySelector(\'#pvProg\');var _rw=bd.querySelector(\'#pvRetryWrap\');var _rb=bd.querySelector(\'#pvRetryBtn\');var _fl=bd.querySelector(\'#pvFail\');if(_tb){_tb.onerror=function(){_tb.style.display=\'none\';};}function _pvShow(el){if(_tb)_tb.style.display=\'none\';if(_md)_md.style.display=\'none\';if(_og)_og.style.display=\'none\';if(el)el.style.display=\'block\';}var _pvRetries=0;var _pvMidOk=false;var _pvStall=null;function _pvArmStall(){if(_pvStall)clearTimeout(_pvStall);_pvStall=setTimeout(function(){if(window.__pvXhr){try{window.__pvXhr.abort();}catch(e){}}},20000);}function _pvOrigFail(reason){if(_pvStall)clearTimeout(_pvStall);window.__pvXhr=null;var _where=_pvMidOk?\'现在显示的是清晰版（1024），点下面可下载原图。\':\'现在显示的是格子缩略图，点下面可下载原图。\';if(_pg)_pg.textContent=\'原图加载失败：\'+reason+\'；\'+_where;if(_pvRetries<2){if(_rw)_rw.style.display=\'block\';if(_rb)_rb.textContent=\'原图加载失败（\'+reason+\'），点我重试原图（第 \'+(_pvRetries+1)+\'/2 次）\';}else{if(_rw)_rw.style.display=\'block\';if(_rb)_rb.style.display=\'none\';if(_fl)_fl.textContent=\'已重试 2 次仍失败：\'+reason+\'；\'+_where;}}function _pvFetchOrig(){if(_rw)_rw.style.display=\'none\';if(_fl)_fl.textContent=\'\';if(_pg)_pg.textContent=\'原图加载中…\';var x=new XMLHttpRequest();window.__pvXhr=x;x.open(\'GET\',view,true);x.responseType=\'blob\';x.onprogress=function(ev){_pvArmStall();if(_pg){if(ev.lengthComputable&&ev.total){_pg.textContent=\'原图加载中 \'+Math.round(ev.loaded/ev.total*100)+\'%\';}else{_pg.textContent=\'原图加载中 已收到 \'+(ev.loaded/1048576).toFixed(1)+\' MB\';}}};x.onload=function(){if(_pvStall)clearTimeout(_pvStall);window.__pvXhr=null;if(x.status===200&&x.response){try{if(window.__pvOrigUrl){URL.revokeObjectURL(window.__pvOrigUrl);}}catch(e){}window.__pvOrigUrl=URL.createObjectURL(x.response);_og.src=window.__pvOrigUrl;_pvShow(_og);if(_pg)_pg.textContent=\'原图已加载\';if(_rw)_rw.style.display=\'none\';}else{_pvOrigFail(\'HTTP \'+x.status);}};x.onerror=function(){_pvOrigFail(\'网络错误\');};x.onabort=function(){_pvOrigFail(\'20 秒无数据（超时）\');};_pvArmStall();x.send();}if(_rb)_rb.onclick=function(){_pvRetries++;_pvFetchOrig();};var _mid=new Image();_mid.onload=function(){_pvMidOk=true;_md.src=\'/preview_img/\'+t.dataset.id;_pvShow(_md);if(_pg)_pg.textContent=\'清晰版已加载，正在取原图…\';_pvFetchOrig();};_mid.onerror=function(){if(_pg)_pg.textContent=\'清晰版取不到，直接取原图…\';_pvFetchOrig();};_mid.src=\'/preview_img/\'+t.dataset.id;}else if(t.dataset.isvid===\'1\'){bd.innerHTML=\'<video id="pvVideo" controls preload="metadata" src="\'+view+\'" style="width:100%;border-radius:12px"></video><div style="display:none;gap:8px;margin:10px 0"><button class="btn" id="qLowBtn" type="button">流畅</button><button class="btn" id="qHighBtn" type="button">高清</button></div><div id="qNote" class="note"></div><p class="note">大视频在线播需要先缓冲一会儿；如果一直转圈，点下面下载后本地播放更快。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载视频</a>\';var _vid=bd.querySelector(\'#pvVideo\');var _ql=bd.querySelector(\'#qLowBtn\');var _qh=bd.querySelector(\'#qHighBtn\');var _qn=bd.querySelector(\'#qNote\');var _qrow=_ql?_ql.parentElement:null;function _setQ(mode,play){if(!_vid)return;if(mode===\'low\'){_vid.src=\'/preview/\'+t.dataset.id;}else{_vid.src=view;}_vid.load();if(play){try{_vid.play();}catch(e){}}if(_ql){_ql.style.background=mode===\'low\'?\'var(--green)\':\'\';_ql.style.color=mode===\'low\'?\'#fff\':\'\';}if(_qh){_qh.style.background=mode===\'high\'?\'var(--green)\':\'\';_qh.style.color=mode===\'high\'?\'#fff\':\'\';}try{localStorage.setItem(\'video_quality\',mode);}catch(e){}}if(_ql)_ql.addEventListener(\'click\',function(){_setQ(\'low\',true);});if(_qh)_qh.addEventListener(\'click\',function(){_setQ(\'high\',true);});if(_vid)_vid.addEventListener(\'error\',function(){if(_vid.src.indexOf(\'/preview/\')>=0){_vid.src=view;_vid.load();}});fetch(\'/preview_status/\'+t.dataset.id).then(function(r){return r.json();}).then(function(j){if(j.has_preview){if(_qrow)_qrow.style.display=\'flex\';var saved=null;try{saved=localStorage.getItem(\'video_quality\');}catch(e){}_setQ(saved===\'high\'?\'high\':\'low\',false);if(_qn)_qn.textContent=\'流畅版是低清预览，起播快；点高清切回原片，加载慢自己受着。\';}else{if(_qrow)_qrow.style.display=\'none\';if(_qn)_qn.textContent=\'低清版还没生成，先看原片。\';}}).catch(function(){if(_qrow)_qrow.style.display=\'none\';});}else if(t.dataset.isaud===\'1\'){bd.innerHTML=\'<audio controls src="\'+view+\'" style="width:100%"></audio>\';}else if(t.dataset.cat===\'文档\'){bd.innerHTML=\'<iframe src="\'+view+\'" style="width:100%;height:420px;border:0;border-radius:12px"></iframe><p style="margin-top:10px"><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a></p>\';}else{bd.innerHTML=\'<p class="note">这个类型不能在线预览，请下载后打开。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a>\';}ov.style.display=\'flex\';_loadComments(t.dataset.id);}function _escHtml(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");} function _loadComments(fid){var card=document.getElementById(\'previewCard\');if(!card)return;var cs=document.getElementById(\'commentSection\');if(!cs){cs=document.createElement(\'div\');cs.id=\'commentSection\';card.appendChild(cs);}cs.innerHTML=\'<div style="margin-top:14px;border-top:1px solid var(--line);padding-top:10px"><b>留言</b><div id="commentList" style="margin-top:8px">加载留言中…</div><input id="commentNick" placeholder="昵称（不填就是匿名）" maxlength="50" style="width:100%;margin-top:8px;box-sizing:border-box"><textarea id="commentText" rows="2" placeholder="写下你的留言…" maxlength="500" style="width:100%;margin-top:6px;box-sizing:border-box"></textarea><button class="btn primary" id="commentSend" type="button" style="margin-top:6px">发送留言</button><div id="commentMsg" class="note"></div></div>\';var list=cs.querySelector(\'#commentList\');function render(items){if(!items||!items.length){list.innerHTML=\'<p class="note">还没有留言。</p>\';return;}list.innerHTML=items.map(function(c){return \'<div style="margin-bottom:8px"><div style="font-weight:800;font-size:13px">\'+_escHtml(c.author||\'匿名\')+\' <span style="font-weight:400;color:var(--muted);font-size:11px">\'+_escHtml(c.time||\'\')+\'</span></div><div style="font-size:13px;word-break:break-all">\'+_escHtml(c.text||\'\')+\'</div></div>\';}).join(\'\');}function reload(){fetch(\'/comments/\'+encodeURIComponent(fid)).then(function(r){return r.json();}).then(function(j){render(j.comments);}).catch(function(){list.innerHTML=\'<p class="note">留言加载失败，稍后再试。</p>\';});}reload();var btn=cs.querySelector(\'#commentSend\');if(btn){btn.onclick=function(){var nick=cs.querySelector(\'#commentNick\').value;var txt=cs.querySelector(\'#commentText\').value;var msg=cs.querySelector(\'#commentMsg\');if(!txt.trim()){msg.textContent=\'留言不能为空\';return;}msg.textContent=\'发送中…\';var fd=new FormData();fd.append(\'author\',nick);fd.append(\'text\',txt);fetch(\'/comments/\'+encodeURIComponent(fid),{method:\'POST\',body:fd}).then(function(r){return r.json();}).then(function(j){if(j.ok){cs.querySelector(\'#commentText\').value=\'\';msg.textContent=\'已发送\';reload();}else{msg.textContent=j.error||\'发送失败\';}}).catch(function(){msg.textContent=\'发送失败，请重试\';});};}} function closePreview(){if(window.__pvXhr){try{window.__pvXhr.abort();}catch(e){}window.__pvXhr=null;}if(window.__pvOrigUrl){try{URL.revokeObjectURL(window.__pvOrigUrl);}catch(e){}window.__pvOrigUrl=null;}var ov=document.getElementById(\'previewOverlay\');var bd=document.getElementById(\'previewBody\');if(bd){bd.querySelectorAll(\'video,audio\').forEach(function(m){m.pause();m.removeAttribute(\'src\');m.load();});bd.innerHTML=\'\';}if(ov)ov.style.display=\'none\';}function dlTile(t){var url=t.dataset.dl;var name=t.querySelector(\'.tile-name\').textContent;var _st=document.createElement(\'div\');_st.className=\'note dlstatus\';_st.textContent=\'下载准备中…\';t.appendChild(_st);_dlFeed(url,name,_st);}document.getElementById(\'albumGrid\').addEventListener(\'click\',function(e){var t=e.target.closest(\'.tile\');if(!t)return;if(e.target.closest&&e.target.closest(\'.dlstatus\'))return;if(selectMode){var id=t.dataset.id;if(selected.has(id)){selected.delete(id);t.classList.remove(\'selected\');}else{selected.add(id);t.classList.add(\'selected\');}updateSel();}else{openPreview(t);}});document.getElementById(\'previewClose\').addEventListener(\'click\',closePreview);document.getElementById(\'previewOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'previewOverlay\')closePreview();});document.getElementById(\'selBtn\').addEventListener(\'click\',function(){selectMode=!selectMode;var g=document.getElementById(\'albumGrid\');if(selectMode){g.classList.add(\'selecting\');this.textContent=\'取消选择\';}else{selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});g.classList.remove(\'selecting\');this.textContent=\'选择\';}updateSel();});document.getElementById(\'dlSelBtn\').addEventListener(\'click\',function(){var tiles=[];document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(selected.has(t.dataset.id))tiles.push(t);});if(!tiles.length)return;var i=0;function next(){if(i>=tiles.length){alert(\'已开始下载 \'+tiles.length+\' 个文件（浏览器可能逐个询问是否允许多个下载）。\');selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});document.getElementById(\'albumGrid\').classList.remove(\'selecting\');selectMode=false;document.getElementById(\'selBtn\').textContent=\'选择\';updateSel();return;}dlTile(tiles[i]);i++;setTimeout(next,600);}next();});document.getElementById(\'newFolderBtn\').addEventListener(\'click\',function(){var f=document.getElementById(\'newFolderForm\');f.style.display=\'flex\';});document.getElementById(\'newFolderCancel\').addEventListener(\'click\',function(){document.getElementById(\'newFolderForm\').style.display=\'none\';});document.getElementById(\'moveForm\').addEventListener(\'submit\',function(e){if(!selected.size){e.preventDefault();alert(\'请先勾选文件\');}});document.getElementById(\'moveBtn\').addEventListener(\'click\',function(){if(!selected.size){alert(\'请先勾选文件\');return;}var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'flex\';});document.getElementById(\'moveCancel\').addEventListener(\'click\',function(){var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'none\';});document.getElementById(\'moveOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'moveOverlay\'){e.target.style.display=\'none\';}});document.querySelectorAll(\'#moveOverlay [data-dest]\').forEach(function(b){b.addEventListener(\'click\',function(){var d=document.getElementById(\'moveDest\');if(d)d.value=b.dataset.dest;document.getElementById(\'moveForm\').submit();});});function _segDl(url,name,size,progEl,doneCb){var CH=8*1024*1024,PAR=3,TRY=3,total=Math.ceil(size/CH),parts=new Array(total),done=0,failed=false,next=0,inflight=0;function show(){if(progEl)progEl.textContent=\'下载中 \'+Math.round(done/total*100)+\'%（\'+(done*CH>size?size:done*CH)+\' / \'+size+\' 字节）\';}function fetchC(idx,att,cb){var st=idx*CH,en=Math.min(size-1,st+CH-1);var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.setRequestHeader(\'Range\',\'bytes=\'+st+\'-\'+en);x.responseType=\'blob\';x.onload=function(){if(x.status===206||x.status===200){cb(null,x.response);}else if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk failed\'));}};x.onerror=function(){if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk network error\'));}};x.send();}function launch(){while(!failed&&inflight<PAR&&next<total){(function(idx){inflight++;fetchC(idx,0,function(err,blob){inflight--;if(failed)return;if(err){failed=true;if(doneCb)doneCb(err);return;}parts[idx]=blob;done++;show();if(done===total){var a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob(parts));a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);if(doneCb)doneCb(null);}else{launch();}});})(next);next++;}}show();launch();}function _dlFeed(url,name,el){el.textContent=\'下载准备中…\';var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.responseType=\'blob\';x.onprogress=function(e){if(e.lengthComputable&&e.total){el.textContent=\'下载中 \'+Math.round(e.loaded/e.total*100)+\'%\';}else{el.textContent=\'下载中 \'+e.loaded+\' 字节\';}};function _fail(){el.innerHTML=\'\';var b=document.createElement(\'button\');b.className=\'btn\';b.type=\'button\';b.textContent=\'下载失败，点我重试\';b.onclick=function(){_dlFeed(url,name,el);};el.appendChild(b);}x.onload=function(){if(x.status===200){el.textContent=\'下载完成\';var a=document.createElement(\'a\');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);setTimeout(function(){if(el.parentNode)el.parentNode.removeChild(el);},2000);}else{_fail();}};x.onerror=function(){_fail();};x.send();}document.getElementById(\'previewBody\').addEventListener(\'click\',function(e){var a=e.target.closest?e.target.closest(\'.segdl\'):null;if(!a)return;var sz=parseInt(a.dataset.size||\'0\',10);if(sz>=20*1024*1024&&sz<=500*1024*1024){e.preventDefault();var prog=document.getElementById(\'segProg\');if(!prog){prog=document.createElement(\'div\');prog.id=\'segProg\';prog.className=\'note\';var _pb=document.getElementById(\'previewBody\');if(_pb)_pb.appendChild(prog);}_segDl(a.dataset.dl,a.dataset.name||\'download\',sz,prog,function(err){if(err&&prog)prog.textContent=\'下载失败，请重试\';else if(prog)prog.textContent=\'下载完成\';});return;}e.preventDefault();var _st2=document.createElement(\'div\');_st2.className=\'note dlstatus\';var _pb2=document.getElementById(\'previewBody\');if(_pb2)_pb2.appendChild(_st2);var _nm=document.getElementById(\'previewTitle\')?document.getElementById(\'previewTitle\').textContent:\'download\';if(!sz||sz>500*1024*1024){_st2.textContent=\'下载准备中…已开始下载，请留意浏览器下载栏\';var _tmp=document.createElement(\'a\');_tmp.href=a.dataset.dl;_tmp.download=_nm;document.body.appendChild(_tmp);_tmp.click();_tmp.remove();return;}_dlFeed(a.dataset.dl,_nm,_st2);});var _pre={};function _preOrig(t){if(!t||t.dataset.isimg!==\'1\')return;var u=t.dataset.view;if(!u||_pre[u])return;_pre[u]=1;var im=new Image();im.src=u;}document.addEventListener(\'touchstart\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);},{passive:true});document.addEventListener(\'mouseover\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);});function _preVisible(){if(navigator.connection&&navigator.connection.saveData)return;var n=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(n>=6)return;if(t.style.display===\'none\')return;var r=t.getBoundingClientRect();if(r.bottom<0||r.top>window.innerHeight)return;var b=Object.keys(_pre).length;_preOrig(t);if(Object.keys(_pre).length>b)n++;});}if(\'requestIdleCallback\' in window){requestIdleCallback(_preVisible,{timeout:2000});}else{setTimeout(_preVisible,1500);}</script></div>'
+    '<div class="tabpanel active" id="tab-published"><div class="pub-toolbar"><input class="search" id="search" type="search" placeholder="搜索文件名…" oninput="onSearch(this.value)"><button class="btn" id="openDrawerBtn" type="button">导航</button><button class="btn" id="selBtn" type="button">选择</button></div><section class="card section"><div class="section-head"><h2>已发布</h2><span class="count">{{ files|length }} 个</span></div>{% if msg %}<p class="note" style="margin-top:10px">{{ msg }}</p>{% endif %}{% if backend_notice %}<p class=\"note\" style=\"margin-top:10px\">{{ backend_notice }}</p>{% endif %}<div class="folderbar" id="folderbar"><button class="tab active" data-folder="all" onclick="showFolder(\'all\',this)">全部（{{ files|length }}）</button>{% for fo in folders %}<button class="tab" data-folder="{{ fo.id }}" onclick="showFolder(\'{{ fo.id }}\',this)">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}<button class="tab" id="newFolderBtn" type="button">+ 新建文件夹</button></div><form id="newFolderForm" method="post" action="/folder/create" style="display:none;gap:8px;margin-top:10px"><input class="textin" name="name" placeholder="新文件夹名字，比如：旅行" required maxlength="50" style="flex:1"><button class="btn primary" type="submit">创建</button><button class="btn" type="button" id="newFolderCancel">取消</button></form><div class="tabs" id="cattabs"><button class="tab active" onclick="showCat(\'全部\',this)">全部（{{ files|length }}）</button>{% for c in cats %}{% if c.count %}<button class="tab" onclick="showCat(\'{{ c.name }}\',this)">{{ c.name }}（{{ c.count }}）</button>{% endif %}{% endfor %}</div><form id="moveForm" method="post" action="/folder/move" style="display:none;margin-top:12px;margin-bottom:4px;gap:8px;flex-wrap:wrap;align-items:center"><span id="selCount" style="font-weight:800"></span><input type="hidden" name="dest_folder_id" id="moveDest"><input type="hidden" name="file_ids" id="moveFileIds"><button class="btn primary" type="button" id="moveBtn">移动</button><button class="btn" type="button" id="dlSelBtn">选择下载</button></form><div class="album-grid" id="albumGrid">{% for f in files %}<div class="tile" data-cat="{{ f.kind }}" data-folder="{{ f.folder_id }}" data-name="{{ f.name|lower }}" data-id="{{ f.id }}" data-dl="/download/{{ f.id }}" data-view="/view/{{ f.id }}" data-isimg="{{ \'1\' if f.is_image else \'0\' }}" data-isvid="{{ \'1\' if f.is_video else \'0\' }}" data-isaud="{{ \'1\' if f.is_audio else \'0\' }}" data-size="{{ f.size_bytes }}"><span class="tile-check"></span>{% if f.is_image or f.is_video %}<img class="tileimg" src="/thumb/{{ f.id }}?v=3" data-fb="/thumb/{{ f.id }}?v=3" alt="" loading="lazy" onerror="_thumbErr(this)">{% if f.is_video %}<div class="tilefic tile-video" style="display:none">影</div>{% else %}<div class="tilefic tile-img" style="display:none">图</div>{% endif %}{% elif f.is_audio %}<div class="tilefic tile-music">音</div>{% elif f.kind == "文档" %}<div class="tilefic tile-doc">文</div>{% elif f.kind == "压缩包" %}<div class="tilefic tile-zip">压</div>{% elif f.kind == "安装包" %}<div class="tilefic tile-pkg">包</div>{% elif f.kind == "影音" %}<div class="tilefic tile-video">影</div>{% else %}<div class="tilefic tile-other">他</div>{% endif %}<div class="tileinfo"><div class="tile-name" style="display:none">{{ f.name }}</div><div class="tile-meta">{{ f.kind }} · {{ f.size }}{% if f.source == "baidu" %} · 百度{% endif %}{% if f.ai_note %} · {{ f.ai_note }}{% endif %}</div></div><span class="tile-dl">↓ {{ f.dl_count|default(0) }}</span></div>{% endfor %}</div><p class="empty" id="folderEmpty" style="display:none">这个文件夹里还没有文件。</p>{% if not files %}<p class="empty">目前还没有已发布的文件。</p>{% endif %}<p class="note">点图片默认就是预览；点右上角“选择”，再点图片打勾，就可以批量下载或移动到文件夹。</p></section><div id="previewOverlay"><div id="previewCard"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b id="previewTitle" style="word-break:break-all"></b><button class="btn" id="previewClose" type="button">关闭</button></div><div id="previewBody" style="margin-top:12px"></div></div></div><div id="moveOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40;align-items:center;justify-content:center;padding:16px;box-sizing:border-box"><div style="background:var(--surface);border-radius:18px;padding:16px;width:100%;max-width:420px;max-height:90vh;overflow:auto"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><b>移到哪里？</b><button class="btn" type="button" id="moveCancel">取消</button></div><p class="note" style="margin-top:8px">点一个文件夹，选中的文件就会移过去。</p><button class="btn" type="button" data-dest="{{ published_id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">已发布根目录</button>{% for fo in folders %}<button class="btn" type="button" data-dest="{{ fo.id }}" style="display:block;width:100%;text-align:left;margin-bottom:8px">{{ fo.name }}（{{ fo.count }}）</button>{% endfor %}</div></div><script>var curCat=\'全部\',curFolder=\'all\',curQ=\'\',selectMode=false,selected=new Set();function applyFilter(){var vis=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){var okCat=curCat===\'全部\'||t.dataset.cat===curCat;var okFolder=curFolder===\'all\'||t.dataset.folder===curFolder;var okQ=t.dataset.name.includes(curQ);var show=(okCat&&okFolder&&okQ);var _nm=t.querySelector(\'.tile-name\');if(_nm)_nm.style.display=(show&&curQ)?\'\':\'none\';t.style.display=show?\'\':\'none\';if(show)vis++;});var fe=document.getElementById(\'folderEmpty\');if(fe)fe.style.display=(curFolder!==\'all\'&&vis===0)?\'block\':\'none\';}function showCat(c,el){curCat=c;document.querySelectorAll(\'#cattabs .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function showFolder(fid,el){curFolder=fid;document.querySelectorAll(\'#folderbar .tab\').forEach(function(t){t.classList.remove(\'active\');});el.classList.add(\'active\');applyFilter();}function onSearch(v){curQ=v.toLowerCase();applyFilter();}function updateSel(){var mf=document.getElementById(\'moveForm\');var sc=document.getElementById(\'selCount\');var ids=document.getElementById(\'moveFileIds\');if(sc)sc.textContent=\'已选 \'+selected.size+\' 个 · 选择模式中，点图片是打勾，点右上角“取消选择”退出后才能查看\';if(ids)ids.value=Array.from(selected).join(\',\');if(mf)mf.style.display=selected.size?\'flex\':\'none\';}function _thumbErr(im){if(!im.dataset.fbDone&&im.dataset.fb){im.dataset.fbDone=\'1\';im.src=im.dataset.fb;return;}im.style.display=\'none\';var nx=im.nextElementSibling;if(nx)nx.style.display=\'grid\';}function openPreview(t){var ov=document.getElementById(\'previewOverlay\');var ti=document.getElementById(\'previewTitle\');var bd=document.getElementById(\'previewBody\');if(!ov||!ti||!bd)return;ti.textContent=t.querySelector(\'.tile-name\').textContent;var view=t.dataset.view,dl=t.dataset.dl;if(t.dataset.isimg===\'1\'){var _th=t.querySelector(\'.tileimg\');var _tu=_th?_th.getAttribute(\'src\'):\'\';bd.innerHTML=\'<img id="pvThumb" src="\'+_tu+\'" style="width:100%;border-radius:12px"><img id="pvMid" style="width:100%;border-radius:12px;display:none"><img id="pvOrig" style="width:100%;border-radius:12px;display:none"><p class="note" id="pvProg">正在取清晰图…</p><div id="pvRetryWrap" style="display:none;margin:10px 0"><button class="btn primary" id="pvRetryBtn" type="button">原图加载较慢或加载失败，点我重试原图</button><p class="note" id="pvFail"></p></div><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载原图</a>\';var _tb=bd.querySelector(\'#pvThumb\');var _md=bd.querySelector(\'#pvMid\');var _og=bd.querySelector(\'#pvOrig\');var _pg=bd.querySelector(\'#pvProg\');var _rw=bd.querySelector(\'#pvRetryWrap\');var _rb=bd.querySelector(\'#pvRetryBtn\');var _fl=bd.querySelector(\'#pvFail\');if(_tb){_tb.onerror=function(){_tb.style.display=\'none\';};}function _pvShow(el){if(_tb)_tb.style.display=\'none\';if(_md)_md.style.display=\'none\';if(_og)_og.style.display=\'none\';if(el)el.style.display=\'block\';}var _pvRetries=0;var _pvMidOk=false;var _pvStall=null;function _pvArmStall(){if(_pvStall)clearTimeout(_pvStall);_pvStall=setTimeout(function(){if(window.__pvXhr){try{window.__pvXhr.abort();}catch(e){}}},20000);}function _pvOrigFail(reason){if(_pvStall)clearTimeout(_pvStall);window.__pvXhr=null;var _where=_pvMidOk?\'现在显示的是清晰版（1024），点下面可下载原图。\':\'现在显示的是格子缩略图，点下面可下载原图。\';if(_pg)_pg.textContent=\'原图加载失败：\'+reason+\'；\'+_where;if(_pvRetries<2){if(_rw)_rw.style.display=\'block\';if(_rb)_rb.textContent=\'原图加载失败（\'+reason+\'），点我重试原图（第 \'+(_pvRetries+1)+\'/2 次）\';}else{if(_rw)_rw.style.display=\'block\';if(_rb)_rb.style.display=\'none\';if(_fl)_fl.textContent=\'已重试 2 次仍失败：\'+reason+\'；\'+_where;}}function _pvFetchOrig(){if(_rw)_rw.style.display=\'none\';if(_fl)_fl.textContent=\'\';if(_pg)_pg.textContent=\'原图加载中…\';var x=new XMLHttpRequest();window.__pvXhr=x;x.open(\'GET\',view,true);x.responseType=\'blob\';x.onprogress=function(ev){_pvArmStall();if(_pg){if(ev.lengthComputable&&ev.total){_pg.textContent=\'原图加载中 \'+Math.round(ev.loaded/ev.total*100)+\'%\';}else{_pg.textContent=\'原图加载中 已收到 \'+(ev.loaded/1048576).toFixed(1)+\' MB\';}}};x.onload=function(){if(_pvStall)clearTimeout(_pvStall);window.__pvXhr=null;if(x.status===200&&x.response){try{if(window.__pvOrigUrl){URL.revokeObjectURL(window.__pvOrigUrl);}}catch(e){}window.__pvOrigUrl=URL.createObjectURL(x.response);_og.src=window.__pvOrigUrl;_pvShow(_og);if(_pg)_pg.textContent=\'原图已加载\';if(_rw)_rw.style.display=\'none\';}else{_pvOrigFail(\'HTTP \'+x.status);}};x.onerror=function(){_pvOrigFail(\'网络错误\');};x.onabort=function(){_pvOrigFail(\'20 秒无数据（超时）\');};_pvArmStall();x.send();}if(_rb)_rb.onclick=function(){_pvRetries++;_pvFetchOrig();};var _mid=new Image();_mid.onload=function(){_pvMidOk=true;_md.src=\'/preview_img/\'+t.dataset.id;_pvShow(_md);if(_pg)_pg.textContent=\'清晰版已加载，正在取原图…\';_pvFetchOrig();};_mid.onerror=function(){if(_pg)_pg.textContent=\'清晰版取不到，直接取原图…\';_pvFetchOrig();};_mid.src=\'/preview_img/\'+t.dataset.id;}else if(t.dataset.isvid===\'1\'){bd.innerHTML=\'<video id="pvVideo" controls preload="metadata" src="\'+view+\'" style="width:100%;border-radius:12px"></video><div style="display:none;gap:8px;margin:10px 0"><button class="btn" id="qLowBtn" type="button">流畅</button><button class="btn" id="qHighBtn" type="button">高清</button></div><div id="qNote" class="note"></div><p class="note">大视频在线播需要先缓冲一会儿；如果一直转圈，点下面下载后本地播放更快。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载视频</a>\';var _vid=bd.querySelector(\'#pvVideo\');var _ql=bd.querySelector(\'#qLowBtn\');var _qh=bd.querySelector(\'#qHighBtn\');var _qn=bd.querySelector(\'#qNote\');var _qrow=_ql?_ql.parentElement:null;function _setQ(mode,play){if(!_vid)return;if(mode===\'low\'){_vid.src=\'/preview/\'+t.dataset.id;}else{_vid.src=view;}_vid.load();if(play){try{_vid.play();}catch(e){}}if(_ql){_ql.style.background=mode===\'low\'?\'var(--green)\':\'\';_ql.style.color=mode===\'low\'?\'#fff\':\'\';}if(_qh){_qh.style.background=mode===\'high\'?\'var(--green)\':\'\';_qh.style.color=mode===\'high\'?\'#fff\':\'\';}try{localStorage.setItem(\'video_quality\',mode);}catch(e){}}if(_ql)_ql.addEventListener(\'click\',function(){_setQ(\'low\',true);});if(_qh)_qh.addEventListener(\'click\',function(){_setQ(\'high\',true);});if(_vid)_vid.addEventListener(\'error\',function(){if(_vid.src.indexOf(\'/preview/\')>=0){_vid.src=view;_vid.load();}});fetch(\'/preview_status/\'+t.dataset.id).then(function(r){return r.json();}).then(function(j){if(j.has_preview){if(_qrow)_qrow.style.display=\'flex\';var saved=null;try{saved=localStorage.getItem(\'video_quality\');}catch(e){}_setQ(saved===\'high\'?\'high\':\'low\',false);if(_qn)_qn.textContent=\'流畅版是低清预览，起播快；点高清切回原片，加载慢自己受着。\';}else{if(_qrow)_qrow.style.display=\'none\';if(_qn)_qn.textContent=\'低清版还没生成，先看原片。\';}}).catch(function(){if(_qrow)_qrow.style.display=\'none\';});}else if(t.dataset.isaud===\'1\'){bd.innerHTML=\'<audio controls src="\'+view+\'" style="width:100%"></audio>\';}else if(t.dataset.cat===\'文档\'){bd.innerHTML=\'<iframe src="\'+view+\'" style="width:100%;height:420px;border:0;border-radius:12px"></iframe><p style="margin-top:10px"><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a></p>\';}else{bd.innerHTML=\'<p class="note">这个类型不能在线预览，请下载后打开。</p><a class="btn primary segdl" data-dl="\'+dl+\'" data-size="\'+(t.dataset.size||\'0\')+\'" href="\'+dl+\'">下载</a>\';}ov.style.display=\'flex\';_loadComments(t.dataset.id);}function _escHtml(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");} function _loadComments(fid){var card=document.getElementById(\'previewCard\');if(!card)return;var cs=document.getElementById(\'commentSection\');if(!cs){cs=document.createElement(\'div\');cs.id=\'commentSection\';card.appendChild(cs);}cs.innerHTML=\'<div style="margin-top:14px;border-top:1px solid var(--line);padding-top:10px"><b>留言</b><div id="commentList" style="margin-top:8px">加载留言中…</div><input id="commentNick" placeholder="昵称（不填就是匿名）" maxlength="50" style="width:100%;margin-top:8px;box-sizing:border-box"><textarea id="commentText" rows="2" placeholder="写下你的留言…" maxlength="500" style="width:100%;margin-top:6px;box-sizing:border-box"></textarea><button class="btn primary" id="commentSend" type="button" style="margin-top:6px">发送留言</button><div id="commentMsg" class="note"></div></div>\';var list=cs.querySelector(\'#commentList\');function render(items){if(!items||!items.length){list.innerHTML=\'<p class="note">还没有留言。</p>\';return;}list.innerHTML=items.map(function(c){return \'<div style="margin-bottom:8px"><div style="font-weight:800;font-size:13px">\'+_escHtml(c.author||\'匿名\')+\' <span style="font-weight:400;color:var(--muted);font-size:11px">\'+_escHtml(c.time||\'\')+\'</span></div><div style="font-size:13px;word-break:break-all">\'+_escHtml(c.text||\'\')+\'</div></div>\';}).join(\'\');}function reload(){fetch(\'/comments/\'+encodeURIComponent(fid)).then(function(r){return r.json();}).then(function(j){render(j.comments);}).catch(function(){list.innerHTML=\'<p class="note">留言加载失败，稍后再试。</p>\';});}reload();var btn=cs.querySelector(\'#commentSend\');if(btn){btn.onclick=function(){var nick=cs.querySelector(\'#commentNick\').value;var txt=cs.querySelector(\'#commentText\').value;var msg=cs.querySelector(\'#commentMsg\');if(!txt.trim()){msg.textContent=\'留言不能为空\';return;}msg.textContent=\'发送中…\';var fd=new FormData();fd.append(\'author\',nick);fd.append(\'text\',txt);fetch(\'/comments/\'+encodeURIComponent(fid),{method:\'POST\',body:fd}).then(function(r){return r.json();}).then(function(j){if(j.ok){cs.querySelector(\'#commentText\').value=\'\';msg.textContent=\'已发送\';reload();}else{msg.textContent=j.error||\'发送失败\';}}).catch(function(){msg.textContent=\'发送失败，请重试\';});};}} function closePreview(){if(window.__pvXhr){try{window.__pvXhr.abort();}catch(e){}window.__pvXhr=null;}if(window.__pvOrigUrl){try{URL.revokeObjectURL(window.__pvOrigUrl);}catch(e){}window.__pvOrigUrl=null;}var ov=document.getElementById(\'previewOverlay\');var bd=document.getElementById(\'previewBody\');if(bd){bd.querySelectorAll(\'video,audio\').forEach(function(m){m.pause();m.removeAttribute(\'src\');m.load();});bd.innerHTML=\'\';}if(ov)ov.style.display=\'none\';}function dlTile(t){var url=t.dataset.dl;var name=t.querySelector(\'.tile-name\').textContent;var _st=document.createElement(\'div\');_st.className=\'note dlstatus\';_st.textContent=\'下载准备中…\';t.appendChild(_st);_dlFeed(url,name,_st);}document.getElementById(\'albumGrid\').addEventListener(\'click\',function(e){var t=e.target.closest(\'.tile\');if(!t)return;if(e.target.closest&&e.target.closest(\'.dlstatus\'))return;if(selectMode){var id=t.dataset.id;if(selected.has(id)){selected.delete(id);t.classList.remove(\'selected\');}else{selected.add(id);t.classList.add(\'selected\');}updateSel();}else{openPreview(t);}});document.getElementById(\'previewClose\').addEventListener(\'click\',closePreview);document.getElementById(\'previewOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'previewOverlay\')closePreview();});document.getElementById(\'selBtn\').addEventListener(\'click\',function(){selectMode=!selectMode;var g=document.getElementById(\'albumGrid\');if(selectMode){g.classList.add(\'selecting\');this.textContent=\'取消选择\';}else{selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});g.classList.remove(\'selecting\');this.textContent=\'选择\';}updateSel();});document.getElementById(\'dlSelBtn\').addEventListener(\'click\',function(){var tiles=[];document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(selected.has(t.dataset.id))tiles.push(t);});if(!tiles.length)return;var i=0;function next(){if(i>=tiles.length){alert(\'已开始下载 \'+tiles.length+\' 个文件（浏览器可能逐个询问是否允许多个下载）。\');selected.clear();document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){t.classList.remove(\'selected\');});document.getElementById(\'albumGrid\').classList.remove(\'selecting\');selectMode=false;document.getElementById(\'selBtn\').textContent=\'选择\';updateSel();return;}dlTile(tiles[i]);i++;setTimeout(next,600);}next();});document.getElementById(\'newFolderBtn\').addEventListener(\'click\',function(){var f=document.getElementById(\'newFolderForm\');f.style.display=\'flex\';});document.getElementById(\'newFolderCancel\').addEventListener(\'click\',function(){document.getElementById(\'newFolderForm\').style.display=\'none\';});document.getElementById(\'moveForm\').addEventListener(\'submit\',function(e){if(!selected.size){e.preventDefault();alert(\'请先勾选文件\');}});document.getElementById(\'moveBtn\').addEventListener(\'click\',function(){if(!selected.size){alert(\'请先勾选文件\');return;}var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'flex\';});document.getElementById(\'moveCancel\').addEventListener(\'click\',function(){var ov=document.getElementById(\'moveOverlay\');if(ov)ov.style.display=\'none\';});document.getElementById(\'moveOverlay\').addEventListener(\'click\',function(e){if(e.target.id===\'moveOverlay\'){e.target.style.display=\'none\';}});document.querySelectorAll(\'#moveOverlay [data-dest]\').forEach(function(b){b.addEventListener(\'click\',function(){var d=document.getElementById(\'moveDest\');if(d)d.value=b.dataset.dest;document.getElementById(\'moveForm\').submit();});});function _segDl(url,name,size,progEl,doneCb){var CH=8*1024*1024,PAR=3,TRY=3,total=Math.ceil(size/CH),parts=new Array(total),done=0,failed=false,next=0,inflight=0;function show(){if(progEl)progEl.textContent=\'下载中 \'+Math.round(done/total*100)+\'%（\'+(done*CH>size?size:done*CH)+\' / \'+size+\' 字节）\';}function fetchC(idx,att,cb){var st=idx*CH,en=Math.min(size-1,st+CH-1);var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.setRequestHeader(\'Range\',\'bytes=\'+st+\'-\'+en);x.responseType=\'blob\';x.onload=function(){if(x.status===206||x.status===200){cb(null,x.response);}else if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk failed\'));}};x.onerror=function(){if(att<TRY){fetchC(idx,att+1,cb);}else{cb(new Error(\'chunk network error\'));}};x.send();}function launch(){while(!failed&&inflight<PAR&&next<total){(function(idx){inflight++;fetchC(idx,0,function(err,blob){inflight--;if(failed)return;if(err){failed=true;if(doneCb)doneCb(err);return;}parts[idx]=blob;done++;show();if(done===total){var a=document.createElement(\'a\');a.href=URL.createObjectURL(new Blob(parts));a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);if(doneCb)doneCb(null);}else{launch();}});})(next);next++;}}show();launch();}function _dlFeed(url,name,el){el.textContent=\'下载准备中…\';var x=new XMLHttpRequest();x.open(\'GET\',url,true);x.responseType=\'blob\';x.onprogress=function(e){if(e.lengthComputable&&e.total){el.textContent=\'下载中 \'+Math.round(e.loaded/e.total*100)+\'%\';}else{el.textContent=\'下载中 \'+e.loaded+\' 字节\';}};function _fail(){el.innerHTML=\'\';var b=document.createElement(\'button\');b.className=\'btn\';b.type=\'button\';b.textContent=\'下载失败，点我重试\';b.onclick=function(){_dlFeed(url,name,el);};el.appendChild(b);}x.onload=function(){if(x.status===200){el.textContent=\'下载完成\';var a=document.createElement(\'a\');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);setTimeout(function(){if(el.parentNode)el.parentNode.removeChild(el);},2000);}else{_fail();}};x.onerror=function(){_fail();};x.send();}document.getElementById(\'previewBody\').addEventListener(\'click\',function(e){var a=e.target.closest?e.target.closest(\'.segdl\'):null;if(!a)return;var sz=parseInt(a.dataset.size||\'0\',10);if(sz>=20*1024*1024&&sz<=500*1024*1024){e.preventDefault();var prog=document.getElementById(\'segProg\');if(!prog){prog=document.createElement(\'div\');prog.id=\'segProg\';prog.className=\'note\';var _pb=document.getElementById(\'previewBody\');if(_pb)_pb.appendChild(prog);}_segDl(a.dataset.dl,a.dataset.name||\'download\',sz,prog,function(err){if(err&&prog)prog.textContent=\'下载失败，请重试\';else if(prog)prog.textContent=\'下载完成\';});return;}e.preventDefault();var _st2=document.createElement(\'div\');_st2.className=\'note dlstatus\';var _pb2=document.getElementById(\'previewBody\');if(_pb2)_pb2.appendChild(_st2);var _nm=document.getElementById(\'previewTitle\')?document.getElementById(\'previewTitle\').textContent:\'download\';if(!sz||sz>500*1024*1024){_st2.textContent=\'下载准备中…已开始下载，请留意浏览器下载栏\';var _tmp=document.createElement(\'a\');_tmp.href=a.dataset.dl;_tmp.download=_nm;document.body.appendChild(_tmp);_tmp.click();_tmp.remove();return;}_dlFeed(a.dataset.dl,_nm,_st2);});var _pre={};function _preOrig(t){if(!t||t.dataset.isimg!==\'1\')return;var u=t.dataset.view;if(!u||_pre[u])return;_pre[u]=1;var im=new Image();im.src=u;}document.addEventListener(\'touchstart\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);},{passive:true});document.addEventListener(\'mouseover\',function(e){var t=e.target.closest?e.target.closest(\'.tile\'):null;if(t)_preOrig(t);});function _preVisible(){if(navigator.connection&&navigator.connection.saveData)return;var n=0;document.querySelectorAll(\'#albumGrid .tile\').forEach(function(t){if(n>=6)return;if(t.style.display===\'none\')return;var r=t.getBoundingClientRect();if(r.bottom<0||r.top>window.innerHeight)return;var b=Object.keys(_pre).length;_preOrig(t);if(Object.keys(_pre).length>b)n++;});}if(\'requestIdleCallback\' in window){requestIdleCallback(_preVisible,{timeout:2000});}else{setTimeout(_preVisible,1500);}</script></div>'
     "{% endif %}"
     "<script>function dlFile(btn){var row=btn.closest('.file');var wrap=row.querySelector('.dlprog');var bar=row.querySelector('.dlbar');var tx=row.querySelector('.dltext');if(!wrap)return;wrap.style.display='block';btn.disabled=true;var url=btn.getAttribute('data-dl');var name=btn.getAttribute('data-name');var x=new XMLHttpRequest();x.open('GET',url,true);x.responseType='blob';x.onprogress=function(ev){if(ev.lengthComputable){var pct=Math.round(ev.loaded/ev.total*100);bar.style.width=pct+'%';tx.textContent='下载中… '+pct+'%（'+(ev.loaded/1048576).toFixed(1)+' / '+(ev.total/1048576).toFixed(1)+' MB）';}else{tx.textContent='下载中… '+(ev.loaded/1048576).toFixed(1)+' MB';}};x.onload=function(){if(x.status===200){bar.style.width='100%';tx.textContent='下载完成';var a=document.createElement('a');a.href=URL.createObjectURL(x.response);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}else{tx.textContent='下载失败，请重试';}btn.disabled=false;};x.onerror=function(){tx.textContent='下载失败，请检查网络后重试';btn.disabled=false;};x.send();}</script>"
         '<div class="tabpanel" id="tab-private"><div class="card section"><h2>私人区</h2>'
@@ -2697,7 +2783,7 @@ ADMIN_PAGE = (
     + "</style></head><body><div class=\"wrap\" id=\"admin-main\"><h1>待审核文件</h1>{% if ai_configured %}<div class=\"card section\"><span class=\"note\">上传后自动审核：AI 通过的文件会自动发布；可疑、无法判断或调用失败的留在待审核等站长人工看。</span></div>{% else %}<div class=\"card section warn\">AI 审核未配置（需配置 DEEPSEEK_API_KEY 后可用），原有审核流程不受影响。</div>{% endif %}"
     "{% if not drive_configured %}"
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
-    "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}?v=2\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
+    "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}?v=3\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
     "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.size }}</span><span class=\"chip wait\">待审核</span>{% if f.source == \"baidu\" %}<span class=\"chip\">百度</span>{% elif f.source == \"google\" %}<span class=\"chip\">谷歌</span>{% endif %}</div></div><div class=\"airow\">{% if f.ai %}<span class=\"chip {% if f.ai.verdict == '可疑' %}bad{% elif f.ai.verdict == '通过' %}{% elif f.ai.verdict == 'failed' %}wait{% else %}sample{% endif %}\">AI：{% if f.ai.verdict == 'failed' %}未能审核{% else %}{{ f.ai.verdict }}{% endif %}</span><span class=\"note\">{{ f.ai.reason }}{% if f.ai.confidence is not none %}（置信度 {{ f.ai.confidence }}）{% endif %}{% if f.ai.note %} · {{ f.ai.note }}{% endif %}</span>{% if f.ai.verdict == 'failed' %}<form method=\"post\" action=\"/admin/ai_review\" style=\"display:inline\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn\">重试初审</button></form>{% endif %}{% elif ai_configured %}<span class=\"note\">尚未 AI 初审</span><form method=\"post\" action=\"/admin/ai_review\" style=\"display:inline\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn\">AI 初审</button></form>{% endif %}</div>"
     "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a>"
     "<form class=\"renameform\" method=\"post\" action=\"/rename\" style=\"display:inline-flex\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
@@ -2718,7 +2804,7 @@ ADMIN_PAGE = (
     + "</style></head><body><div class=\"wrap\" id=\"admin-main\"><h1>待审核文件</h1>{% if ai_configured %}<div class=\"card section\"><span class=\"note\">上传后自动审核：AI 通过的文件会自动发布；可疑、无法判断或调用失败的留在待审核等站长人工看。</span></div>{% else %}<div class=\"card section warn\">AI 审核未配置（需配置 DEEPSEEK_API_KEY 后可用），原有审核流程不受影响。</div>{% endif %}"
     "{% if not drive_configured %}"
     "<div class=\"card section warn\"><strong>云盘暂未连接</strong><br>这里没有列出任何真实云盘文件。</div>"
-    "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}?v=2\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
+    "{% elif files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}?v=3\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
     "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.size }}</span><span class=\"chip wait\">待审核</span>{% if f.source == \"baidu\" %}<span class=\"chip\">百度</span>{% elif f.source == \"google\" %}<span class=\"chip\">谷歌</span>{% endif %}</div></div><div class=\"airow\">{% if f.ai %}<span class=\"chip {% if f.ai.verdict == '可疑' %}bad{% elif f.ai.verdict == '通过' %}{% elif f.ai.verdict == 'failed' %}wait{% else %}sample{% endif %}\">AI：{% if f.ai.verdict == 'failed' %}未能审核{% else %}{{ f.ai.verdict }}{% endif %}</span><span class=\"note\">{{ f.ai.reason }}{% if f.ai.confidence is not none %}（置信度 {{ f.ai.confidence }}）{% endif %}{% if f.ai.note %} · {{ f.ai.note }}{% endif %}</span>{% if f.ai.verdict == 'failed' %}<form method=\"post\" action=\"/admin/ai_review\" style=\"display:inline\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn\">重试初审</button></form>{% endif %}{% elif ai_configured %}<span class=\"note\">尚未 AI 初审</span><form method=\"post\" action=\"/admin/ai_review\" style=\"display:inline\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\"><button class=\"btn\">AI 初审</button></form>{% endif %}</div>"
     "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a>"
     "<form class=\"renameform\" method=\"post\" action=\"/rename\" style=\"display:inline-flex\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
@@ -2739,7 +2825,7 @@ ADMIN_PUBLISHED_PAGE = (
     + BASE_CSS
     + "</style></head><body><div class=\"wrap\" id=\"admin-main\"><h1>已发布管理</h1>"
     "<p class=\"note\">这里可以把已发布的文件移到回收站，熟人就再也下载不到了。回收站里的文件不在列表里，需要去云盘回收站看。</p>"
-    "{% if files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}?v=2\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
+    "{% if files %}<div class=\"card section\">{% for f in files %}<div class=\"file\">{% if f.is_image or f.is_video %}<img class=\"thumb\" src=\"/thumb/{{ f.id }}?v=3\" loading=\"lazy\" onerror=\"this.style.display='none'\">{% else %}<div class=\"fic\">{{ f.ext }}</div>{% endif %}"
     "<div class=\"fmain\"><div class=\"fname\">{{ f.name }}</div><div class=\"fmeta\"><span>{{ f.kind }}</span><span>·</span><span>{{ f.size }}</span></div></div>"
     "<div class=\"actions\"><a class=\"btn\" href=\"/view/{{ f.id }}\" target=\"_blank\">打开预览</a>"
     "<form class=\"renameform\" method=\"post\" action=\"/rename\" style=\"display:inline-flex\"><input type=\"hidden\" name=\"file_id\" value=\"{{ f.id }}\">"
@@ -3522,7 +3608,7 @@ def upload():
             return jsonify({"ok": True, "msg": msg})
         return redirect(f"/?msg={msg}")
     service = drive_service()
-    if service is None:
+    if service is None and not _use_baidu_meta():
         return redirect("/?msg=云盘暂未连接，上传暂不可用，请联系站长")
     uploads = request.files.getlist("file")
     uploads = [u for u in uploads if u and u.filename]
@@ -3692,7 +3778,7 @@ def view(file_id):
     if file_id.startswith("bd:"):
         return _baidu_view(file_id)
     service = drive_service()
-    if service is None:
+    if service is None and not _use_baidu_meta():
         return "云盘暂未连接", 503
     try:
         meta = get_file(service, file_id)
@@ -3788,7 +3874,7 @@ def download(file_id):
     if file_id.startswith("bd:"):
         return _baidu_download(file_id)
     service = drive_service()
-    if service is None:
+    if service is None and not _use_baidu_meta():
         return "云盘暂未连接，下载暂不可用", 503
     try:
         meta = get_file(service, file_id)
@@ -4084,7 +4170,7 @@ def feedback_submit():
     if len(text) > 500:
         text = text[:500]
     service = drive_service()
-    if service is None:
+    if service is None and not _use_baidu_meta():
         return redirect("/?msg=云盘暂未连接，意见暂无法保存#feedback")
     items = _read_feedback(service)  # newest first
     import time as _t, random as _r
@@ -4106,7 +4192,7 @@ def feedback_resolve():
         return _proxy_post_to_backend("/feedback/resolve")
     fid = request.form.get("file_id") or request.form.get("id") or ""
     service = drive_service()
-    if service is None:
+    if service is None and not _use_baidu_meta():
         return "云盘暂未连接", 503
     items = _read_feedback(service)
     for it in items:
@@ -4152,7 +4238,7 @@ def comments_list(file_id):
     if not _access_granted():
         return {"error": "请先输入访问口令"}, 403
     service = drive_service()
-    if service is None:
+    if service is None and not _use_baidu_meta():
         return {"error": "云盘暂未连接"}, 503
     if not _published_file_exists(service, file_id):
         return {"comments": []}
@@ -4168,7 +4254,7 @@ def comments_post(file_id):
     if not _access_granted():
         return {"error": "请先输入访问口令"}, 403
     service = drive_service()
-    if service is None:
+    if service is None and not _use_baidu_meta():
         return {"error": "云盘暂未连接"}, 503
     if not _published_file_exists(service, file_id):
         return {"error": "文件不存在或已删除"}, 404
@@ -5065,8 +5151,8 @@ def admin_announcement():
     if _is_relay():
         return _proxy_to_backend("/admin/announcement")
     import html as _html
-    service = drive_service()
-    raw = _read_announcement_raw(service) if service else None
+    service = drive_service()  # _announcement_baidu_fix
+    raw = _read_announcement_raw(service)
     title = (raw.get("title") if raw else "") or ANNOUNCEMENT_DEFAULT_TITLE
     body = raw.get("body") if raw else ANNOUNCEMENT_DEFAULT_BODY
     msg = request.args.get("msg", "")
@@ -5091,7 +5177,7 @@ def admin_announcement_save():
     if _is_relay():
         return _proxy_post_to_backend("/admin/announcement")
     service = drive_service()
-    if service is None:
+    if service is None and not _baidu_enabled():
         return redirect("/admin/announcement?msg=云盘暂未连接，保存失败")
     title = (request.form.get("title") or "").strip() or ANNOUNCEMENT_DEFAULT_TITLE
     body = request.form.get("body") or ""
@@ -5453,7 +5539,7 @@ def approve():
         _log("审核通过", _name)
         return redirect("/admin")
     service = drive_service()
-    if service is None:
+    if service is None and not _use_baidu_meta():
         return "云盘暂未连接", 503
     if not file_id or _admin_file_or_403(service, file_id) is None:
         return "该文件不在待审核里，无法通过", 403
@@ -5493,7 +5579,7 @@ def reject():
         _log("审核不通过", meta.get("name", file_id))
         return redirect("/admin")
     service = drive_service()
-    if service is None:
+    if service is None and not _use_baidu_meta():
         return "云盘暂未连接", 503
     if not file_id or _admin_file_or_403(service, file_id) is None:
         return "该文件不在待审核里，无法处理", 403
@@ -5550,7 +5636,7 @@ def admin_delete():
         _log("删除已发布", _meta.get("server_filename", file_id))
         return redirect("/admin/published")
     service = drive_service()
-    if service is None:
+    if service is None and not _use_baidu_meta():
         return "云盘暂未连接", 503
     try:
         meta = get_file(service, file_id)
@@ -5610,7 +5696,7 @@ def admin_comments_delete():
     if _is_relay():
         return _proxy_post_to_backend("/admin/comments/delete")
     service = drive_service()
-    if service is None:
+    if service is None and not _use_baidu_meta():
         return redirect("/admin/comments")
     cid = request.form.get("id") or ""
     items = _read_comments(service)
@@ -5720,7 +5806,7 @@ def _thumb_impl(file_id):
     if file_id.startswith("bd:"):
         return _baidu_thumb(file_id)
     service = drive_service()
-    if service is None:
+    if service is None and not _use_baidu_meta():
         return "云盘暂未连接", 503
     try:
         meta = get_file(service, file_id)
@@ -5859,7 +5945,7 @@ def preview_img(file_id):
     if file_id.startswith("bd:"):
         return _baidu_preview_img(file_id)
     service = drive_service()
-    if service is None:
+    if service is None and not _use_baidu_meta():
         return "云盘暂未连接", 503
     try:
         meta = get_file(service, file_id)
@@ -5903,7 +5989,7 @@ def rename():
         # Rename form posts here in relay mode too; backend checks admin gate itself
         return _proxy_post_to_backend("/rename")
     service = drive_service()
-    if service is None:
+    if service is None and not _use_baidu_meta():
         return "云盘暂未连接", 503
     file_id = request.form.get("file_id", "")
     new_name = (request.form.get("new_name", "") or "").strip()
@@ -5963,7 +6049,7 @@ def folder_create():
     if not code or not _access_granted():
         return redirect("/?msg=请先输入访问口令")
     service = drive_service()
-    if service is None:
+    if service is None and not _use_baidu_meta():
         return redirect("/?msg=云盘暂未连接，无法新建文件夹#published")
     name = _safe_filename(request.form.get("name", ""))
     if not name or name == "全部" or len(name) > 50:
@@ -6002,7 +6088,7 @@ def folder_move():
     if not code or not _access_granted():
         return redirect("/?msg=请先输入访问口令")
     service = drive_service()
-    if service is None:
+    if service is None and not _use_baidu_meta():
         return redirect("/?msg=云盘暂未连接，无法移动#published")
     dest_id = (request.form.get("dest_folder_id") or "").strip()
     raw = request.form.get("file_ids", "") or ""
@@ -6210,6 +6296,282 @@ def _no_store_files_api(resp):
             resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
             resp.headers["Pragma"] = "no-cache"
             resp.headers["Expires"] = "0"
+    except Exception:
+        pass
+    return resp
+
+
+# ================= 下载进度条注入（新增） =================
+_DL_JS = """
+<script id="_DL_HELPER">
+(function(){
+  if(window.__dlReady) return; window.__dlReady = 1;
+
+  function el(tag, css, txt){
+    var d = document.createElement(tag);
+    if(css) d.style.cssText = css;
+    if(txt != null) d.textContent = txt;
+    return d;
+  }
+
+  function overlay(name){
+    var ov = document.getElementById('__dlov');
+    if(!ov){
+      ov = el('div', 'position:fixed;left:0;right:0;top:0;bottom:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;box-sizing:border-box');
+      ov.id = '__dlov';
+      var card = el('div', 'background:#fff;border-radius:16px;padding:18px;width:100%;max-width:340px;font-family:system-ui,sans-serif');
+      card.innerHTML = '<div id="__dlnm" style="font-size:14px;font-weight:700;color:#17211a;word-break:break-all;margin-bottom:12px"></div>'
+        + '<div style="background:#eef1ea;border-radius:999px;height:10px;overflow:hidden"><div id="__dlbar" style="width:0%;height:100%;background:#2f7d4f;transition:width .2s"></div></div>'
+        + '<div id="__dltx" style="font-size:12px;color:#6b756c;margin-top:10px">准备下载…</div>'
+        + '<div id="__dlclose" style="text-align:center;margin-top:14px;font-size:13px;color:#2f7d4f;font-weight:700">取消</div>';
+      ov.appendChild(card);
+      document.body.appendChild(ov);
+      document.getElementById('__dlclose').onclick = function(){ if(ov.__xhr) try{ov.__xhr.abort()}catch(e){}; ov.style.display='none'; };
+    }
+    ov.style.display = 'flex';
+    document.getElementById('__dlnm').textContent = name || '文件';
+    document.getElementById('__dlbar').style.width = '0%';
+    document.getElementById('__dltx').textContent = '连接中…';
+    return ov;
+  }
+
+  window.__dl = function(url, name){
+    var ov = overlay(name);
+    var bar = document.getElementById('__dlbar');
+    var tx = document.getElementById('__dltx');
+    var x = new XMLHttpRequest();
+    ov.__xhr = x;
+    x.open('GET', url, true);
+    x.responseType = 'blob';
+    x.onprogress = function(e){
+      if(e.lengthComputable && e.total > 0){
+        var pct = Math.round(e.loaded / e.total * 100);
+        bar.style.width = pct + '%';
+        tx.textContent = pct + '%  (' + (e.loaded/1048576).toFixed(1) + ' / ' + (e.total/1048576).toFixed(1) + ' MB)';
+      } else {
+        tx.textContent = (e.loaded/1048576).toFixed(1) + ' MB';
+      }
+    };
+    x.onload = function(){
+      if(x.status >= 400){
+        tx.textContent = '下载失败：HTTP ' + x.status;
+        return;
+      }
+      var blob = x.response;
+      var a = document.createElement('a');
+      var objUrl = URL.createObjectURL(blob);
+      a.href = objUrl;
+      a.download = name || 'file';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function(){
+        try{ URL.revokeObjectURL(objUrl); }catch(e){}
+        if(a.parentNode) a.parentNode.removeChild(a);
+        ov.style.display = 'none';
+      }, 3000);
+      tx.textContent = '已完成，正在保存…';
+      bar.style.width = '100%';
+    };
+    x.onerror = function(){ tx.textContent = '下载失败：网络错误'; };
+    x.onabort = function(){ ov.style.display = 'none'; };
+    x.send();
+  };
+
+  // 点击瓦片：图片走原预览；其他文件直接下载（带进度条）
+  document.addEventListener('click', function(e){
+    var t = e.target;
+    while(t && t !== document.body && !(t.classList && t.classList.contains('tile'))) t = t.parentNode;
+    if(!t || !t.classList || !t.classList.contains('tile')) return;
+    if(t.dataset.isimg === '1' || t.dataset.isvid === '1') return;   // 图片/视频保留原预览
+    var url = t.dataset.dl;
+    if(!url) return;
+    e.preventDefault();
+    e.stopPropagation();
+    var nmEl = t.querySelector('.tile-name');
+    var nm = nmEl ? nmEl.textContent : (t.dataset.name || 'file');
+    window.__dl(url, nm);
+  }, true);
+  window.__dlReady = 2;
+})();
+</script>
+"""
+
+
+@app.after_request
+def _inject_download_js(resp):
+    try:
+        if resp.mimetype == "text/html" and not resp.direct_passthrough:
+            _d = resp.get_data(as_text=True)
+            if "</body>" in _d and "_DL_HELPER" not in _d:
+                _d = _d.replace("</body>", _DL_JS + "</body>", 1)
+                resp.set_data(_d)
+    except Exception:
+        pass
+    return resp
+
+
+# ================= 图片转码显示（HEIC/PNG 等统一转 JPEG） =================
+@app.route("/img/<path:file_id>")
+def img_view(file_id):
+    """把云盘里的图片转成浏览器能显示的 JPEG（HEIC 也能显示）。"""
+    if not file_id.startswith("bd:"):
+        return "不支持", 404
+    if not _baidu_enabled():
+        return "百度源暂未连接", 503
+    try:
+        meta = _baidu_meta(file_id[3:])
+    except Exception:
+        return "文件不存在", 404
+    gate = _baidu_gate(meta)
+    if gate == "need_gate":
+        return "请先输入访问口令", 403
+    if gate == "need_admin":
+        return "该文件尚未发布", 403
+    if gate is None:
+        return "文件不存在", 404
+    try:
+        import requests as _rq
+        tok = _baidu_token()
+        r = _rq.get(meta["dlink"], params={"access_token": tok},
+                    headers={"User-Agent": "pan.baidu.com"}, stream=True, timeout=60)
+        data = bytearray()
+        for chunk in r.iter_content(chunk_size=65536):
+            data.extend(chunk)
+            if len(data) > 40 * 1024 * 1024:
+                raise RuntimeError("image too large")
+        data = bytes(data)
+        from PIL import Image, ImageOps
+        im = Image.open(io.BytesIO(data))
+        im = ImageOps.exif_transpose(im)
+        im.thumbnail((1600, 1600))
+        if im.mode in ("RGBA", "LA", "P"):
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            alpha = im.convert("RGBA").split()[3]
+            bg.paste(im.convert("RGBA"), mask=alpha)
+            im = bg
+        else:
+            im = im.convert("RGB")
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=85, optimize=True)
+        return Response(out.getvalue(), headers={"Content-Type": "image/jpeg",
+                                                 "Cache-Control": "public, max-age=86400"})
+    except Exception as _e:
+        print("[img] convert failed: %s" % _e, flush=True)
+        return "图片转换失败", 500
+
+
+# ================= 图片预览改用转码接口（新增） =================
+_IMG_FIX_JS = """
+<script id="_IMG_FIX">
+(function(){
+  if(window.__imgFixReady) return; window.__imgFixReady = 1;
+  function boot(){
+    if(typeof window.openPreview !== 'function'){ setTimeout(boot, 300); return; }
+    var orig = window.openPreview;
+    window.openPreview = function(t){
+      orig.apply(this, arguments);
+      try{
+        if(!t || !t.dataset || t.dataset.isimg !== '1') return;
+        var id = t.dataset.id;
+        setTimeout(function(){
+          var mid = document.getElementById('pvMid');
+          var og  = document.getElementById('pvOrig');
+          var th  = document.getElementById('pvThumb');
+          var pg  = document.getElementById('pvProg');
+          var rw  = document.getElementById('pvRetryWrap');
+          if(rw) rw.style.display = 'none';
+          if(th) th.style.display = 'none';
+          if(og) og.style.display = 'none';
+          if(mid){
+            mid.style.display = 'block';
+            mid.src = '/img/' + id + '?t=' + Date.now();
+          }
+          if(pg) pg.textContent = 'HEIC/高清图已自动转码显示';
+        }, 60);
+      }catch(e){}
+    };
+  }
+  boot();
+})();
+</script>
+"""
+
+
+@app.after_request
+def _inject_img_fix(resp):
+    return resp  # 已由 /view 服务端转码解决，停用前端覆盖
+    try:
+        if resp.mimetype == "text/html" and not resp.direct_passthrough:
+            _d = resp.get_data(as_text=True)
+            if "</body>" in _d and "_IMG_FIX" not in _d:
+                _d = _d.replace("</body>", _IMG_FIX_JS + "</body>", 1)
+                resp.set_data(_d)
+    except Exception:
+        pass
+    return resp
+
+
+# ================= 音视频在线播放（新增） =================
+_MEDIA_JS = """
+<script id="_MEDIA_PLAYER">
+(function(){
+  if(window.__mediaReady) return; window.__mediaReady = 1;
+
+  function ov(title, kind, id){
+    var box = document.getElementById('__mplayer');
+    if(!box){
+      box = document.createElement('div');
+      box.id = '__mplayer';
+      box.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:10000;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box';
+      box.innerHTML = '<div style="width:100%;max-width:520px;background:#101410;border-radius:16px;padding:14px">'
+        + '<div id="__mpTitle" style="color:#cfe6d7;font-size:13px;font-weight:700;margin-bottom:10px;word-break:break-all"></div>'
+        + '<div id="__mpBody"></div>'
+        + '<div style="text-align:center;margin-top:12px"><span id="__mpClose" style="color:#48ad7d;font-weight:800;font-size:14px;padding:6px 18px">关闭</span></div>'
+        + '</div>';
+      document.body.appendChild(box);
+      document.getElementById('__mpClose').onclick = function(){
+        var b = document.getElementById('__mpBody');
+        if(b) b.innerHTML = '';
+        box.style.display = 'none';
+      };
+    }
+    document.getElementById('__mpTitle').textContent = title || '';
+    var body = document.getElementById('__mpBody');
+    if(kind === 'video'){
+      body.innerHTML = '<video id="__v" controls playsinline preload="metadata" style="width:100%;border-radius:10px;background:#000" src="/view/' + id + '"></video>';
+    } else {
+      body.innerHTML = '<audio id="__a" controls preload="metadata" style="width:100%" src="/view/' + id + '"></audio>'
+        + '<div style="color:#8b948c;font-size:12px;margin-top:8px">正在加载音频…</div>';
+    }
+    box.style.display = 'flex';
+  }
+
+  document.addEventListener('click', function(e){
+    var t = e.target;
+    while(t && t !== document.body && !(t.classList && t.classList.contains('tile'))) t = t.parentNode;
+    if(!t || !t.classList || !t.classList.contains('tile')) return;
+    var isVid = t.dataset.isvid === '1';
+    var isAud = t.dataset.isaud === '1';
+    if(!isVid && !isAud) return;
+    e.preventDefault();
+    e.stopPropagation();
+    var nmEl = t.querySelector('.tile-name');
+    var nm = nmEl ? nmEl.textContent : (t.dataset.name || '媒体');
+    ov(nm, isVid ? 'video' : 'audio', t.dataset.id);
+  }, true);
+})();
+</script>
+"""
+
+
+@app.after_request
+def _inject_media_player(resp):
+    try:
+        if resp.mimetype == "text/html" and not resp.direct_passthrough:
+            _d = resp.get_data(as_text=True)
+            if "</body>" in _d and "_MEDIA_PLAYER" not in _d:
+                _d = _d.replace("</body>", _MEDIA_JS + "</body>", 1)
+                resp.set_data(_d)
     except Exception:
         pass
     return resp
