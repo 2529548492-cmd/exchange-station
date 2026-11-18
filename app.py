@@ -7566,7 +7566,7 @@ _AI_REC_JS = """
       var box=card.querySelector('[data-box]');
       var upd=card.querySelector('[data-upd]');
       if(upd)upd.textContent=j.time?('更新 '+j.time.slice(11,16)):'';
-      if(!j||!j.ok){if(box)box.innerHTML='<p class="uix-sub">统计加载失败</p>';return;}
+      if(!j||!j.ok){if(box)box.innerHTML='<p class="uix-sub">'+((j&&j.error)||'统计加载失败')+'</p>';return;}
       var ai=j.ai||{},lc=j.local||{},dk=j.disk||{};
       var cells=[
         ['已发布',j.published||0,lc.published?('本地 '+lc.published):''],
@@ -7960,6 +7960,9 @@ def _baidu_pending():
 
 @app.route("/api/admin_stats")
 def api_admin_stats():
+    # _STATS_AUTH 只有站长能看统计
+    if not _is_manager():
+        return jsonify({"ok": False, "error": "需要站长口令"}), 403
     now = time.time()
     if _ADMIN_STATS_CACHE["payload"] is not None and now - _ADMIN_STATS_CACHE["at"] < 30:
         return jsonify(_ADMIN_STATS_CACHE["payload"])
