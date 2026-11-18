@@ -59,9 +59,6 @@ except Exception as _e:
     _heif_ok = False
     print("[heif] pillow-heif not available: %s" % _e, flush=True)
 
-# ????????????????? EXCHANGE_DATA_DIR ???Windows/Linux ???
-_DATA_DIR = os.environ.get("EXCHANGE_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
-
 app = Flask(__name__)
 
 PENDING_FOLDER_ID = os.environ.get(
@@ -779,7 +776,7 @@ def _relay_read_baidu_refresh():
 def _stored_baidu_refresh():
     try:
         import json as _lj
-        with io.open(os.path.join(_DATA_DIR, "baidu_token.json"), 'r', encoding='utf-8') as _lf:
+        with io.open(r'C:\exchange-station\baidu_token.json', 'r', encoding='utf-8') as _lf:
             _lv = _lj.load(_lf).get('refresh_token')
         if _lv:
             return _lv.strip()
@@ -797,7 +794,7 @@ def _stored_baidu_refresh():
 def _persist_baidu_refresh(access_token, refresh_token):
     try:
         import json as _wj, time as _wt, io as _wi
-        with _wi.open(os.path.join(_DATA_DIR, "baidu_token.json"), 'w', encoding='utf-8') as _wf:
+        with _wi.open(r'C:\exchange-station\baidu_token.json', 'w', encoding='utf-8') as _wf:
             _wj.dump({'refresh_token': refresh_token, 'updated': _wt.strftime('%Y-%m-%d %H:%M:%S')}, _wf)
     except Exception as _we:
         print('[baidu-token] local persist failed: %s' % _we, flush=True)
@@ -1082,12 +1079,23 @@ def _baidu_upload_bytes(path, data):
     tok = _baidu_token()
     url = "https://pan.baidu.com/rest/2.0/xpan/file"
     params = {"method": "upload", "path": path, "ondup": "overwrite", "access_token": tok}
-    r = _rq.post(url, params=params,
-                 files={"file": (path.rsplit("/", 1)[-1], io.BytesIO(data))}, headers={"User-Agent": "pan.baidu.com"}, timeout=120)
-    j = r.json() or {}
-    if j.get("errno") not in (None, 0):
-        raise RuntimeError("baidu upload failed")
-    return j
+    last = None
+    for _attempt in range(4):
+        try:
+            with _BAIDU_UP_LOCK:
+                r = _rq.post(url, params=params,
+                             files={"file": (path.rsplit("/", 1)[-1], io.BytesIO(data))},
+                             headers={"User-Agent": "pan.baidu.com"}, timeout=180)
+                j = r.json() or {}
+                time.sleep(0.12)
+            errno = j.get("errno")
+            if errno in (None, 0):
+                return j
+            last = RuntimeError("baidu upload errno=%s" % errno)
+        except Exception as e:
+            last = e
+        time.sleep(1.0 + 1.2 * _attempt)
+    raise last if last else RuntimeError("baidu upload failed")
 
 
 def _baidu_upload_stream(path, stream):
@@ -1145,16 +1153,44 @@ def _baidu_upload_stream(path, stream):
             url = "https://d.pcs.baidu.com/rest/2.0/pcs/superfile2"
             params = {"method": "upload", "path": path, "type": "tmpfile",
                       "uploadid": uploadid, "partseq": idx, "access_token": tok}
-            r = _rq.post(url, params=params,
-                         files={"file": (path.rsplit("/", 1)[-1], io.BytesIO(data))}, headers={"User-Agent": "pan.baidu.com"},
-                         timeout=120)
-            jj = r.json() or {}
-            if jj.get("errno") not in (None, 0):
-                raise RuntimeError("baidu superfile upload failed")
-        created = _baidu_api_post("file", {"method": "create"},
-                                  {"path": path, "size": size, "isdir": 0,
-                                   "uploadid": uploadid,
-                                   "block_list": json.dumps(block_list)})
+            _last2 = None
+            for _att2 in range(4):
+                try:
+                    with _BAIDU_UP_LOCK:
+                        r = _rq.post(url, params=params,
+                                     files={"file": (path.rsplit("/", 1)[-1], io.BytesIO(data))},
+                                     headers={"User-Agent": "pan.baidu.com"},
+                                     timeout=300)
+                        jj = r.json() or {}
+                        time.sleep(0.12)
+                    if jj.get("errno") in (None, 0):
+                        _last2 = None
+                        break
+                    _last2 = RuntimeError("superfile errno=%s" % jj.get("errno"))
+                except Exception as e:
+                    _last2 = e
+                time.sleep(1.0 + 1.2 * _att2)
+            if _last2 is not None:
+                raise _last2
+        created = None
+        _last3 = None
+        for _att3 in range(4):
+            try:
+                with _BAIDU_UP_LOCK:
+                    created = _baidu_api_post("file", {"method": "create"},
+                                              {"path": path, "size": size, "isdir": 0,
+                                               "uploadid": uploadid,
+                                               "block_list": json.dumps(block_list)})
+                    time.sleep(0.12)
+                if created and created.get("errno") in (None, 0):
+                    _last3 = None
+                    break
+                _last3 = RuntimeError("create errno=%s" % (created or {}).get("errno"))
+            except Exception as e:
+                _last3 = e
+            time.sleep(1.0 + 1.2 * _att3)
+        if _last3 is not None:
+            raise _last3
         print("[baidu-upload] create=%s" % json.dumps(created, ensure_ascii=False)[:400], flush=True)
         return created.get("fs_id")
     finally:
@@ -1490,6 +1526,14 @@ def _baidu_view(file_id):
                                                "Cache-Control": "public, max-age=86400"})
         except Exception as _e:
             print("[view] heic convert failed: %s" % _e, flush=True)
+    # _MEDIA_CACHE_V1：音视频优先走服务器本地缓存，命中就秒开
+    try:
+        if low in _MEDIA_EXTS:
+            _cached = _media_cache_serve(file_id, name, meta)
+            if _cached is not None:
+                return _cached
+    except Exception as _e:
+        print("[media cache] hook failed: %s" % _e, flush=True)
     return _baidu_stream_response(meta, name, ctype, "inline")
 
 
@@ -2904,6 +2948,17 @@ def api_files():
         elif _priority_backend() == "baidu":
             baidu_err = True
         files, folders = _merge_mixed(gfiles, gfolders, bfiles, bfolders)
+
+        # _MEDIA_WARM：已发布的音视频自动预热到服务器本地缓存
+        try:
+            for _mf in files:
+                _mn = (_mf.get("name") or "")
+                _ext = _mn.rsplit(".", 1)[-1].lower() if "." in _mn else ""
+                if _ext in _MEDIA_EXTS and _mf.get("id"):
+                    threading.Thread(target=_media_precache_by_id,
+                                     args=(_mf["id"], _mn), daemon=True).start()
+        except Exception:
+            pass
         out["published"] = files
         out["folders"] = folders
         _dl_attach(files, service)
@@ -4727,6 +4782,14 @@ def _auto_ai_process(file_id):
         else:
             res = _ai_review_one(file_id)
         verdict = (res or {}).get("verdict")
+        if verdict == "通过":
+            try:
+                _conf = float((res or {}).get("confidence") or 0)
+            except Exception:
+                _conf = 0
+            if _conf and _conf < 0.6:
+                _ai_set_result(file_id, "可疑", "AI 置信度较低（%.2f），请人工确认" % _conf)
+                return
         if verdict != "通过":
             # 失败/未配置统一记为“AI 未能审核”，绝不自动发布、绝不自动驳回
             if verdict in ("failed", "unconfigured"):
@@ -4748,12 +4811,27 @@ def _auto_ai_process(file_id):
                                    res.get("confidence"),
                                    f"大小未对齐暂未自动发布：云盘里只有 {_fmt_size(actual)}，上传时应为 {_fmt_size(expected)}，请等上传完成后再人工通过")
                     return
+            if not AI_AUTO_PUBLISH_ENABLED:
+                _ai_set_result(file_id, "通过", res.get("reason") or "内容初审通过",
+                               res.get("confidence"),
+                               "AI 建议通过，请在审核区人工确认后再发布")
+                return
             with _AI_LOCK:
                 _AI_PUBLISHED[file_id] = dict(_AI_RESULTS.get(file_id) or {})
             if not _baidu_move_pending_to_published(file_id[3:], name):
                 _ai_set_result(file_id, "通过", res.get("reason") or "内容初审通过",
                                res.get("confidence"), "自动发布失败（移动失败），请人工通过")
                 return
+            try:
+                with _AI_LOCK:
+                    if file_id in _AI_RESULTS:
+                        _AI_RESULTS[file_id]["name"] = name
+            except Exception:
+                pass
+            try:
+                _AI_REC_CACHE["payload"] = None
+            except Exception:
+                pass
             _auto_log("AI 自动发布", name)
             return
         service = drive_service()
@@ -4778,6 +4856,11 @@ def _auto_ai_process(file_id):
                                res.get("confidence"),
                                f"大小未对齐暂未自动发布：云盘里只有 {_fmt_size(actual)}，上传时应为 {_fmt_size(expected)}，请等上传完成后再人工通过")
                 return
+        if not AI_AUTO_PUBLISH_ENABLED:
+            _ai_set_result(file_id, "通过", res.get("reason") or "内容初审通过",
+                           res.get("confidence"),
+                           "AI 建议通过，请在审核区人工确认后再发布")
+            return
         with _AI_LOCK:
             # 注意：这里不能调 _ai_get_result（它自己也要拿 _AI_LOCK，非重入锁会死锁）
             _AI_PUBLISHED[file_id] = dict(_AI_RESULTS.get(file_id) or {})
@@ -4787,6 +4870,16 @@ def _auto_ai_process(file_id):
             _ai_set_result(file_id, "通过", res.get("reason") or "内容初审通过",
                            res.get("confidence"), "自动发布失败（移动失败），请人工通过")
             return
+        try:
+            with _AI_LOCK:
+                if file_id in _AI_RESULTS:
+                    _AI_RESULTS[file_id]["name"] = name
+        except Exception:
+            pass
+        try:
+            _AI_REC_CACHE["payload"] = None
+        except Exception:
+            pass
         _auto_log("AI 自动发布", name)
     except Exception as e:
         print(f"[auto-ai] failed for {file_id}: {e}", flush=True)
@@ -4873,6 +4966,11 @@ def _ai_set_result(file_id, verdict, reason, confidence=None, note=""):
                     _AI_SHARED_CACHE["at"] = time.time()
     except Exception as e:
         print(f"[ai-shared] set write failed: {e}", flush=True)
+    # _AI_REC_INVALIDATE：记录变化后让统计缓存失效，下次请求重新统计
+    try:
+        _AI_REC_CACHE["payload"] = None
+    except Exception:
+        pass
 
 
 def _ai_fetch_head(service, file_id, limit):
@@ -4951,9 +5049,13 @@ def _ai_call_deepseek_vision(data_url, filename, size):
     base = (_env("DEEPSEEK_API_BASE") or "https://api.deepseek.com").rstrip("/")
     model = _env("DEEPSEEK_VISION_MODEL") or "deepseek-flash"
     key = _ai_current_key() or ""
-    system = ("你是文件分享站的初审员。只看图片画面内容，按站内通用口径判断"
-              "是否可能违规：色情、暴力血腥、极端主义、毒品、赌博诈骗、恶意软件、"
-              "明显侵权盗版。只输出严格 JSON，形如 {\"verdict\": \"通过|可疑|无法判断\", "
+    system = ("你是文件分享站的初审员，只判断图片是否明显违规。规则："
+              "普通照片、风景、人像、自拍、宠物、美食、截图、表情包、文档照片、"
+              "动漫插画、商品图，一律判「通过」；"
+              "只有出现以下情况才判「可疑」：裸露色情、血腥暴力、极端主义标识、"
+              "毒品、赌博诈骗、二维码收款骗局、明显盗版资源截图。"
+              "拿不准时判「通过」，不要因为看不清就判可疑。"
+              "只输出严格 JSON，形如 {\"verdict\": \"通过|可疑\", "
               "\"reason\": \"一句话理由\", \"confidence\": 0.0到1.0}，不要输出其他文字。")
     user_text = ("请审查这张图片的画面内容。文件名：" + filename
                  + "，大小：" + _fmt_size(size)
@@ -5082,8 +5184,13 @@ def _ai_pending_meta(file_id):
             return None
         if _baidu_area(raw.get("path") or "") != "pending":
             return None
-        return {"id": file_id, "name": raw.get("server_filename") or file_id,
-                "size": raw.get("size"), "source": "baidu"}
+        _nm = (raw.get("server_filename") or raw.get("filename") or "").strip()
+        if not _nm:
+            _p = (raw.get("path") or "").rstrip("/")
+            _nm = _p.rsplit("/", 1)[-1] if "/" in _p else file_id
+        return {"id": file_id, "name": _nm or file_id,
+                "size": raw.get("size"), "source": "baidu",
+                "path": raw.get("path") or ""}
     service = drive_service()
     if service is None:
         return None
@@ -6164,7 +6271,7 @@ if __name__ == "__main__":
 
 
 # ================= AI 设置（新增功能） =================
-AI_KEY_FILE = os.path.join(_DATA_DIR, "ai_key.txt")
+AI_KEY_FILE = r"C:\exchange-station\ai_key.txt"
 
 
 def _ai_current_key():
@@ -6605,6 +6712,615 @@ def _inject_media_player(resp):
             if "</body>" in _d and "_MEDIA_PLAYER" not in _d:
                 _d = _d.replace("</body>", _MEDIA_JS + "</body>", 1)
                 resp.set_data(_d)
+    except Exception:
+        pass
+    return resp
+
+# ===== /site/ 静态下载站（国内 IP 直连兜底，不经 Cloudflare）=====
+
+# ===== /site/ 静态下载站（国内 IP 直连兜底，不经 Cloudflare）=====
+def _site_send(rel_path):
+    import mimetypes
+    from flask import send_file, abort, request
+    root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "site"))
+    target = os.path.normpath(os.path.join(root, rel_path))
+    if not target.startswith(root) or not os.path.isfile(target):
+        abort(404)
+    gz = target + ".gz"
+    use_gzip = ("gzip" in (request.headers.get("Accept-Encoding") or "")) and os.path.isfile(gz)
+    resp = send_file(gz if use_gzip else target, mimetype=mimetypes.guess_type(target)[0] or "application/octet-stream")
+    if use_gzip:
+        resp.headers["Content-Encoding"] = "gzip"
+    rel = rel_path.replace("\\", "/")
+    if rel.startswith("assets/"):
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    else:
+        resp.headers["Cache-Control"] = "public, max-age=600"
+    return resp
+
+
+
+# ===== /site/ 静态下载站（国内 IP 直连兜底，不经 Cloudflare）=====
+def _site_send(rel_path):
+    import mimetypes
+    from flask import send_file, abort, request
+    root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "site"))
+    target = os.path.normpath(os.path.join(root, rel_path))
+    if not target.startswith(root) or not os.path.isfile(target):
+        abort(404)
+    gz = target + ".gz"
+    use_gzip = ("gzip" in (request.headers.get("Accept-Encoding") or "")) and os.path.isfile(gz)
+    resp = send_file(gz if use_gzip else target, mimetype=mimetypes.guess_type(target)[0] or "application/octet-stream")
+    if use_gzip:
+        resp.headers["Content-Encoding"] = "gzip"
+    rel = rel_path.replace("\\", "/")
+    if rel.startswith("assets/"):
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    else:
+        resp.headers["Cache-Control"] = "public, max-age=600"
+    return resp
+
+
+
+# ===== /site/ 静态下载站（国内 IP 直连兜底，不经 Cloudflare）=====
+def _site_send(rel_path):
+    import mimetypes
+    from flask import send_file, abort, request
+    root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "site"))
+    target = os.path.normpath(os.path.join(root, rel_path))
+    if not target.startswith(root) or not os.path.isfile(target):
+        abort(404)
+    gz = target + ".gz"
+    use_gzip = ("gzip" in (request.headers.get("Accept-Encoding") or "")) and os.path.isfile(gz)
+    resp = send_file(gz if use_gzip else target, mimetype=mimetypes.guess_type(target)[0] or "application/octet-stream")
+    if use_gzip:
+        resp.headers["Content-Encoding"] = "gzip"
+    rel = rel_path.replace("\\", "/")
+    if rel.startswith("assets/"):
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    else:
+        resp.headers["Cache-Control"] = "public, max-age=600"
+    return resp
+
+
+
+# ===== /site/ 静态下载站（国内 IP 直连兜底，不经 Cloudflare）=====
+def _site_send(rel_path):
+    import mimetypes
+    from flask import send_file, abort, request
+    root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "site"))
+    target = os.path.normpath(os.path.join(root, rel_path))
+    if not target.startswith(root) or not os.path.isfile(target):
+        abort(404)
+    gz = target + ".gz"
+    use_gzip = ("gzip" in (request.headers.get("Accept-Encoding") or "")) and os.path.isfile(gz)
+    resp = send_file(gz if use_gzip else target, mimetype=mimetypes.guess_type(target)[0] or "application/octet-stream")
+    if use_gzip:
+        resp.headers["Content-Encoding"] = "gzip"
+    rel = rel_path.replace("\\", "/")
+    if rel.startswith("assets/"):
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    else:
+        resp.headers["Cache-Control"] = "public, max-age=600"
+    return resp
+
+
+
+# ===== /site/ 静态下载站（国内 IP 直连兜底，不经 Cloudflare）=====
+def _site_send(rel_path):
+    import mimetypes
+    from flask import send_file, abort, request
+    root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "site"))
+    target = os.path.normpath(os.path.join(root, rel_path))
+    if not target.startswith(root) or not os.path.isfile(target):
+        abort(404)
+    gz = target + ".gz"
+    use_gzip = ("gzip" in (request.headers.get("Accept-Encoding") or "")) and os.path.isfile(gz)
+    resp = send_file(gz if use_gzip else target, mimetype=mimetypes.guess_type(target)[0] or "application/octet-stream")
+    if use_gzip:
+        resp.headers["Content-Encoding"] = "gzip"
+    rel = rel_path.replace("\\", "/")
+    if rel.startswith("assets/"):
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    else:
+        resp.headers["Cache-Control"] = "public, max-age=600"
+    return resp
+
+
+
+# ===== /site/ 静态下载站（国内 IP 直连兜底，不经 Cloudflare）=====
+def _site_send(rel_path):
+    import mimetypes
+    from flask import send_file, abort, request
+    root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "site"))
+    target = os.path.normpath(os.path.join(root, rel_path))
+    if not target.startswith(root) or not os.path.isfile(target):
+        abort(404)
+    gz = target + ".gz"
+    use_gzip = ("gzip" in (request.headers.get("Accept-Encoding") or "")) and os.path.isfile(gz)
+    resp = send_file(gz if use_gzip else target, mimetype=mimetypes.guess_type(target)[0] or "application/octet-stream")
+    if use_gzip:
+        resp.headers["Content-Encoding"] = "gzip"
+    rel = rel_path.replace("\\", "/")
+    if rel.startswith("assets/"):
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    else:
+        resp.headers["Cache-Control"] = "public, max-age=600"
+    return resp
+
+
+@app.route("/site")
+def _site_redirect_root():
+    return redirect("/site/")
+
+
+@app.route("/site/")
+@app.route("/site/<path:sub>")
+def _site_static(sub=""):
+    import os as _os
+    from flask import abort
+    root = _os.path.normpath(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "site"))
+    if not sub:
+        sub = "index.html"
+    candidates = [sub]
+    if sub.endswith("/"):
+        candidates = [sub + "index.html"]
+    else:
+        candidates.append(sub + "/index.html")
+        candidates.append(sub + ".html")
+    for c in candidates:
+        t = _os.path.normpath(_os.path.join(root, c))
+        if t.startswith(root) and _os.path.isfile(t):
+            return _site_send(c)
+    abort(404)
+
+# ===== /site/ 根路径别名（站点用了根绝对路径，需兜底）=====
+_SITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "site")
+_SITE_IMG_EXT = (".jpg", ".jpeg", ".png", ".svg", ".ico", ".webp", ".woff2", ".txt", ".xml", ".json")
+
+
+@app.route("/<name>")
+def _site_alias_file(name):
+    import os as _os
+    from flask import send_file, abort
+    if not name.lower().endswith(_SITE_IMG_EXT):
+        abort(404)
+    target = _os.path.normpath(_os.path.join(_SITE_DIR, name))
+    if target.startswith(_os.path.normpath(_SITE_DIR)) and _os.path.isfile(target):
+        return send_file(target)
+    abort(404)
+
+
+def _site_alias_page(section):
+    import os as _os
+    from flask import send_file, abort
+    target = _os.path.join(_SITE_DIR, section, "index.html")
+    if _os.path.isfile(target):
+        return send_file(target)
+    abort(404)
+
+
+@app.route("/sponsor/")
+def _site_alias_sponsor():
+    return _site_alias_page("sponsor")
+
+
+@app.route("/download/")
+def _site_alias_download():
+    return _site_alias_page("download")
+
+
+@app.route("/changelog/")
+def _site_alias_changelog():
+    return _site_alias_page("changelog")
+
+
+@app.route("/faq/")
+def _site_alias_faq():
+    return _site_alias_page("faq")
+
+# ===== _PV_CLICK_FIX：委托点击，修复图片预览点不开 =====
+_PV_CLICK_FIX_JS = """
+<script id="_PV_CLICK_FIX">
+(function(){
+  if(document.__pvClickFix){return;}
+  document.__pvClickFix=true;
+
+  function visible(id){
+    var el=document.getElementById(id);
+    if(!el){return false;}
+    var st=getComputedStyle(el);
+    return st.display!=='none' && st.visibility!=='hidden';
+  }
+
+  // 任何弹层开着时，不再处理图块点击（避免关闭时点击穿透又开出新弹窗）
+  function anyOverlayOpen(){
+    if(visible('previewOverlay')){return true;}
+    if(visible('__mp')){return true;}
+    if(visible('moveOverlay')){return true;}
+    if(visible('annOverlay')){return true;}
+    return false;
+  }
+
+  function findTile(e){
+    var el=e.target;
+    var t=null;
+    if(el&&el.closest){ t=el.closest('.tile'); }
+    if(!t||!t.closest||!t.closest('#albumGrid')){
+      try{
+        var pts=document.elementsFromPoint(e.clientX,e.clientY)||[];
+        for(var i=0;i<pts.length;i++){
+          var c=pts[i].closest?pts[i].closest('.tile'):null;
+          if(c&&c.closest&&c.closest('#albumGrid')){ t=c; break; }
+        }
+      }catch(_){}
+    }
+    if(t&&t.closest&&t.closest('#albumGrid')){return t;}
+    return null;
+  }
+
+  document.addEventListener('click',function(e){
+    // 1) 公告卡片：点任意位置关闭
+    try{
+      var ov=document.getElementById('annOverlay');
+      if(ov&&getComputedStyle(ov).display!=='none'){
+        var inCard=false;
+        var pts0=document.elementsFromPoint(e.clientX,e.clientY)||[];
+        for(var j=0;j<pts0.length;j++){
+          if(pts0[j].closest&&pts0[j].closest('.ann-card')){inCard=true;break;}
+        }
+        if(inCard){
+          ov.classList.remove('ann-show');
+          ov.style.display='none';
+          setTimeout(function(){ try{ov.parentNode&&ov.parentNode.removeChild(ov);}catch(_){} }, 60);
+          e.stopPropagation();
+          return;
+        }
+      }
+    }catch(_){}
+
+    // _FOLDER_BTN_FIX 2.5) 新建文件夹按钮兜底
+    try{
+      var nfEl=e.target;
+      if(nfEl&&nfEl.closest&&nfEl.closest('#newFolderBtn')){
+        var nfForm=document.getElementById('newFolderForm');
+        if(nfForm){
+          nfForm.style.display='flex';
+          var nfInput=nfForm.querySelector('input[name="name"]');
+          if(nfInput){ try{ nfInput.focus(); }catch(_){} }
+        }
+        e.stopPropagation();
+        return;
+      }
+    }catch(_){}
+
+    // 2) 有弹层开着：交给弹层自己的逻辑，禁止再开新预览
+    if(anyOverlayOpen()){
+      return;
+    }
+
+    // 3) 图块点击 -> 预览
+    var t=findTile(e);
+    if(!t){return;}
+    if(e.target&&e.target.closest&&e.target.closest('.dlstatus')){return;}
+    var sm=false;
+    try{sm=(typeof selectMode!=='undefined')&&selectMode;}catch(_){}
+    if(sm){
+      try{
+        var id=t.dataset.id;
+        if(selected.has(id)){selected.delete(id);t.classList.remove('selected');}
+        else{selected.add(id);t.classList.add('selected');}
+        if(typeof updateSel==='function')updateSel();
+      }catch(_){}
+    }else if(typeof openPreview==='function'){
+      e.stopPropagation();
+      if(e.stopImmediatePropagation){e.stopImmediatePropagation();}
+      openPreview(t);
+    }
+  },true);
+})();
+</script>
+"""
+
+
+@app.after_request
+def _pv_click_fix(resp):
+    try:
+        if resp.direct_passthrough:
+            return resp
+        if resp.mimetype == "text/html" and resp.status_code == 200:
+            data = resp.get_data(as_text=True)
+            if "_PV_CLICK_FIX" not in data and "</body>" in data:
+                data = data.replace("</body>", _PV_CLICK_FIX_JS + "</body>", 1)
+                resp.set_data(data)
+    except Exception:
+        pass
+    return resp
+
+# ===== _ANN_EVERY_LOAD：公告每次进入都弹一次 =====
+@app.after_request
+def _ann_every_load(resp):
+    try:
+        if resp.direct_passthrough:
+            return resp
+        if resp.mimetype == "text/html" and resp.status_code == 200:
+            data = resp.get_data(as_text=True)
+            if "sessionStorage.getItem('exchange_ann_closed')" in data:
+                data = data.replace("sessionStorage.getItem('exchange_ann_closed')", "false")
+                resp.set_data(data)
+    except Exception:
+        pass
+    return resp
+
+# ===== _MEDIA_CACHE_V1：音视频本地缓存 =====
+_MEDIA_EXTS = {"mp4", "mov", "mkv", "webm", "avi", "mp3", "wav", "m4a", "flac", "ogg"}
+_MEDIA_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "media_cache")
+_MEDIA_RUNNING = set()
+_MEDIA_LOCK = threading.Lock()
+
+
+def _media_cache_file(file_id, name):
+    import re as _re
+    safe = _re.sub(r"[^0-9A-Za-z._-]", "_", (name or "media"))[-80:]
+    return os.path.join(_MEDIA_CACHE_DIR, file_id.replace(":", "_") + "__" + safe)
+
+
+def _media_precache(file_id, name, meta):
+    with _MEDIA_LOCK:
+        if file_id in _MEDIA_RUNNING:
+            return
+        _MEDIA_RUNNING.add(file_id)
+    try:
+        os.makedirs(_MEDIA_CACHE_DIR, exist_ok=True)
+        dst = _media_cache_file(file_id, name)
+        if os.path.isfile(dst) and os.path.getsize(dst) > 0:
+            return
+        tmp = dst + ".part"
+        import requests as _rq
+        tok = _baidu_token()
+        with _rq.get(meta["dlink"], params={"access_token": tok},
+                     headers={"User-Agent": "pan.baidu.com"}, stream=True, timeout=300) as r:
+            r.raise_for_status()
+            with open(tmp, "wb") as fh:
+                for ch in r.iter_content(256 * 1024):
+                    if ch:
+                        fh.write(ch)
+        _media_faststart(tmp)
+        os.replace(tmp, dst)
+        print("[media cache] ready %s %.1fMB" % (file_id, os.path.getsize(dst) / 1048576.0), flush=True)
+    except Exception as e:
+        print("[media cache] fail %s: %s" % (file_id, e), flush=True)
+    finally:
+        with _MEDIA_LOCK:
+            _MEDIA_RUNNING.discard(file_id)
+
+
+def _media_cache_serve(file_id, name, meta):
+    dst = _media_cache_file(file_id, name)
+    if os.path.isfile(dst) and os.path.getsize(dst) > 0:
+        from flask import send_file
+        resp = send_file(dst, conditional=True)
+        resp.headers["Accept-Ranges"] = "bytes"
+        resp.headers["Cache-Control"] = "public, max-age=86400"
+        return resp
+    threading.Thread(target=_media_precache, args=(file_id, name, meta), daemon=True).start()
+    return None
+
+def _media_precache_by_id(file_id, name):
+    """按 id 预热媒体缓存（发布列表加载时触发）。"""
+    try:
+        dst = _media_cache_file(file_id, name)
+        if os.path.isfile(dst) and os.path.getsize(dst) > 0:
+            return
+        if file_id.startswith("bd:"):
+            meta = _baidu_meta(file_id[3:])
+        else:
+            meta = get_file(drive_service(), file_id) or {}
+        if not meta or not meta.get("dlink"):
+            return
+        _media_precache(file_id, name, meta)
+    except Exception as e:
+        print("[media warm] %s" % e, flush=True)
+
+def _media_faststart(path):
+    """无损重排 MP4：把 moov 移到文件头（纯 Python，无需 ffmpeg）。"""
+    try:
+        if not path.lower().endswith((".mp4", ".mov", ".m4v")):
+            return
+        out = path + ".fs.mp4"
+        moved, reason = faststart(path, out)
+        if moved and os.path.isfile(out) and os.path.getsize(out) == os.path.getsize(path):
+            os.replace(out, path)
+            print("[media faststart] ok %s" % os.path.basename(path), flush=True)
+        else:
+            try:
+                os.remove(out)
+            except Exception:
+                pass
+            print("[media faststart] skip %s (%s)" % (os.path.basename(path), reason), flush=True)
+    except Exception as e:
+        print("[media faststart] fail: %s" % e, flush=True)
+
+
+# 百度上传串行锁（限量 QPS，避免批量上传被限流）
+_BAIDU_UP_LOCK = threading.Lock()
+
+
+# AI 自动发布开关：False = 只给建议，文件留在审核区等人工确认
+AI_AUTO_PUBLISH_ENABLED = True
+
+# ===== _AI_RECORDS_V1：AI 审核记录面板 =====
+@app.route("/api/ai_records")
+def api_ai_records():
+    now = time.time()
+    with _AI_REC_LOCK:
+        payload = _AI_REC_CACHE["payload"]
+        at = _AI_REC_CACHE["at"]
+        building = _AI_REC_CACHE["building"]
+    if payload is None:
+        if not building:
+            with _AI_REC_LOCK:
+                _AI_REC_CACHE["building"] = True
+            threading.Thread(target=_ai_rec_build, daemon=True).start()
+        return jsonify({"ok": True, "records": [], "total": 0, "building": True})
+    if now - at > 120 and not building:
+        with _AI_REC_LOCK:
+            _AI_REC_CACHE["building"] = True
+        threading.Thread(target=_ai_rec_build, daemon=True).start()
+    return jsonify(payload)
+
+
+def _ai_rec_build():
+    try:
+        mem = {}
+        try:
+            with _AI_LOCK:
+                mem = dict(_AI_RESULTS)
+        except Exception:
+            pass
+        base = {}
+        try:
+            svc = _ai_shared_service()
+            if svc is not None or _use_baidu_meta():
+                got = _ai_read_shared(svc)
+                if isinstance(got, dict):
+                    base = got
+        except Exception:
+            pass
+        merged = dict(base)
+        merged.update(mem)
+
+        pub_names = {}
+        try:
+            if _baidu_enabled():
+                for it in (_baidu_published()[0] or []):
+                    pub_names[it.get("id")] = it.get("name")
+        except Exception:
+            pass
+
+        today = time.strftime("%Y-%m-%d")
+        out = []
+        for fid, row in merged.items():
+            if not isinstance(row, dict):
+                continue
+            if (row.get("verdict") or "") != "通过":
+                continue
+            t = row.get("time") or ""
+            nm = pub_names.get(fid) or row.get("name") or fid
+            out.append({
+                "id": fid,
+                "name": nm,
+                "confidence": row.get("confidence"),
+                "time": t,
+                "short_time": t[5:16] if len(t) >= 16 else t,
+                "today": t[:10] == today,
+            })
+        out.sort(key=lambda x: x.get("time") or "", reverse=True)
+        payload = {"ok": True, "records": out[:120], "total": len(out)}
+        with _AI_REC_LOCK:
+            _AI_REC_CACHE["payload"] = payload
+            _AI_REC_CACHE["at"] = time.time()
+    except Exception as e:
+        print("[ai-rec] build failed: %s" % e, flush=True)
+    finally:
+        with _AI_REC_LOCK:
+            _AI_REC_CACHE["building"] = False
+
+
+_AI_REC_CACHE = {"payload": None, "at": 0.0, "building": False}
+_AI_REC_LOCK = threading.Lock()
+
+
+_AI_REC_JS = """
+<style id="_AI_REC_STYLE">
+#aiRecFab{position:fixed;left:14px;bottom:76px;z-index:39;display:flex;align-items:center;gap:6px;
+  padding:8px 12px;border-radius:999px;background:var(--surface,#fffefa);border:1px solid var(--line,#e2e0d6);
+  box-shadow:0 8px 22px rgba(0,0,0,.18);font-size:12px;color:var(--ink,#202b23);cursor:pointer;user-select:none}
+#aiRecFab b{color:var(--green,#176a4c)}
+#aiRecPanel{position:fixed;left:14px;bottom:126px;z-index:40;width:min(420px,calc(100vw - 28px));
+  max-height:min(56vh,420px);overflow:auto;border-radius:16px;background:var(--surface,#fffefa);
+  border:1px solid var(--line,#e2e0d6);box-shadow:0 18px 44px rgba(0,0,0,.28);padding:12px 14px;display:none}
+#aiRecPanel.open{display:block}
+#aiRecPanel .arc-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
+#aiRecPanel .arc-head b{font-size:13px;color:var(--ink,#202b23)}
+#aiRecPanel .arc-close{border:none;background:transparent;font-size:18px;line-height:1;color:var(--muted,#66746b);cursor:pointer}
+#aiRecPanel .arc-stat{font-size:12px;color:var(--muted,#66746b);margin-bottom:8px}
+#aiRecPanel .arc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:8px}
+#aiRecPanel .arc-item{display:flex;flex-direction:column;gap:3px;text-decoration:none;color:var(--ink,#202b23)}
+#aiRecPanel .arc-thumb{display:block;width:100%;aspect-ratio:1/1;border-radius:9px;background-size:cover;background-position:center;background-color:#e6e6e0;border:1px solid var(--line,#e2e0d6)}
+#aiRecPanel .arc-name{font-size:10px;line-height:1.2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#aiRecPanel .arc-time{font-size:10px;color:var(--muted,#66746b)}
+</style>
+<script id="_AI_RECORDS_V1">
+(function(){
+  function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+  function init(){
+    if(document.getElementById('aiRecFab')){return;}
+    var fab=document.createElement('div');
+    fab.id='aiRecFab';
+    fab.innerHTML='<span>AI 记录</span><b data-cnt>-</b>';
+    document.body.appendChild(fab);
+    var panel=document.createElement('div');
+    panel.id='aiRecPanel';
+    panel.innerHTML='<div class="arc-head"><b>AI 审核记录</b><button class="arc-close" type="button" data-close>&times;</button></div>'
+      +'<div class="arc-stat" data-stat>加载中…</div><div class="arc-grid" data-grid></div>';
+    document.body.appendChild(panel);
+    fab.addEventListener('click',function(e){
+      e.stopPropagation();
+      panel.classList.toggle('open');
+      if(panel.classList.contains('open')){ load(); }
+    });
+    panel.addEventListener('click',function(e){
+      e.stopPropagation();
+      if(e.target && e.target.closest && e.target.closest('[data-close]')){ panel.classList.remove('open'); }
+    });
+    load();
+  }
+  function load(){
+    var panel=document.getElementById('aiRecPanel');
+    if(!panel){return;}
+    var stat=panel.querySelector('[data-stat]');
+    var grid=panel.querySelector('[data-grid]');
+    var fabCnt=document.querySelector('#aiRecFab b');
+    fetch('/api/ai_records',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(j){
+      var list=(j&&j.records)||[];
+      if(j&&j.building){ if(stat)stat.textContent='正在统计…'; return; }
+      var todayN=0;
+      for(var i=0;i<list.length;i++){ if(list[i].today) todayN++; }
+      var total=(j&&j.total)||list.length;
+      if(fabCnt) fabCnt.textContent=String(todayN);
+      if(stat) stat.innerHTML='今日 AI 通过 <b>'+todayN+'</b> 个 · 累计 <b>'+total+'</b> 条';
+      if(!grid) return;
+      if(!list.length){ grid.innerHTML='<p class="note" style="margin:0;font-size:12px">还没有 AI 通过记录</p>'; return; }
+      var html='';
+      for(var k=0;k<list.length;k++){
+        var it=list[k];
+        html+='<a class="arc-item" href="/view/'+encodeURIComponent(it.id)+'" target="_blank" title="'+esc(it.name)+'">'
+             +'<span class="arc-thumb" style="background-image:url(/thumb/+encodeURIComponent(it.id))"></span>'
+             +'<span class="arc-name">'+esc(it.name)+'</span>'
+             +'<span class="arc-time">'+esc(it.short_time)+(it.today?' · 今天':'')+'</span></a>';
+      }
+      grid.innerHTML=html;
+    }).catch(function(){ if(stat)stat.textContent='加载失败'; });
+  }
+  if(document.readyState==='loading'){ document.addEventListener('DOMContentLoaded',function(){ setTimeout(init,1000); }); }
+  else { setTimeout(init,1000); }
+  setInterval(function(){ try{ load(); }catch(e){} }, 15000);
+})();
+</script>
+"""
+
+
+@app.after_request
+def _ai_records_inject(resp):
+    try:
+        if resp.direct_passthrough:
+            return resp
+        if resp.mimetype == "text/html" and resp.status_code == 200:
+            data = resp.get_data(as_text=True)
+            if "_AI_RECORDS_V1" not in data and "tab-published" in data and "</body>" in data:
+                data = data.replace("</body>", _AI_REC_JS + "</body>", 1)
+                resp.set_data(data)
     except Exception:
         pass
     return resp
