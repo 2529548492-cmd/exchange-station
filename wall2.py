@@ -274,8 +274,11 @@ WALL2_JS = r"""
       for (var i = 0; i < all.length; i++){
         all[i].style.transform = ''; all[i].style.width = '';
         all[i].style.height = ''; all[i].style.visibility = '';
-        all[i].style.opacity = ''; all[i].style.display = '';
+        all[i].style.opacity = '';
       }
+      // 退出卡片墙后重新套用「分类 / 文件夹 / 搜索」过滤，
+      // 否则会把 applyFilter 设置的 display:none 一起清掉，导致所有文件都显示出来。
+      try { if (typeof applyFilter === 'function') applyFilter(); } catch (e) {}
       pieces = []; P = Q = 0;
     }
   }
