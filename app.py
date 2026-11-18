@@ -7311,29 +7311,58 @@ _AI_REC_LOCK = threading.Lock()
 
 
 _AI_REC_JS = """
-<style id="_AI_REC_STYLE">
-#aiRecFab{position:fixed;left:14px;bottom:76px;z-index:39;display:flex;align-items:center;gap:6px;
+<style id="_UIX_STYLE">
+#aiRecFab,#upQFab,#statFab{position:fixed;z-index:39;display:flex;align-items:center;gap:6px;
   padding:8px 12px;border-radius:999px;background:var(--surface,#fffefa);border:1px solid var(--line,#e2e0d6);
   box-shadow:0 8px 22px rgba(0,0,0,.18);font-size:12px;color:var(--ink,#202b23);cursor:pointer;user-select:none}
-#aiRecFab b{color:var(--green,#176a4c)}
-#aiRecPanel{position:fixed;left:14px;bottom:126px;z-index:40;width:min(420px,calc(100vw - 28px));
-  max-height:min(56vh,420px);overflow:auto;border-radius:16px;background:var(--surface,#fffefa);
-  border:1px solid var(--line,#e2e0d6);box-shadow:0 18px 44px rgba(0,0,0,.28);padding:12px 14px;display:none}
-#aiRecPanel.open{display:block}
-#aiRecPanel .arc-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
-#aiRecPanel .arc-head b{font-size:13px;color:var(--ink,#202b23)}
-#aiRecPanel .arc-close{border:none;background:transparent;font-size:18px;line-height:1;color:var(--muted,#66746b);cursor:pointer}
-#aiRecPanel .arc-stat{font-size:12px;color:var(--muted,#66746b);margin-bottom:8px}
-#aiRecPanel .arc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:8px}
-#aiRecPanel .arc-item{display:flex;flex-direction:column;gap:3px;text-decoration:none;color:var(--ink,#202b23)}
-#aiRecPanel .arc-thumb{display:block;width:100%;aspect-ratio:1/1;border-radius:9px;background-size:cover;background-position:center;background-color:#e6e6e0;border:1px solid var(--line,#e2e0d6)}
-#aiRecPanel .arc-name{font-size:10px;line-height:1.2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#aiRecPanel .arc-time{font-size:10px;color:var(--muted,#66746b)}
+#aiRecFab{left:14px;bottom:76px}
+#upQFab{right:14px;bottom:76px}
+#statFab{right:14px;bottom:128px;display:none}
+#aiRecFab b,#upQFab b,#statFab b{color:var(--green,#176a4c)}
+#aiRecPanel,#upQPanel{position:fixed;z-index:40;width:min(440px,calc(100vw - 28px));max-height:min(60vh,460px);
+  overflow:auto;border-radius:16px;background:var(--surface,#fffefa);border:1px solid var(--line,#e2e0d6);
+  box-shadow:0 18px 44px rgba(0,0,0,.28);padding:12px 14px;display:none}
+#aiRecPanel{left:14px;bottom:126px}
+#upQPanel{right:14px;bottom:126px}
+#aiRecPanel.open,#upQPanel.open{display:block}
+.uix-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
+.uix-head b{font-size:13px}
+.uix-close{border:none;background:transparent;font-size:18px;line-height:1;color:var(--muted,#66746b);cursor:pointer}
+.uix-sub{font-size:12px;color:var(--muted,#66746b);margin-bottom:8px}
+.ai-group{margin:10px 0 4px;font-size:12px;font-weight:600;color:var(--muted,#66746b)}
+.ai-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:8px}
+.ai-item{display:flex;flex-direction:column;gap:3px;text-decoration:none;color:var(--ink,#202b23)}
+.ai-thumb{display:block;width:100%;aspect-ratio:1/1;border-radius:9px;background-size:cover;background-position:center;background-color:#e6e6e0;border:1px solid var(--line,#e2e0d6)}
+.ai-name{font-size:10px;line-height:1.2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ai-time{font-size:10px;color:var(--muted,#66746b)}
+.q-row{display:flex;flex-direction:column;gap:4px;padding:7px 0;border-bottom:1px dashed var(--line,#e2e0d6)}
+.q-row:last-child{border-bottom:none}
+.q-line{display:flex;align-items:center;gap:8px}
+.q-name{flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.q-chip{font-size:10px;padding:1px 7px;border-radius:999px;white-space:nowrap}
+.q-wait{background:#eee9dc;color:#7a6b45}
+.q-run{background:#e3eefc;color:#215ea8}
+.q-ok{background:#e3f0e8;color:#14573f}
+.q-fail{background:#fbe4e4;color:#a02121}
+.q-bar{height:4px;border-radius:999px;background:#eee;overflow:hidden}
+.q-bar i{display:block;height:100%;width:0;background:var(--green,#176a4c);transition:width .2s}
+.q-err{font-size:10px;color:#a02121}
+.admin-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}
+.as-box{background:var(--surface,#fffefa);border:1px solid var(--line,#e2e0d6);border-radius:12px;padding:10px 12px}
+.as-k{font-size:11px;color:var(--muted,#66746b)}
+.as-v{font-size:20px;font-weight:700;margin-top:2px}
+.as-v small{font-size:11px;font-weight:400;color:var(--muted,#66746b);margin-left:4px}
 </style>
-<script id="_AI_RECORDS_V1">
+<script id="_UIX_V2">
 (function(){
+  if(window.__uixV2){return;}
+  window.__uixV2=true;
   function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-  function init(){
+  function pad(n){return n<10?'0'+n:''+n;}
+  function dayStr(offset){var d=new Date();d.setDate(d.getDate()-(offset||0));return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());}
+
+  // ============ AI 记录（按日期分组） ============
+  function initAi(){
     if(document.getElementById('aiRecFab')){return;}
     var fab=document.createElement('div');
     fab.id='aiRecFab';
@@ -7341,50 +7370,232 @@ _AI_REC_JS = """
     document.body.appendChild(fab);
     var panel=document.createElement('div');
     panel.id='aiRecPanel';
-    panel.innerHTML='<div class="arc-head"><b>AI 审核记录</b><button class="arc-close" type="button" data-close>&times;</button></div>'
-      +'<div class="arc-stat" data-stat>加载中…</div><div class="arc-grid" data-grid></div>';
+    panel.innerHTML='<div class="uix-head"><b>AI 审核记录</b><button class="uix-close" type="button" data-close>&times;</button></div><div class="uix-sub" data-stat>加载中…</div><div data-body></div>';
     document.body.appendChild(panel);
-    fab.addEventListener('click',function(e){
-      e.stopPropagation();
-      panel.classList.toggle('open');
-      if(panel.classList.contains('open')){ load(); }
-    });
-    panel.addEventListener('click',function(e){
-      e.stopPropagation();
-      if(e.target && e.target.closest && e.target.closest('[data-close]')){ panel.classList.remove('open'); }
-    });
-    load();
+    fab.addEventListener('click',function(e){e.stopPropagation();panel.classList.toggle('open');if(panel.classList.contains('open')){loadAi();}});
+    panel.addEventListener('click',function(e){e.stopPropagation();if(e.target&&e.target.closest&&e.target.closest('[data-close]')){panel.classList.remove('open');}});
+    loadAi();
   }
-  function load(){
+  function loadAi(){
     var panel=document.getElementById('aiRecPanel');
     if(!panel){return;}
     var stat=panel.querySelector('[data-stat]');
-    var grid=panel.querySelector('[data-grid]');
+    var body=panel.querySelector('[data-body]');
     var fabCnt=document.querySelector('#aiRecFab b');
     fetch('/api/ai_records',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(j){
       var list=(j&&j.records)||[];
-      if(j&&j.building){ if(stat)stat.textContent='正在统计…'; return; }
+      if(j&&j.building){if(stat)stat.textContent='正在统计…';return;}
       var todayN=0;
-      for(var i=0;i<list.length;i++){ if(list[i].today) todayN++; }
-      var total=(j&&j.total)||list.length;
-      if(fabCnt) fabCnt.textContent=String(todayN);
-      if(stat) stat.innerHTML='今日 AI 通过 <b>'+todayN+'</b> 个 · 累计 <b>'+total+'</b> 条';
-      if(!grid) return;
-      if(!list.length){ grid.innerHTML='<p class="note" style="margin:0;font-size:12px">还没有 AI 通过记录</p>'; return; }
-      var html='';
+      for(var i=0;i<list.length;i++){if(list[i].today)todayN++;}
+      if(fabCnt)fabCnt.textContent=String(todayN);
+      if(stat)stat.innerHTML='今日通过 <b>'+todayN+'</b> 个 · 累计 <b>'+((j&&j.total)||list.length)+'</b> 条';
+      if(!body)return;
+      if(!list.length){body.innerHTML='<p class="uix-sub" style="margin:0">还没有 AI 通过记录</p>';return;}
+      var t0=dayStr(0),t1=dayStr(1);
+      var groups={'今天':[],'昨天':[],'更早':[]};
       for(var k=0;k<list.length;k++){
         var it=list[k];
-        html+='<a class="arc-item" href="/view/'+encodeURIComponent(it.id)+'" target="_blank" title="'+esc(it.name)+'">'
-             +'<span class="arc-thumb" style="background-image:url(/thumb/+encodeURIComponent(it.id))"></span>'
-             +'<span class="arc-name">'+esc(it.name)+'</span>'
-             +'<span class="arc-time">'+esc(it.short_time)+(it.today?' · 今天':'')+'</span></a>';
+        var day=(it.time||'').slice(0,10);
+        if(day===t0)groups['今天'].push(it);
+        else if(day===t1)groups['昨天'].push(it);
+        else groups['更早'].push(it);
       }
-      grid.innerHTML=html;
-    }).catch(function(){ if(stat)stat.textContent='加载失败'; });
+      var html='';
+      ['今天','昨天','更早'].forEach(function(g){
+        var arr=groups[g];
+        if(!arr.length)return;
+        html+='<div class="ai-group">'+g+'（'+arr.length+'）</div><div class="ai-grid">';
+        for(var m=0;m<arr.length;m++){
+          var x=arr[m];
+          html+='<a class="ai-item" href="/view/'+encodeURIComponent(x.id)+'" target="_blank" title="'+esc(x.name)+'">'
+              +'<span class="ai-thumb" style="background-image:url(/thumb/'+encodeURIComponent(x.id)+')"></span>'
+              +'<span class="ai-name">'+esc(x.name)+'</span>'
+              +'<span class="ai-time">'+esc(x.short_time)+'</span></a>';
+        }
+        html+='</div>';
+      });
+      body.innerHTML=html;
+    }).catch(function(){if(stat)stat.textContent='加载失败';});
   }
-  if(document.readyState==='loading'){ document.addEventListener('DOMContentLoaded',function(){ setTimeout(init,1000); }); }
-  else { setTimeout(init,1000); }
-  setInterval(function(){ try{ load(); }catch(e){} }, 15000);
+
+  // ============ 上传队列 ============
+  var Q={},QSEQ=0,QHIDE=0;
+  function qAdd(name){
+    var id='q'+(++QSEQ);
+    Q[id]={name:name||'文件',pct:0,status:'wait',err:''};
+    qRender();return id;
+  }
+  function qSet(id,pct,status,err){
+    var it=Q[id];if(!it)return;
+    if(pct!=null)it.pct=Math.max(it.pct||0,pct);
+    if(status)it.status=status;
+    if(err)it.err=err;
+    qRender();
+  }
+  function qActive(){var n=0;for(var k in Q){if(Q[k].status==='wait'||Q[k].status==='run'||Q[k].status==='uploading')n++;}return n;}
+  function qRender(){
+    var panel=document.getElementById('upQPanel');
+    var fab=document.getElementById('upQFab');
+    if(!panel||!fab)return;
+    var rows=[],done=0,fail=0,total=0;
+    for(var k in Q){total++;
+      var it=Q[k];
+      if(it.status==='success')done++;
+      if(it.status==='fail')fail++;
+    }
+    if(!total){panel.classList.remove('open');fab.style.display='none';return;}
+    fab.style.display='flex';
+    fab.innerHTML='<span>上传队列</span><b>'+done+'/'+total+(fail?(' 失败'+fail):'')+'</b>';
+    var order=Object.keys(Q);
+    for(var i=0;i<order.length;i++){
+      var it=Q[order[i]];
+      var st=it.status,chip='等待',cls='q-wait';
+      if(st==='run'||st==='uploading'){chip='上传中 '+it.pct+'%';cls='q-run';}
+      else if(st==='success'){chip='成功';cls='q-ok';}
+      else if(st==='fail'){chip='失败';cls='q-fail';}
+      var bar=st==='success'?100:(st==='fail'?100:it.pct||0);
+      var col=st==='fail'?'#a02121':'var(--green,#176a4c)';
+      rows.push('<div class="q-row"><div class="q-line"><span class="q-name">'+esc(it.name)+'</span>'
+        +'<span class="q-chip '+cls+'">'+chip+'</span></div>'
+        +'<div class="q-bar"><i style="width:'+bar+'%;background:'+col+'"></i></div>'
+        +(it.err?'<div class="q-err">'+esc(it.err)+'</div>':'')+'</div>');
+    }
+    var body=panel.querySelector('[data-qbody]');
+    if(body)body.innerHTML=rows.join('');
+    var sum=panel.querySelector('[data-qsum]');
+    if(sum)sum.textContent='成功 '+done+' · 失败 '+fail+' · 共 '+total;
+    if(qActive()===0){
+      panel.classList.add('open');
+      clearTimeout(QHIDE);
+      QHIDE=setTimeout(function(){panel.classList.remove('open');},6000);
+    }
+  }
+  function initQueue(){
+    if(document.getElementById('upQPanel')){return;}
+    var panel=document.createElement('div');
+    panel.id='upQPanel';
+    panel.innerHTML='<div class="uix-head"><b>上传队列</b><button class="uix-close" type="button" data-close>&times;</button></div><div class="uix-sub" data-qsum></div><div data-qbody></div>';
+    document.body.appendChild(panel);
+    var fab=document.createElement('div');
+    fab.id='upQFab';
+    fab.style.display='none';
+    fab.innerHTML='<span>上传队列</span><b>-</b>';
+    document.body.appendChild(fab);
+    fab.addEventListener('click',function(e){e.stopPropagation();panel.classList.toggle('open');});
+    panel.addEventListener('click',function(e){e.stopPropagation();if(e.target&&e.target.closest&&e.target.closest('[data-close]'))panel.classList.remove('open');});
+  }
+  function namesFromBody(body){
+    var names=[];
+    try{
+      if(body&&body.getAll){
+        var fs=body.getAll('file');
+        for(var i=0;i<fs.length;i++){names.push(fs[i]&&fs[i].name?fs[i].name:('文件'+(i+1)));}
+      }
+    }catch(e){}
+    if(!names.length)names.push('上传任务');
+    return names;
+  }
+  function hookXHR(){
+    var XO=XMLHttpRequest.prototype.open,XS=XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open=function(m,u){try{this.__u=String(u||'');}catch(e){}return XO.apply(this,arguments);};
+    XMLHttpRequest.prototype.send=function(body){
+      try{
+        var u=this.__u||'';
+        if(u.indexOf('/upload')>=0||u.indexOf('/direct')>=0){
+          var names=namesFromBody(body),ids=[],self=this;
+          for(var i=0;i<names.length;i++){ids.push(qAdd(names[i]));}
+          for(var j=0;j<ids.length;j++){qSet(ids[j],0,'run');}
+          if(this.upload&&this.upload.addEventListener){
+            this.upload.addEventListener('progress',function(e){
+              if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);for(var x=0;x<ids.length;x++){qSet(ids[x],p,'uploading');}}
+            });
+          }
+          this.addEventListener('load',function(){
+            var ok=self.status>=200&&self.status<300,msg='';
+            try{var j=JSON.parse(self.responseText||'{}');if(j.msg)msg=j.msg;if(j.ok===false)ok=false;}catch(e){}
+            for(var x=0;x<ids.length;x++){qSet(ids[x],100,ok?'success':'fail',ok?'':(msg||('HTTP '+self.status)));}
+          });
+          this.addEventListener('error',function(){for(var x=0;x<ids.length;x++){qSet(ids[x],0,'fail','网络错误');}});
+          this.addEventListener('timeout',function(){for(var x=0;x<ids.length;x++){qSet(ids[x],0,'fail','超时');}});
+        }
+      }catch(e){}
+      return XS.apply(this,arguments);
+    };
+  }
+  function hookFetch(){
+    var OF=window.fetch;
+    if(!OF||OF.__uixHooked)return;
+    window.fetch=function(input,init){
+      var url='';try{url=typeof input==='string'?input:(input&&input.url)||'';}catch(e){}
+      var ids=null;
+      try{
+        if(url.indexOf('/upload')>=0){
+          ids=[];var names=['上传任务'];
+          try{if(init&&init.body&&init.body.getAll){names=namesFromBody(init.body);}}catch(e){}
+          for(var i=0;i<names.length;i++){ids.push(qAdd(names[i]));}
+          for(var j=0;j<ids.length;j++){qSet(ids[j],30,'run');}
+        }
+      }catch(e){}
+      var p=OF.apply(this,arguments);
+      if(ids){
+        p.then(function(r){
+          var ok=r&&r.ok;
+          for(var x=0;x<ids.length;x++){qSet(ids[x],100,ok?'success':'fail','');}
+        }).catch(function(){for(var x=0;x<ids.length;x++){qSet(ids[x],0,'fail','网络错误');}});
+      }
+      return p;
+    };
+    window.fetch.__uixHooked=true;
+  }
+
+  // ============ 站长统计 ============
+  function fmtBytes(b){
+    if(!b)return '0 B';
+    if(b<1048576)return (b/1024).toFixed(0)+' KB';
+    if(b<1073741824)return (b/1048576).toFixed(1)+' MB';
+    return (b/1073741824).toFixed(2)+' GB';
+  }
+  function injectStats(){
+    var tab=document.getElementById('tab-admin');
+    if(!tab||tab.querySelector('.admin-stats-card'))return;
+    var card=document.createElement('div');
+    card.className='card section admin-stats-card';
+    card.innerHTML='<div class="section-head"><h2>站长统计</h2><span class="count" data-upd></span></div><div class="admin-stats" data-box><p class="uix-sub" style="margin:0">加载中…</p></div>';
+    tab.insertBefore(card,tab.firstChild);
+    fetch('/api/admin_stats',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(j){
+      var box=card.querySelector('[data-box]');
+      var upd=card.querySelector('[data-upd]');
+      if(upd)upd.textContent=j.time?('更新 '+j.time.slice(11,16)):'';
+      if(!j||!j.ok){if(box)box.innerHTML='<p class="uix-sub">统计加载失败</p>';return;}
+      var ai=j.ai||{},lc=j.local||{},dk=j.disk||{};
+      var cells=[
+        ['已发布',j.published||0,lc.published?('本地 '+lc.published):''],
+        ['待审核',j.pending||0,lc.pending?('本地 '+lc.pending):''],
+        ['今日 AI 通过',ai.today||0,''],
+        ['昨日 AI 通过',ai.yesterday||0,''],
+        ['AI 通过率',(ai.rate||0)+'%',(ai.total||0)+' 通过 / '+(ai.rejected||0)+' 驳回'],
+        ['本地未同步',lc.unsynced||0,fmtBytes(lc.bytes||0)],
+        ['磁盘可用',(dk.free_gb||0)+' GB','共 '+(dk.total_gb||0)+' GB']
+      ];
+      var html='';
+      for(var i=0;i<cells.length;i++){
+        html+='<div class="as-box"><div class="as-k">'+cells[i][0]+'</div><div class="as-v">'+cells[i][1]+(cells[i][2]?'<small>'+esc(cells[i][2])+'</small>':'')+'</div></div>';
+      }
+      if(box)box.innerHTML=html;
+    }).catch(function(){var box=card.querySelector('[data-box]');if(box)box.innerHTML='<p class="uix-sub">统计加载失败</p>';});
+  }
+
+  function boot(){
+    try{initAi();}catch(e){}
+    try{initQueue();}catch(e){}
+    try{hookXHR();}catch(e){}
+    try{hookFetch();}catch(e){}
+    try{injectStats();}catch(e){}
+  }
+  if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',function(){setTimeout(boot,900);});}
+  else{setTimeout(boot,900);}
+  setInterval(function(){try{loadAi();}catch(e){}},15000);
+  setInterval(function(){try{injectStats();}catch(e){}},4000);
 })();
 </script>
 """
@@ -7733,3 +7944,100 @@ try:
     _ls_dirs()
 except Exception:
     pass
+
+# ===== _UIX_V2_STATS 站长统计 =====
+_ADMIN_STATS_CACHE = {"payload": None, "at": 0.0}
+
+
+def _baidu_pending():
+    try:
+        _base, _pub, pend = _baidu_dirs()
+        j = _baidu_api_post("file", {"method": "list"}, {"dir": pend, "order": "time", "limit": 300})
+        return (j or {}).get("list") or []
+    except Exception:
+        return []
+
+
+@app.route("/api/admin_stats")
+def api_admin_stats():
+    now = time.time()
+    if _ADMIN_STATS_CACHE["payload"] is not None and now - _ADMIN_STATS_CACHE["at"] < 30:
+        return jsonify(_ADMIN_STATS_CACHE["payload"])
+    out = {"ok": True}
+    try:
+        pub_baidu = 0
+        pend_baidu = 0
+        try:
+            if _baidu_enabled():
+                pub_baidu = len(_baidu_published()[0] or [])
+                pend_baidu = len(_baidu_pending())
+        except Exception:
+            pass
+
+        local_items = list((_ls_load().get("items") or {}).values())
+        local_pending = len([x for x in local_items if (x.get("status") or "") == "pending"])
+        local_published = len([x for x in local_items if (x.get("status") or "") == "published"])
+        unsynced = len([x for x in local_items if (x.get("up_status") or "") != "done"])
+        local_bytes = sum(int(x.get("size_bytes") or 0) for x in local_items)
+
+        passed = rejected = today = yesterday = 0
+        t_today = time.strftime("%Y-%m-%d")
+        t_yest = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+        try:
+            merged = {}
+            try:
+                with _AI_LOCK:
+                    merged.update(dict(_AI_RESULTS))
+            except Exception:
+                pass
+            try:
+                svc = _ai_shared_service()
+                if svc is not None or _use_baidu_meta():
+                    got = _ai_read_shared(svc)
+                    if isinstance(got, dict):
+                        for k, v in got.items():
+                            merged.setdefault(k, v)
+            except Exception:
+                pass
+            for _fid, row in merged.items():
+                if not isinstance(row, dict):
+                    continue
+                verdict = row.get("verdict") or ""
+                day = (row.get("time") or "")[:10]
+                if verdict == "通过":
+                    passed += 1
+                    if day == t_today:
+                        today += 1
+                    elif day == t_yest:
+                        yesterday += 1
+                elif verdict in ("不通过", "拒绝"):
+                    rejected += 1
+        except Exception:
+            pass
+
+        reviewed = passed + rejected
+        rate = int(round(passed * 100.0 / reviewed)) if reviewed else 0
+        disk_free = disk_total = 0.0
+        try:
+            import shutil
+            dt, du, df = shutil.disk_usage("C:\\")
+            disk_free = round(df / float(2 ** 30), 1)
+            disk_total = round(dt / float(2 ** 30), 1)
+        except Exception:
+            pass
+
+        out.update({
+            "published": pub_baidu + local_published,
+            "pending": pend_baidu + local_pending,
+            "local": {"pending": local_pending, "published": local_published,
+                      "unsynced": unsynced, "bytes": local_bytes},
+            "ai": {"today": today, "yesterday": yesterday, "total": passed,
+                   "rejected": rejected, "rate": rate},
+            "disk": {"free_gb": disk_free, "total_gb": disk_total},
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        _ADMIN_STATS_CACHE["payload"] = out
+        _ADMIN_STATS_CACHE["at"] = now
+    except Exception as e:
+        out["error"] = str(e)[:120]
+    return jsonify(out)
