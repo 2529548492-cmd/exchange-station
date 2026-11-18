@@ -7949,7 +7949,7 @@ except Exception:
 _ADMIN_STATS_CACHE = {"payload": None, "at": 0.0}
 
 
-def _baidu_pending():
+def _baidu_pending_raw():
     try:
         _base, _pub, pend = _baidu_dirs()
         j = _baidu_api_post("file", {"method": "list"}, {"dir": pend, "order": "time", "limit": 300})
@@ -7973,7 +7973,7 @@ def api_admin_stats():
         try:
             if _baidu_enabled():
                 pub_baidu = len(_baidu_published()[0] or [])
-                pend_baidu = len(_baidu_pending())
+                pend_baidu = len(_baidu_pending_raw())
         except Exception:
             pass
 
@@ -8171,3 +8171,25 @@ try:
     app.view_functions["index"] = _cached_index_view
 except Exception as _pc_err:
     print("[page-cache] disabled: %s" % _pc_err, flush=True)
+
+# ===== _ERRLOG_HANDLER：把未处理异常写盘，便于定位 500 =====
+try:
+    from werkzeug.exceptions import HTTPException as _WHTTPException
+
+    @app.errorhandler(Exception)
+    def _errlog_handler(e):
+        if isinstance(e, _WHTTPException):
+            return e
+        try:
+            import traceback as _tb
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "err.log")
+            with io.open(p, "a", encoding="utf-8") as f:
+                f.write("\n===== %s  %s %s =====\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                                       getattr(request, "method", "?"),
+                                                       getattr(request, "path", "?")))
+                _tb.print_exception(type(e), e, e.__traceback__, file=f)
+        except Exception:
+            pass
+        return "服务器内部错误（已记录，请联系站长）", 500
+except Exception as _eh:
+    print("[errlog] disabled: %s" % _eh, flush=True)
