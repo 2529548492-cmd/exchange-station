@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 import hmac
 import io
 import json
+import uuid
 import os
 import tempfile
 import threading
@@ -2959,6 +2960,12 @@ def api_files():
                                      args=(_mf["id"], _mn), daemon=True).start()
         except Exception:
             pass
+        try:
+            _lp = _local_api_items("published")
+            if _lp:
+                files = list(files) + _lp
+        except Exception:
+            pass
         out["published"] = files
         out["folders"] = folders
         _dl_attach(files, service)
@@ -2972,6 +2979,13 @@ def api_files():
             elif _baidu_enabled():
                 notices.append("百度区暂时连不上，只显示谷歌区")
         out["notice"] = "；".join(notices)
+    try:
+        if _is_manager():
+            _lpending = _local_api_items("pending")
+            if _lpending:
+                out["pending"] = list(out.get("pending") or []) + _lpending
+    except Exception:
+        pass
     if _is_manager():
         try:
             try:
@@ -2984,6 +2998,29 @@ def api_files():
             out["pending"] = pending
         except Exception:
             out["pending"] = []
+    # _LOCAL_MERGE_FINAL：本地条目优先展示，网盘同一文件的副本去重
+    try:
+        _lpending = _local_api_items("pending")
+        if _lpending and _is_manager():
+            _bdset = set(x.get("bd_id") for x in _lpending if x.get("bd_id"))
+            _cur = [x for x in (out.get("pending") or []) if x.get("id") not in _bdset]
+            out["pending"] = _lpending + _cur
+        _lpub = _local_api_items("published")
+        if _lpub:
+            _bdset2 = set(x.get("bd_id") for x in _lpub if x.get("bd_id"))
+            _cur2 = [x for x in (out.get("published") or []) if x.get("id") not in _bdset2]
+            # _LOCAL_DEDUPE 按 id 去重，避免同一本地条目重复出现
+            _seen = set()
+            _ded = []
+            for _x in list(_lpub) + list(_cur2):
+                _id = _x.get("id")
+                if _id in _seen:
+                    continue
+                _seen.add(_id)
+                _ded.append(_x)
+            out["published"] = _ded
+    except Exception as _e:
+        print("[local-store] merge failed: %s" % _e, flush=True)
     return jsonify(out)
 
 
@@ -3610,6 +3647,12 @@ def upload():
         except Exception as e:
             return jsonify({"ok": False, "msg": f"中转上传失败：{e}"}), 502
     if _priority_backend() == "baidu":
+        try:
+            _lr = _local_receive_uploads(request.files.getlist("file"))
+            if _lr is not None:
+                return _lr
+        except Exception as _le:
+            print("[local-store] receive failed, fallback to baidu: %s" % _le, flush=True)
         if not _baidu_enabled():
             if request.headers.get("X-Requested-With") == "XMLHttpRequest":
                 return jsonify({"ok": False, "msg": "百度暂未连接，上传暂不可用，请联系站长"}), 503
@@ -3826,6 +3869,8 @@ def _parse_range(range_header, total):
 
 @app.route("/view/<file_id>")
 def view(file_id):
+    if file_id.startswith("lcl:"):
+        return _local_view(file_id)
     """在线预览：已发布文件熟人可看，待审核文件只有站长可看。
     图片、PDF、文本、视频、音频会在浏览器里直接打开，其他类型浏览器会提示下载。"""
     if _is_relay():
@@ -3921,6 +3966,8 @@ def view(file_id):
 
 @app.route("/download/<file_id>")
 def download(file_id):
+    if file_id.startswith("lcl:"):
+        return _local_view(file_id, attach=True)
     code = _env("EXCHANGE_CODE")
     if not _access_granted():
         return redirect("/?msg=请先输入访问口令")
@@ -4832,6 +4879,14 @@ def _auto_ai_process(file_id):
                 _AI_REC_CACHE["payload"] = None
             except Exception:
                 pass
+            # _LOCAL_AI_SYNC：AI 自动发布后，同步对应本地条目为已发布
+            try:
+                for _lid, _li in (_ls_load().get("items") or {}).items():
+                    if _li.get("bd_id") == file_id and _li.get("status") == "pending":
+                        _local_publish(_lid)
+                        break
+            except Exception:
+                pass
             _auto_log("AI 自动发布", name)
             return
         service = drive_service()
@@ -4878,6 +4933,14 @@ def _auto_ai_process(file_id):
             pass
         try:
             _AI_REC_CACHE["payload"] = None
+        except Exception:
+            pass
+        # _LOCAL_AI_SYNC：谷歌分支同样同步本地条目
+        try:
+            for _lid, _li in (_ls_load().get("items") or {}).items():
+                if _li.get("bd_id") == file_id and _li.get("status") == "pending":
+                    _local_publish(_lid)
+                    break
         except Exception:
             pass
         _auto_log("AI 自动发布", name)
@@ -5626,6 +5689,12 @@ def approve():
     if _is_relay():
         return _proxy_post_to_backend("/admin/approve")
     file_id = request.form.get("file_id", "")
+    if (file_id or "").startswith("lcl:"):
+        _ok = _local_publish(file_id)
+        if _ok:
+            _log("审核通过(本地)", file_id)
+            return redirect("/admin")
+        return "发布失败，请重试", 503
     if (file_id or "").startswith("bd:"):
         if not _baidu_enabled():
             return "百度源暂未连接", 503
@@ -5672,6 +5741,10 @@ def reject():
     if _is_relay():
         return _proxy_post_to_backend("/admin/reject")
     file_id = request.form.get("file_id", "")
+    if (file_id or "").startswith("lcl:"):
+        _local_delete(file_id)
+        _log("审核拒绝(本地)", file_id)
+        return redirect("/admin")
     if (file_id or "").startswith("bd:"):
         if not _baidu_enabled():
             return "百度源暂未连接", 503
@@ -5892,6 +5965,8 @@ def admin_logs():
 
 @app.route("/thumb/<file_id>")
 def thumb(file_id):
+    if file_id.startswith("lcl:"):
+        return _local_thumb(file_id)
     _r = _thumb_impl(file_id)
     _resp = _cacheable(_r, 14)
     try:
@@ -6044,6 +6119,8 @@ def _baidu_preview_img(file_id):
 
 @app.route("/preview_img/<file_id>")
 def preview_img(file_id):
+    if file_id.startswith("lcl:"):
+        return _local_thumb(file_id)
     """图片清晰版（1024）：权限与 /thumb 一致，只给已发布（熟人）或待审核（站长）看。
     预览三段式用的中间档：格子缩略图 192 太糊、原图跨境又慢，先给 1024 清晰版
     顶着，再后台取原图；原图失败时也不降回 192。非图片一律 404。"""
@@ -6520,6 +6597,8 @@ def _inject_download_js(resp):
 # ================= 图片转码显示（HEIC/PNG 等统一转 JPEG） =================
 @app.route("/img/<path:file_id>")
 def img_view(file_id):
+    if file_id.startswith("lcl:"):
+        return _local_thumb(file_id)
     """把云盘里的图片转成浏览器能显示的 JPEG（HEIC 也能显示）。"""
     if not file_id.startswith("bd:"):
         return "不支持", 404
@@ -7324,3 +7403,333 @@ def _ai_records_inject(resp):
     except Exception:
         pass
     return resp
+
+# ===== _LOCAL_STORE_V1：本地优先存储（先落地本机，再后台传网盘）=====
+_LS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_store")
+_LS_PENDING = os.path.join(_LS_ROOT, "pending")
+_LS_PUBLISHED = os.path.join(_LS_ROOT, "published")
+_LS_FILES = os.path.join(_LS_ROOT, "files")
+_LS_THUMBS = os.path.join(_LS_ROOT, "thumbs")
+_LS_INDEX = os.path.join(_LS_ROOT, "index.json")
+_LS_LOCK = threading.RLock()
+_LS_INDEX_CACHE = {"items": None, "at": 0.0}
+_LS_UPLOADING = set()
+
+_LS_IMG = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif"}
+_LS_VID = {"mp4", "mov", "mkv", "webm", "avi", "m4v"}
+_LS_AUD = {"mp3", "wav", "m4a", "flac", "ogg", "aac"}
+
+
+def _ls_dirs():
+    for d in (_LS_ROOT, _LS_PENDING, _LS_PUBLISHED, _LS_FILES, _LS_THUMBS):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
+
+
+def _ls_load():
+    _ls_dirs()
+    with _LS_LOCK:
+        now = time.time()
+        if _LS_INDEX_CACHE["items"] is not None and now - _LS_INDEX_CACHE["at"] < 3:
+            return _LS_INDEX_CACHE["items"]
+        data = {"items": {}}
+        try:
+            if os.path.isfile(_LS_INDEX):
+                data = json.load(io.open(_LS_INDEX, encoding="utf-8")) or {"items": {}}
+        except Exception:
+            data = {"items": {}}
+        if not isinstance(data.get("items"), dict):
+            data["items"] = {}
+        _LS_INDEX_CACHE["items"] = data
+        _LS_INDEX_CACHE["at"] = now
+        return data
+
+
+def _ls_save(data):
+    _ls_dirs()
+    tmp = _LS_INDEX + ".tmp"
+    io.open(tmp, "w", encoding="utf-8").write(json.dumps(data, ensure_ascii=False, indent=1))
+    os.replace(tmp, _LS_INDEX)
+    _LS_INDEX_CACHE["items"] = data
+    _LS_INDEX_CACHE["at"] = time.time()
+
+
+def _ls_kind(ext):
+    e = (ext or "").lower()
+    if e in _LS_IMG:
+        return "图片"
+    if e in _LS_VID:
+        return "影音"
+    if e in _LS_AUD:
+        return "影音"
+    if e in ("pdf", "txt", "md", "doc", "docx", "xls", "xlsx", "ppt", "pptx"):
+        return "文档"
+    if e in ("zip", "rar", "7z", "tar", "gz"):
+        return "压缩包"
+    if e == "apk":
+        return "安装包"
+    return "其他"
+
+
+def _ls_item_path(item):
+    fname = item.get("file") or ""
+    if not fname:
+        return None
+    for base in (_LS_PUBLISHED, _LS_PENDING):
+        p = os.path.join(base, fname)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _ls_get(file_id):
+    data = _ls_load()
+    return data["items"].get(file_id)
+
+
+def _ls_update(file_id, **kw):
+    with _LS_LOCK:
+        data = _ls_load()
+        item = data["items"].get(file_id)
+        if not item:
+            return None
+        item.update(kw)
+        data["items"][file_id] = item
+        _ls_save(data)
+        return item
+
+
+def _local_receive_uploads(files):
+    """把上传文件先存本机，立即返回；后台再传百度。返回 None 表示回退旧逻辑。"""
+    files = [u for u in (files or []) if u and u.filename]
+    if not files:
+        return None
+    _ls_dirs()
+    data = _ls_load()
+    saved = []
+    for up in files:
+        name = _safe_filename(up.filename)
+        if not name:
+            continue
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        fid = "lcl:" + uuid.uuid4().hex[:12]
+        fname = fid.replace(":", "_") + "__" + name
+        dest = os.path.join(_LS_PENDING, fname)
+        try:
+            up.stream.seek(0)
+        except Exception:
+            pass
+        size = 0
+        with open(dest, "wb") as fh:
+            while True:
+                chunk = up.stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                size += len(chunk)
+        if size <= 0:
+            try:
+                os.remove(dest)
+            except Exception:
+                pass
+            continue
+        item = {
+            "id": fid,
+            "name": name,
+            "file": fname,
+            "size_bytes": size,
+            "ext": ext.upper(),
+            "kind": _ls_kind(ext),
+            "is_image": ext in _LS_IMG,
+            "is_video": ext in _LS_VID,
+            "is_audio": ext in _LS_AUD,
+            "status": "pending",
+            "up_status": "queued",
+            "bd_id": "",
+            "error": "",
+            "mtime": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "local",
+        }
+        with _LS_LOCK:
+            data["items"][fid] = item
+            _ls_save(data)
+        saved.append(item)
+        threading.Thread(target=_local_upload_worker, args=(fid,), daemon=True).start()
+
+    if not saved:
+        return None
+    resp = jsonify({"ok": True, "count": len(saved),
+                    "msg": "已保存 %d 个文件到本站，可以立即查看；正在后台上传网盘…" % len(saved)})
+    return resp
+
+
+def _local_upload_worker(file_id):
+    with _LS_LOCK:
+        if file_id in _LS_UPLOADING:
+            return
+        _LS_UPLOADING.add(file_id)
+    try:
+        item = _ls_get(file_id)
+        if not item:
+            return
+        path = _ls_item_path(item)
+        if not path:
+            _ls_update(file_id, up_status="failed", error="本地文件丢失")
+            return
+        _ls_update(file_id, up_status="uploading")
+        base, pub, pend = _baidu_dirs()
+        remote = (pend.rstrip("/") + "/" + item["name"]).replace("\\", "/")
+        fs_id = None
+        with open(path, "rb") as fh:
+            fs_id = _baidu_upload_stream(remote, fh)
+        if not fs_id:
+            _ls_update(file_id, up_status="failed", error="网盘上传未返回 id")
+            return
+        bd_id = "bd:%s" % fs_id
+        try:
+            EXPECTED_SIZES[bd_id] = int(item.get("size_bytes") or 0)
+        except Exception:
+            pass
+        _ls_update(file_id, up_status="done", bd_id=bd_id, error="")
+        try:
+            threading.Thread(target=_auto_ai_process, args=(bd_id,), daemon=True).start()
+        except Exception:
+            pass
+    except Exception as e:
+        print("[local-store] upload worker failed %s: %s" % (file_id, e), flush=True)
+        try:
+            _ls_update(file_id, up_status="failed", error=str(e)[:120])
+        except Exception:
+            pass
+    finally:
+        with _LS_LOCK:
+            _LS_UPLOADING.discard(file_id)
+
+
+def _local_api_items(status):
+    data = _ls_load()
+    out = []
+    for item in (data.get("items") or {}).values():
+        if (item.get("status") or "") != status:
+            continue
+        out.append({
+            "id": item.get("id"),
+            "name": item.get("name"),
+            "kind": item.get("kind") or "其他",
+            "ext": item.get("ext") or "",
+            "is_image": bool(item.get("is_image")),
+            "is_video": bool(item.get("is_video")),
+            "is_audio": bool(item.get("is_audio")),
+            "size": _fmt_size(int(item.get("size_bytes") or 0)),
+            "size_bytes": int(item.get("size_bytes") or 0),
+            "source": "local",
+            "folder_id": "",
+            "folder_name": "",
+            "thumb_link": "",
+            "dl_count": 0,
+            "mtime": item.get("mtime") or "",
+            "up_status": item.get("up_status") or "",
+            "bd_id": item.get("bd_id") or "",
+            "ai_note": ("上传中" if (item.get("up_status") in ("queued", "uploading")) else ("网盘已同步" if item.get("up_status") == "done" else "")),
+        })
+    out.sort(key=lambda x: x.get("mtime") or "", reverse=True)
+    return out
+
+
+def _local_view(file_id, attach=False):
+    item = _ls_get(file_id)
+    if not item:
+        return "文件不存在", 404
+    path = _ls_item_path(item)
+    if not path:
+        return "文件不存在", 404
+    import mimetypes
+    from flask import send_file
+    mt = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    resp = send_file(path, mimetype=mt, conditional=True, as_attachment=bool(attach),
+                     download_name=item.get("name") if attach else None)
+    resp.headers["Accept-Ranges"] = "bytes"
+    resp.headers["Cache-Control"] = "private, max-age=3600"
+    return resp
+
+
+def _local_thumb(file_id):
+    item = _ls_get(file_id)
+    if not item:
+        return "文件不存在", 404
+    if not item.get("is_image"):
+        return "不是图片", 404
+    path = _ls_item_path(item)
+    if not path:
+        return "文件不存在", 404
+    thumb = os.path.join(_LS_THUMBS, file_id.replace(":", "_") + ".jpg")
+    try:
+        if not os.path.isfile(thumb) or os.path.getmtime(thumb) < os.path.getmtime(path):
+            from PIL import Image
+            im = Image.open(path)
+            im = im.convert("RGB")
+            im.thumbnail((512, 512))
+            im.save(thumb, "JPEG", quality=82, optimize=True)
+    except Exception as e:
+        print("[local-store] thumb failed: %s" % e, flush=True)
+    if os.path.isfile(thumb):
+        from flask import send_file
+        resp = send_file(thumb, mimetype="image/jpeg", conditional=True)
+        resp.headers["Cache-Control"] = "public, max-age=86400"
+        return resp
+    return _local_view(file_id)
+
+
+def _local_publish(file_id):
+    item = _ls_get(file_id)
+    if not item:
+        return False
+    path = _ls_item_path(item)
+    if not path:
+        return False
+    dest = os.path.join(_LS_PUBLISHED, os.path.basename(path))
+    try:
+        if path != dest:
+            os.replace(path, dest)
+    except Exception as e:
+        print("[local-store] publish move failed: %s" % e, flush=True)
+        return False
+    _ls_update(file_id, status="published")
+    bd_id = item.get("bd_id") or ""
+    if bd_id:
+        try:
+            _baidu_move_pending_to_published(bd_id[3:], item.get("name") or "")
+        except Exception as e:
+            print("[local-store] baidu move failed: %s" % e, flush=True)
+    return True
+
+
+def _local_delete(file_id):
+    item = _ls_get(file_id)
+    if not item:
+        return False
+    path = _ls_item_path(item)
+    try:
+        if path and os.path.isfile(path):
+            os.remove(path)
+    except Exception:
+        pass
+    try:
+        t = os.path.join(_LS_THUMBS, file_id.replace(":", "_") + ".jpg")
+        if os.path.isfile(t):
+            os.remove(t)
+    except Exception:
+        pass
+    with _LS_LOCK:
+        data = _ls_load()
+        data["items"].pop(file_id, None)
+        _ls_save(data)
+    return True
+
+
+try:
+    _ls_dirs()
+except Exception:
+    pass
