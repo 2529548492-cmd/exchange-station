@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>写博客 · 硝子交换站</title>
+<style>
+  :root { --bg:#171a18; --card:#20241f; --line:#333a33; --ink:#e9efe6; --muted:#9aa79a; --green:#7fc79b; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px 60px;
+    background: linear-gradient(160deg, #171a18, #1d231c 60%, #161a16);
+    color: var(--ink); font-family: -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin-bottom: 16px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 0 0 6px; }
+  input, textarea {
+    width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line);
+    background: #191d19; color: var(--ink); font-size: 15px; outline: none;
+  }
+  input:focus, textarea:focus { border-color: var(--green); }
+  textarea { min-height: 340px; resize: vertical; line-height: 1.7; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 14px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 260px; }
+  .actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  button {
+    border: none; border-radius: 10px; padding: 11px 22px; font-size: 15px; cursor: pointer;
+    background: var(--green); color: #10241a; font-weight: 600;
+  }
+  button:disabled { opacity: .55; cursor: default; }
+  button.ghost { background: transparent; border: 1px solid var(--line); color: var(--ink); font-weight: 400; }
+  .msg { font-size: 13px; line-height: 1.6; }
+  .ok { color: var(--green); }
+  .err { color: #ff9a9a; }
+  .hint { color: var(--muted); font-size: 12px; line-height: 1.7; }
+  a { color: var(--green); }
+  .toast {
+    position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+    background: #0f1512; border: 1px solid var(--line); color: var(--ink);
+    padding: 12px 18px; border-radius: 12px; font-size: 14px; display: none; z-index: 99;
+    box-shadow: 0 10px 30px rgba(0,0,0,.4);
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>写博客</h1>
+  <div class="sub">写完点保存，会自动提交并构建，约 1~2 分钟后出现在 <a href="/posts/">博客文章</a> 列表里。</div>
+
+  <div class="card">
+    <label>站长密码</label>
+    <div class="row">
+      <div><input id="pwd" type="password" placeholder="输入站长口令" autocomplete="current-password"></div>
+      <div style="flex:0 0 auto; display:flex; align-items:center;">
+        <label style="margin:0; display:flex; align-items:center; gap:6px; color:var(--muted);">
+          <input id="remember" type="checkbox" style="width:auto;" checked> 记住密码
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <label>标题</label>
+    <input id="title" placeholder="文章标题，比如：今天去看了海">
+    <div style="height:14px"></div>
+    <label>正文（支持 Markdown）</label>
+    <textarea id="body" placeholder="正文写在这里…
+
+## 二级标题
+- 列表
+**加粗**
+[链接](https://example.com)
+"></textarea>
+  </div>
+
+  <div class="actions">
+    <button id="save">保存并发布</button>
+    <button class="ghost" id="preview">打开博客列表</button>
+    <span class="msg" id="status"></span>
+  </div>
+
+  <div class="hint" style="margin-top:14px">
+    说明：密码就是站长口令；保存后会提交到 GitHub，由云端自动构建部署。<br>
+    标题和正文都要填，重复标题同一天会覆盖同一篇。
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  var API = '';  // 同源（页面由交换站服务器提供）
+  var $ = function (id) { return document.getElementById(id); };
+  var pwd = $('pwd'), titleEl = $('title'), bodyEl = $('body'), statusEl = $('status');
+  var saveBtn = $('save');
+
+  try {
+    var saved = localStorage.getItem('blog_pwd');
+    if (saved) pwd.value = saved;
+    var draft = localStorage.getItem('blog_draft');
+    if (draft) {
+      var d = JSON.parse(draft);
+      if (d.title) titleEl.value = d.title;
+      if (d.body) bodyEl.value = d.body;
+    }
+  } catch (e) {}
+
+  function toast(text, bad) {
+    var t = $('toast');
+    t.textContent = text;
+    t.style.color = bad ? '#ff9a9a' : '#e9efe6';
+    t.style.display = 'block';
+    clearTimeout(t._timer);
+    t._timer = setTimeout(function () { t.style.display = 'none'; }, 4200);
+  }
+
+  function saveDraft() {
+    try {
+      localStorage.setItem('blog_draft', JSON.stringify({ title: titleEl.value, body: bodyEl.value }));
+    } catch (e) {}
+  }
+  titleEl.addEventListener('input', saveDraft);
+  bodyEl.addEventListener('input', saveDraft);
+
+  // 轮询最近一次构建状态
+  function pollBuild() {
+    fetch(API + '/api/blog/latest', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (!j || !j.ok) { statusEl.textContent = '已提交（无法查询构建状态）'; return; }
+        if (j.status === 'completed') {
+          if (j.conclusion === 'success') {
+            statusEl.className = 'msg ok';
+            statusEl.textContent = '上线完成！去博客列表看看 →';
+            toast('已上线 ✓');
+          } else {
+            statusEl.className = 'msg err';
+            statusEl.textContent = '构建失败，请联系站长检查';
+          }
+        } else {
+          statusEl.className = 'msg';
+          statusEl.textContent = '云端构建中…（约 1~2 分钟）';
+          setTimeout(pollBuild, 12000);
+        }
+      })
+      .catch(function () {});
+  }
+
+  saveBtn.addEventListener('click', function () {
+    var password = pwd.value.trim();
+    var title = titleEl.value.trim();
+    var body = bodyEl.value.trim();
+    if (!password) { toast('请输入站长密码', true); pwd.focus(); return; }
+    if (!title) { toast('请输入标题', true); titleEl.focus(); return; }
+    if (!body) { toast('请输入正文', true); bodyEl.focus(); return; }
+
+    if ($('remember').checked) { try { localStorage.setItem('blog_pwd', password); } catch (e) {} }
+    else { try { localStorage.removeItem('blog_pwd'); } catch (e) {} }
+
+    saveBtn.disabled = true;
+    statusEl.className = 'msg';
+    statusEl.textContent = '正在提交…';
+
+    fetch(API + '/api/blog/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: password, title: title, content: body }),
+    }).then(function (r) { return r.json(); }).then(function (j) {
+      saveBtn.disabled = false;
+      if (j && j.ok) {
+        statusEl.className = 'msg ok';
+        statusEl.textContent = (j.msg || '已提交') + (j.commit ? '（提交 ' + j.commit + '）' : '');
+        toast('提交成功，正在构建…');
+        try { localStorage.removeItem('blog_draft'); } catch (e) {}
+        pollBuild();
+      } else {
+        statusEl.className = 'msg err';
+        statusEl.textContent = (j && j.error) || '提交失败';
+        toast((j && j.error) || '提交失败', true);
+      }
+    }).catch(function (e) {
+      saveBtn.disabled = false;
+      statusEl.className = 'msg err';
+      statusEl.textContent = '网络错误：' + e.message;
+      toast('网络错误', true);
+    });
+  });
+
+  $('preview').addEventListener('click', function () { location.href = '/posts/'; });
+})();
+</script>
+</body>
+</html>

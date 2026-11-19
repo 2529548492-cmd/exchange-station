@@ -8209,3 +8209,110 @@ try:
         return "服务器内部错误（已记录，请联系站长）", 500
 except Exception as _eh:
     print("[errlog] disabled: %s" % _eh, flush=True)
+
+# ===== _BLOG_EDITOR_V1：网页写博客（密码验证 -> 提交 GitHub -> 自动部署）=====
+@app.after_request
+def _blog_cors(resp):
+    try:
+        if request.path.startswith("/api/blog/"):
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+            resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS, GET"
+            resp.headers["Access-Control-Max-Age"] = "600"
+    except Exception:
+        pass
+    return resp
+
+
+@app.route("/api/blog/save", methods=["POST", "OPTIONS"])
+def api_blog_save():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    admin = _env("ADMIN_TOKEN")
+    data = request.get_json(silent=True) or {}
+    if not admin or (data.get("password") or "") != admin:
+        return jsonify({"ok": False, "error": "密码不对"}), 403
+
+    title = (data.get("title") or "").strip()[:80]
+    content = (data.get("content") or "").strip()
+    if not title or not content:
+        return jsonify({"ok": False, "error": "标题和正文都不能为空"}), 400
+
+    gh = _env("GITHUB_TOKEN")
+    repo = _env("GITHUB_REPO") or "2529548492-cmd/exchange-station-site"
+    branch = _env("BLOG_BRANCH") or "main"
+    if not gh:
+        return jsonify({"ok": False, "error": "服务器未配置 GITHUB_TOKEN"}), 500
+
+    import base64
+    import datetime
+    import re as _re
+    import requests as _rq
+
+    now = datetime.datetime.now()
+    date = now.strftime("%Y-%m-%d")
+    slug = _re.sub(r"[^\w\u4e00-\u9fff-]+", "-", title).strip("-")[:60] or "post"
+    path = "pages/posts/%s-%s.md" % (date, slug)
+    body = "---\ntitle: %s\ndate: %s\ntags:\n  - 随笔\n---\n\n%s\n" % (title, date, content)
+    api_url = "https://api.github.com/repos/%s/contents/%s" % (repo, path)
+    headers = {
+        "Authorization": "token " + gh,
+        "User-Agent": "exchange-station-blog",
+        "Accept": "application/vnd.github+json",
+    }
+    payload = {
+        "message": "post: %s" % title,
+        "content": base64.b64encode(body.encode("utf-8")).decode("ascii"),
+        "branch": branch,
+    }
+    try:
+        cur = _rq.get(api_url, headers=headers, params={"ref": branch}, timeout=25)
+        if cur.status_code == 200:
+            payload["sha"] = (cur.json() or {}).get("sha")
+        w = _rq.put(api_url, headers=headers, json=payload, timeout=25)
+    except Exception as e:
+        return jsonify({"ok": False, "error": "连接 GitHub 失败: %s" % str(e)[:120]}), 502
+
+    if w.status_code not in (200, 201):
+        return jsonify({"ok": False, "error": "提交失败（%s）: %s" % (w.status_code, w.text[:160])}), 502
+
+    out = w.json() or {}
+    commit = ((out.get("commit") or {}).get("sha") or "")[:8]
+    _log("网页写博客", "%s（%s）" % (title, path))
+    return jsonify({
+        "ok": True,
+        "path": path,
+        "commit": commit,
+        "msg": "已提交，GitHub 正在自动构建，约 1~2 分钟后上线",
+    })
+
+
+@app.route("/api/blog/latest", methods=["GET"])
+def api_blog_latest():
+    """查询最近一次部署状态（给编辑页显示进度用）。"""
+    gh = _env("GITHUB_TOKEN")
+    repo = _env("GITHUB_REPO") or "2529548492-cmd/exchange-station-site"
+    if not gh:
+        return jsonify({"ok": False, "error": "未配置"}), 500
+    try:
+        import requests as _rq
+        r = _rq.get("https://api.github.com/repos/%s/actions/runs" % repo,
+                    headers={"Authorization": "token " + gh, "User-Agent": "exchange-station-blog"},
+                    params={"per_page": 1}, timeout=20)
+        runs = ((r.json() or {}).get("workflow_runs") or [])
+        if not runs:
+            return jsonify({"ok": True, "status": "none"})
+        w = runs[0]
+        return jsonify({"ok": True, "status": w.get("status"), "conclusion": w.get("conclusion"),
+                        "created_at": w.get("created_at"), "url": w.get("html_url")})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:100]}), 502
+
+
+# ===== _BLOG_EDITOR_PAGE：网页写博客页面 =====
+@app.route("/blog-editor")
+def blog_editor_page():
+    from flask import send_from_directory
+    base = os.path.dirname(os.path.abspath(__file__))
+    return send_from_directory(os.path.join(base, "static"), "write.html")
+
