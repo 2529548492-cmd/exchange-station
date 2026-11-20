@@ -199,3 +199,19 @@ CF_DOMAIN=gujianxiaozi.ccwu.cc
 ### CI 注意
 - 仓库含 8.2MB APK，提交/推送会稍慢，属正常
 - 构建成功判据：Actions 里 Deploy 步骤 success；线上首页两张卡片同时出现
+
+## 十一、2026-11-20 更新：MyLike（个人加强版）上线
+
+- **性质**：站长在原作者项目上做的**个人改版**（非官方、非原作者发布）
+  - 原作者仓库：https://github.com/Hannah2227/douyin-favorite-MyLike （MIT）
+  - 改版仓库/Release：https://github.com/2529548492-cmd/douyin-favorite-MyLike
+  - 安装包 166MB `MyLike-2.0.7-enhanced-win-x64.zip`，托管在 GitHub Releases（**不放 Cloudflare Pages：超 25MB 单文件限制**）
+- **站点入口**：
+  - 详情页 `pages/apps/mylike.md` → https://gujianxiaozi.ccwu.cc/apps/mylike/
+  - 下载页第三张卡片（`pages/download.md`，素材 `public/tile-mylike.jpg`、`public/cover-mylike.jpg`）
+  - 页面上必须写明「非原作者发布、个人改版、原版链接」——已加醒目声明
+- **样式修复**：
+  - 下载页第一张卡片原本「图片烘焙文字 + HTML 文字」重影 → 生成干净底图 `public/tile-xiangzi-clean.jpg`（裁掉原图左侧文字 + 渐变），三张卡片统一用 HTML 文字
+  - 新增 `.x-tile-rose` 配色类
+  - 聊天助手卡片体积由「28.1 MB」修正为「8.2 MB」
+- 素材生成脚本：`tools/make_mylike_images.py`、`tools/make_xiangzi_clean_tile.py`
