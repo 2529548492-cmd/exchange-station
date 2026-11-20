@@ -215,3 +215,22 @@ CF_DOMAIN=gujianxiaozi.ccwu.cc
   - 新增 `.x-tile-rose` 配色类
   - 聊天助手卡片体积由「28.1 MB」修正为「8.2 MB」
 - 素材生成脚本：`tools/make_mylike_images.py`、`tools/make_xiangzi_clean_tile.py`
+
+## 十二、2026-11-20 更新：手机端（竖屏）适配
+
+用户反馈三件事，均已修复：
+
+1. **首页缺 MyLike 卡片** → `layouts/home.vue` 新增第三张卡片（`x-app-rose`，`/tile-mylike.jpg`，下载走 GitHub Release，详情 `/apps/mylike/`）
+2. **手机端下方显示不完整** → 根因是 `styles/index.scss` 里 `.x-apps { max-height:320px; overflow:hidden }` 把第二、三张卡片裁掉。已在 `@media (max-width:768px)` 里覆盖为 `max-height:none; overflow:visible`。
+3. **手机端博客列表没有「写博客」按钮** → 主题移动端顶栏不渲染 `themeConfig.nav`（fullscreen menu 也没启用 nav 列表）。解决：
+   - 新增 `layouts/posts.vue` 覆盖主题布局，在列表上方加「✍ 写博客」按钮（手机/电脑都显示，跳转交换站 `/blog-editor`）
+   - `valaxy.config.ts` 的 `themeConfig.pages` 增加「写博客」胶囊（首页与手机侧栏可见）
+
+**顺带修复**：
+- 首页第一张卡片在手机上文字被裁 → 与下载页统一，改用 `public/tile-xiangzi-clean.jpg`（裁掉图片里烘焙文字）+ HTML 标题/副标题
+- 新增 `.x-app-rose` 配色（玫红渐变）
+
+**手机端实测**（390×844，headless Chrome）：
+- 首页 3 张卡片全部完整显示，文档高度 1467px，可正常滚动
+- `/posts/` 顶部「✍ 写博客」按钮可见（href 指向 `/blog-editor`）
+- `/download/` 3 张卡片纵向堆叠正常
