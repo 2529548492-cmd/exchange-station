@@ -71,6 +71,8 @@
 | CI 自动部署 | 博客站 `.github/workflows/deploy.yml` |
 | 本机一键发布 | 博客站 `publish.cmd` / `publish.ps1` |
 | 本地新建文章工具 | 博客站 `tools/new-post.cmd` / `new-post.ps1` |
+| 硝子聊天助手 App 页 | 博客站 `pages/apps/xiaozichat.md` → `/apps/xiaozichat/` |
+| 硝子聊天助手 APK | 博客站 `public/dl/xiaozichat-1.7.apk` → `https://gujianxiaozi.ccwu.cc/dl/xiaozichat-1.7.apk`（8.2 MB，走 Cloudflare，比网盘稳） |
 
 ---
 
@@ -170,3 +172,30 @@ CF_DOMAIN=gujianxiaozi.ccwu.cc
 2. 博客站仓库 `README.md`（构建/部署/定制点/踩坑）
 3. 交换站仓库 `BLOG-EDITOR.md`（写博客接口与安全）
 4. 交换站仓库 `README.md`（部署与环境变量总览）
+
+---
+
+## 十、2026-11-20 更新：硝子聊天助手上线
+
+### 已完成
+- **APK 瘦身**：28.06 MB → **8.21 MB**（8,613,255 B，SHA256 `088CC8A9C527887A4802F3F00BE25A551EB55BD1FBB12AC6879747A85742831D`）
+  - 删 mlkit 中文 OCR（改视觉模型）、material、constraintlayout、旧 mipmap
+  - 关键：删库后必须 `:app:clean :app:assembleDebug`，否则 18.61MB 增量打包空洞不回收
+- **APK 托管到 Cloudflare Pages**：https://gujianxiaozi.ccwu.cc/dl/xiaozichat-1.7.apk （不再走网盘）
+- **详情页**：https://gujianxiaozi.ccwu.cc/apps/xiaozichat/ （`pages/apps/xiaozichat.md`）
+- **下载页**：两张卡片（`pages/download.md`，`/tile-xiaozichat.jpg`）
+- **首页推荐区**：两张卡片（`layouts/home.vue`，去掉 `x-apps-single`；第二张 `x-app-purple`，HTML 标题/副标题）
+  - 注意：第一张卡片「硝子交换站」的标题是**烘焙在 tile-xiangzi.jpg 图片里**的，源码里 `.x-app-body` 为空，不是 bug
+- **交换站旧包清理**：pending `lcl:3346f39490c8` + published `bd:1024948613204292`（28.1MB）已删除
+- 站长口令仍为 `cb198164`（本次验证可登录）
+
+### 本机构建工具链问题（已知）
+- `C:\Users\陈云财\AppData\Local\pnpm` 被标记为不可信挂载点，`pnpm build` 报 `UNKNOWN: unknown error`
+- `station-site\node_modules` 里 valaxy/wrangler 的 junction 已失效
+- **绕过办法**：改源码 → 推到 `exchange-station-site` 仓库 → GitHub Actions 自动构建部署（已多次验证成功，约 1~2 分钟）
+  - 本机推送需走代理 `http://127.0.0.1:7890`（直连会被 reset）
+  - 推送命令：`git -c credential.helper= -c http.proxy=... push https://x-access-token:<PAT>@github.com/...`
+
+### CI 注意
+- 仓库含 8.2MB APK，提交/推送会稍慢，属正常
+- 构建成功判据：Actions 里 Deploy 步骤 success；线上首页两张卡片同时出现
