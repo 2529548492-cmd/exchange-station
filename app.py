@@ -2144,7 +2144,12 @@ def _log(action, detail=""):
     print(f"[access] {line.strip()}", flush=True)
     _DRIVE_LOG_BUFFER.append(line)
     if len(_DRIVE_LOG_BUFFER) >= 20 or any(action.startswith(a) for a in ("审核通过", "审核不通过", "删除已发布", "改名", "AI 自动发布")):
-        _flush_drive_log()
+        # 网盘日志写入失败（令牌过期/限流/断网）绝不能把接口带崩：
+        # 之前站长登录就是在这里抛异常 → 500，站长进不去后台。
+        try:
+            _flush_drive_log()
+        except Exception as _e:
+            print("[drive-log] flush failed: %s" % _e, flush=True)
 
 
 def _IP_LOC_CACHE():
